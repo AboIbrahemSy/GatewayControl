@@ -1,0 +1,170 @@
+package telemetry
+
+import (
+	"bufio"
+	"bytes"
+	"context"
+	"errors"
+	"fmt"
+	"os"
+	"os/exec"
+	"path/filepath"
+	"strconv"
+	"strings"
+	"time"
+
+	"gatewaycontrol/agent/internal/types"
+)
+
+const MaximumServices = 250
+
+var dockerServiceFormat = `{{.Label "com.docker.compose.project"}}\t{{.Label "com.docker.compose.service"}}\t{{.State}}\t{{.Status}}`
+
+type Runner interface {
+	Run(context.Context, string, ...string) ([]byte, error)
+}
+
+type Collector struct {
+	procRoot string
+	runner   Runner
+}
+
+func New(procRoot string) *Collector {
+	return &Collector{procRoot: procRoot, runner: OSRunner{}}
+}
+
+func (c *Collector) Collect(ctx context.Context) (types.Telemetry, error) {
+	node, err := c.collectNode()
+	if err != nil {
+		return types.Telemetry{}, err
+	}
+	services, err := c.collectServices(ctx)
+	if err != nil {
+		return types.Telemetry{}, err
+	}
+	return types.Telemetry{ObservedAt: time.Now().UTC(), Node: node, Services: services}, nil
+}
+
+func (c *Collector) collectNode() (types.TelemetryNode, error) {
+	uptime, err := readFields(filepath.Join(c.procRoot, "uptime"))
+	if err != nil || len(uptime) < 1 {
+		return types.TelemetryNode{}, errors.New("read host uptime")
+	}
+	loads, err := readFields(filepath.Join(c.procRoot, "loadavg"))
+	if err != nil || len(loads) < 3 {
+		return types.TelemetryNode{}, errors.New("read host load average")
+	}
+	numbers := make([]float64, 4)
+	for index, value := range append(uptime[:1], loads[:3]...) {
+		numbers[index], err = strconv.ParseFloat(value, 64)
+		if err != nil || numbers[index] < 0 {
+			return types.TelemetryNode{}, errors.New("parse host metrics")
+		}
+	}
+	memory, err := os.Open(filepath.Join(c.procRoot, "meminfo"))
+	if err != nil {
+		return types.TelemetryNode{}, errors.New("read host memory")
+	}
+	defer memory.Close()
+	var total, available uint64
+	scanner := bufio.NewScanner(memory)
+	for scanner.Scan() {
+		fields := strings.Fields(scanner.Text())
+		if len(fields) < 2 {
+			continue
+		}
+		value, parseErr := strconv.ParseUint(fields[1], 10, 64)
+		if parseErr != nil || value > ^uint64(0)/1024 {
+			return types.TelemetryNode{}, errors.New("parse host memory")
+		}
+		switch fields[0] {
+		case "MemTotal:":
+			total = value * 1024
+		case "MemAvailable:":
+			available = value * 1024
+		}
+	}
+	if scanner.Err() != nil || total == 0 || available > total {
+		return types.TelemetryNode{}, errors.New("parse host memory")
+	}
+	return types.TelemetryNode{UptimeSeconds: numbers[0], Load1: numbers[1], Load5: numbers[2], Load15: numbers[3], MemoryTotalBytes: total, MemoryAvailableBytes: available}, nil
+}
+
+func (c *Collector) collectServices(ctx context.Context) ([]types.TelemetryService, error) {
+	output, err := c.runner.Run(ctx, "docker", "ps", "--all", "--format", dockerServiceFormat)
+	if err != nil {
+		return nil, errors.New("collect Docker service state")
+	}
+	services := make([]types.TelemetryService, 0)
+	seen := make(map[string]struct{})
+	for _, line := range strings.Split(strings.TrimSpace(string(output)), "\n") {
+		if line == "" {
+			continue
+		}
+		fields := strings.Split(line, "\t")
+		if len(fields) != 4 || !validComposeIdentifier(fields[0]) || !validComposeIdentifier(fields[1]) {
+			continue
+		}
+		name := fields[0] + "_" + fields[1]
+		if _, exists := seen[name]; exists {
+			continue
+		}
+		seen[name] = struct{}{}
+		services = append(services, types.TelemetryService{Name: name, Status: normalizeStatus(fields[2], fields[3]), ProjectName: fields[0], ServiceName: fields[1]})
+		if len(services) == MaximumServices {
+			break
+		}
+	}
+	return services, nil
+}
+
+func normalizeStatus(state, detail string) string {
+	if state != "running" {
+		return "stopped"
+	}
+	detail = strings.ToLower(detail)
+	switch {
+	case strings.Contains(detail, "(healthy)"):
+		return "healthy"
+	case strings.Contains(detail, "(unhealthy)"):
+		return "unhealthy"
+	case strings.Contains(detail, "health: starting") || strings.Contains(detail, "(starting)"):
+		return "starting"
+	default:
+		return "unknown"
+	}
+}
+
+func validComposeIdentifier(value string) bool {
+	if len(value) < 1 || len(value) > 63 {
+		return false
+	}
+	for index, character := range value {
+		if character >= 'a' && character <= 'z' || character >= '0' && character <= '9' || index > 0 && (character == '_' || character == '-') {
+			continue
+		}
+		return false
+	}
+	return true
+}
+
+func readFields(path string) ([]string, error) {
+	contents, err := os.ReadFile(path)
+	if err != nil {
+		return nil, err
+	}
+	return strings.Fields(string(contents)), nil
+}
+
+type OSRunner struct{}
+
+func (OSRunner) Run(ctx context.Context, name string, args ...string) ([]byte, error) {
+	command := exec.CommandContext(ctx, name, args...)
+	var output bytes.Buffer
+	command.Stdout = &output
+	command.Stderr = &bytes.Buffer{}
+	if err := command.Run(); err != nil {
+		return nil, fmt.Errorf("run telemetry command: %w", err)
+	}
+	return output.Bytes(), nil
+}

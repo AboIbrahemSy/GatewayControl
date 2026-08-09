@@ -1,0 +1,87 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+:root {
+  font-family: 'Manrope Variable', 'Noto Sans Arabic Variable', ui-sans-serif, system-ui, sans-serif;
+  color: #152925;
+  background: #f3f0e8;
+  font-synthesis: none;
+  text-rendering: optimizeLegibility;
+}
+
+:root[lang='ar'] {
+  font-family: 'Noto Sans Arabic Variable', 'Manrope Variable', ui-sans-serif, system-ui, sans-serif;
+}
+
+html {
+  min-width: 320px;
+  min-height: 100%;
+  background: #f3f0e8;
+}
+
+html.dark {
+  background: #07100f;
+}
+
+body {
+  min-width: 320px;
+  min-height: 100vh;
+  margin: 0;
+}
+
+button,
+a,
+input,
+select,
+textarea {
+  -webkit-tap-highlight-color: transparent;
+}
+
+button:focus-visible,
+a:focus-visible,
+input:focus-visible,
+select:focus-visible,
+textarea:focus-visible {
+  outline: 3px solid rgba(69, 214, 161, 0.45);
+  outline-offset: 2px;
+}
+
+::selection {
+  color: #07100f;
+  background: #77e6bd;
+}
+
+* {
+  scrollbar-color: #b9c3bd transparent;
+  scrollbar-width: thin;
+}
+
+.dashboard-grid {
+  background-image:
+    linear-gradient(rgba(34, 185, 130, 0.035) 1px, transparent 1px),
+    linear-gradient(90deg, rgba(34, 185, 130, 0.035) 1px, transparent 1px);
+  background-size: 32px 32px;
+}
+
+.dark .dashboard-grid {
+  background-image:
+    linear-gradient(rgba(119, 230, 189, 0.03) 1px, transparent 1px),
+    linear-gradient(90deg, rgba(119, 230, 189, 0.03) 1px, transparent 1px);
+}
+
+.surface-glow::before {
+  position: absolute;
+  inset: -30% auto auto -10%;
+  width: 22rem;
+  height: 22rem;
+  content: '';
+  pointer-events: none;
+  border-radius: 9999px;
+  background: rgba(69, 214, 161, 0.09);
+  filter: blur(70px);
+}
+
+[dir='rtl'] .surface-glow::before {
+  inset: -30% -10% auto auto;
+}
