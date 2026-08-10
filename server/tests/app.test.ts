@@ -132,9 +132,12 @@ describe('control-plane API', () => {
 
     const localDefinition = await app.inject({ method: 'POST', url: '/api/agents', headers: { cookie }, payload: { name: 'local-edge', baseUrl: 'http://127.0.0.1:8080', image: 'gateway-control-agent:local' } });
     expect(localDefinition.json().enrollmentCommand).toContain("docker image inspect 'gateway-control-agent:local'");
-    expect(localDefinition.json().enrollmentCommand).toContain('Build it on this host before enrollment.');
+    expect(localDefinition.json().enrollmentCommand).toContain('Build or load it on this host before enrollment.');
+    expect(localDefinition.json().enrollmentCommand).not.toContain('exit 1');
     expect(localDefinition.json().enrollmentCommand).toContain('--pull never');
     expect(localDefinition.json().enrollmentCommand).toContain('GATEWAY_ALLOW_INSECURE_HTTP=true');
+    expect(localDefinition.json().enrollmentCommand).toContain("GATEWAY_CONTROL_URL='http://host.docker.internal:8080'");
+    expect(localDefinition.json().enrollmentCommand).toContain('--add-host host.docker.internal:host-gateway');
   });
 
   it('lets only owners safely remove unassigned agents and returns host cleanup instructions', async () => {

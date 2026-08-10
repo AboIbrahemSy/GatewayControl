@@ -132,6 +132,9 @@ function enrollmentCommand(baseUrl: string, image: string, enrollmentToken: stri
   if (!['http:', 'https:'].includes(url.protocol) || url.username || url.password) {
     throw new ApiError(400, 'baseUrl must be a valid absolute HTTP or HTTPS URL without credentials.');
   }
+  if (['localhost', '127.0.0.1', '[::1]'].includes(url.hostname)) {
+    url.hostname = 'host.docker.internal';
+  }
   if (!IMAGE_PATTERN.test(image)) throw new ApiError(400, 'image is not a valid container image reference.');
   if (!DOCKER_VOLUME_PATTERN.test(traefikDynamicVolume)) throw new ApiError(500, 'The configured Traefik dynamic volume name is invalid.');
   const normalizedUrl = url.toString().replace(/\/$/, '');
@@ -140,7 +143,7 @@ function enrollmentCommand(baseUrl: string, image: string, enrollmentToken: stri
   const insecureHttpOption = url.protocol === 'http:' ? '-e GATEWAY_ALLOW_INSECURE_HTTP=true' : '';
   const pullPolicy = image.endsWith(':local') ? '--pull never' : '--pull always';
   const imagePreflight = image.endsWith(':local')
-    ? `docker image inspect ${shellQuote(image)} >/dev/null 2>&1 || { printf '%s\n' ${shellQuote(`Local Agent image ${image} was not found. Build it on this host before enrollment.`)} >&2; exit 1; }`
+    ? `docker image inspect ${shellQuote(image)} >/dev/null 2>&1 || { printf '%s\n' ${shellQuote(`Local Agent image ${image} was not found. Build or load it on this host before enrollment.`)} >&2; false; }`
     : '';
 
   const initializeWritableMounts = [
@@ -160,6 +163,7 @@ function enrollmentCommand(baseUrl: string, image: string, enrollmentToken: stri
     '--pull never',
     `--name ${shellQuote(containerName)}`,
     '--restart unless-stopped',
+    '--add-host host.docker.internal:host-gateway',
     `--group-add "$(stat -c '%g' /var/run/docker.sock)"`,
     `-e GATEWAY_CONTROL_URL=${shellQuote(normalizedUrl)}`,
     `-e GATEWAY_ENROLLMENT_TOKEN=${shellQuote(enrollmentToken)}`,

@@ -137,6 +137,8 @@ Local trusted-network testing may use a reachable LAN address:
 http://192.168.1.10:8080
 ```
 
+When the browser opens GatewayControl through `localhost` or `127.0.0.1`, the enrollment form uses `host.docker.internal` instead. The generated Agent container maps that name to the Docker host through `host-gateway`, because `localhost` inside the Agent container refers to the Agent itself rather than the control plane.
+
 Copy the generated one-time command and run it on the target Linux host with Docker permissions. The command contains a short-lived enrollment secret and must be treated as sensitive until it has been used or expires.
 
 For remote hosts, publish the Agent image to a registry and configure an immutable tag or digest:
