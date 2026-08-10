@@ -6,13 +6,14 @@ import { parseDocument } from 'yaml';
 import { SecretBox, hashPassword, hashToken, randomToken, verifyPassword } from './crypto.js';
 import { CloudflareClient, CloudflareClientError, type CloudflareIngressRule } from './cloudflare-client.js';
 import { NotificationDispatcher } from './notification-dispatcher.js';
-import { OPERATIONAL_EVENT_TYPES, type Agent, type AgentCommand, type Role, type StackBackup, type StackRestore, type Store, type User } from './types.js';
+import { SystemRecoveryFailure, type SystemRecoveryService } from './system-recovery.js';
+import { OPERATIONAL_EVENT_TYPES, type Agent, type AgentCommand, type Role, type StackBackup, type StackRestore, type Store, type SystemBackup, type SystemRestore, type User } from './types.js';
 
 const SESSION_COOKIE = 'gateway_control_session';
 const EMAIL_PATTERN = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
 const UUID_PATTERN = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
 const IMAGE_PATTERN = /^[a-z0-9][a-z0-9._/-]*(?::[a-z0-9][a-z0-9._-]*)?(?:@sha256:[a-f0-9]{64})?$/i;
-const USER_COMMAND_TYPES = new Set(['ping', 'docker.info', 'compose.ps', 'compose.up', 'compose.stop', 'compose.restart']);
+const USER_COMMAND_TYPES = new Set(['ping', 'docker.info', 'agent.diagnostics.run', 'compose.ps', 'compose.up', 'compose.stop', 'compose.restart']);
 const RESOURCE_NAME_PATTERN = /^[A-Za-z0-9][A-Za-z0-9._-]{0,62}$/;
 const PROJECT_NAME_PATTERN = /^[a-z0-9][a-z0-9_-]{0,62}$/;
 const DOCKER_VOLUME_PATTERN = /^[A-Za-z0-9][A-Za-z0-9_.-]{1,127}$/;
@@ -26,7 +27,7 @@ const TUNNEL_SERVICE = 'http://traefik:80';
 const TUNNEL_CATCH_ALL_SERVICE = 'http_status:404';
 
 class ApiError extends Error {
-  public constructor(public readonly statusCode: number, message: string) {
+  public constructor(public readonly statusCode: number, message: string, public readonly code?: string) {
     super(message);
   }
 }
@@ -49,9 +50,12 @@ export interface BuildAppOptions {
   webRoot?: string;
   defaultAgentImage?: string;
   traefikDynamicVolume?: string;
+  systemBackupNasRoot?: string;
+  systemBackupNasMarker?: string;
   notificationIntervalMs?: number;
   offlineAfterMs?: number;
   commandStaleAfterMs?: number;
+  systemRecoveryService?: SystemRecoveryService;
 }
 
 function objectBody(body: unknown): Record<string, unknown> {
@@ -122,7 +126,7 @@ function shellQuote(value: string): string {
   return `'${value.replaceAll("'", `'"'"'`)}'`;
 }
 
-function enrollmentCommand(baseUrl: string, image: string, enrollmentToken: string, agentId: string, agentName: string, traefikDynamicVolume: string): string {
+function enrollmentCommand(baseUrl: string, image: string, enrollmentToken: string, agentId: string, agentName: string, traefikDynamicVolume: string, nasRoot: string, nasMarker: string): string {
   let url: URL;
   try {
     url = new URL(baseUrl);
@@ -137,6 +141,8 @@ function enrollmentCommand(baseUrl: string, image: string, enrollmentToken: stri
   }
   if (!IMAGE_PATTERN.test(image)) throw new ApiError(400, 'image is not a valid container image reference.');
   if (!DOCKER_VOLUME_PATTERN.test(traefikDynamicVolume)) throw new ApiError(500, 'The configured Traefik dynamic volume name is invalid.');
+  if (!nasRoot.startsWith('/') || nasRoot.includes(':') || /[\r\n]/.test(nasRoot)) throw new ApiError(500, 'The configured NAS backup root is invalid.');
+  if (!/^[A-Za-z0-9._-]+$/.test(nasMarker) || nasMarker === '.' || nasMarker === '..') throw new ApiError(500, 'The configured NAS marker is invalid.');
   const normalizedUrl = url.toString().replace(/\/$/, '');
   const containerName = `gateway-agent-${agentId.slice(0, 8)}`;
   const stateVolume = `${containerName}-state`;
@@ -177,8 +183,9 @@ function enrollmentCommand(baseUrl: string, image: string, enrollmentToken: stri
     '-e GATEWAY_HOST_PROC_ROOT=/host/proc',
     '-e GATEWAY_LOCAL_BACKUP_ROOT=/opt/gateway-control/backups/local',
     '-e GATEWAY_HOST_LOCAL_BACKUP_ROOT=/opt/gateway-control/backups/local',
-    '-e GATEWAY_NAS_BACKUP_ROOT=/mnt/gateway-control-backups',
-    '-e GATEWAY_HOST_NAS_BACKUP_ROOT=/mnt/gateway-control-backups',
+    `-e GATEWAY_NAS_BACKUP_ROOT=${shellQuote(nasRoot)}`,
+    `-e GATEWAY_HOST_NAS_BACKUP_ROOT=${shellQuote(nasRoot)}`,
+    `-e GATEWAY_NAS_MARKER=${shellQuote(nasMarker)}`,
     '-e GATEWAY_TRAEFIK_DYNAMIC_ROOT=/srv/traefik-dynamic',
     `-e GATEWAY_TRAEFIK_DYNAMIC_VOLUME=${shellQuote(traefikDynamicVolume)}`,
     '-v /var/run/docker.sock:/var/run/docker.sock',
@@ -186,7 +193,7 @@ function enrollmentCommand(baseUrl: string, image: string, enrollmentToken: stri
     `-v ${shellQuote(stateVolume)}:/var/lib/gateway-agent`,
     '-v /opt/gateway-control/stacks:/opt/gateway-control/stacks',
     '-v /opt/gateway-control/backups/local:/opt/gateway-control/backups/local',
-    '-v /mnt/gateway-control-backups:/mnt/gateway-control-backups',
+    `-v ${shellQuote(`${nasRoot}:${nasRoot}`)}`,
     `-v ${shellQuote(traefikDynamicVolume)}:/srv/traefik-dynamic`,
     shellQuote(image),
   ].filter(Boolean).join(' ');
@@ -261,6 +268,19 @@ function validateBackends(value: unknown): string[] {
   });
 }
 
+function optionalPostgresBackupConfig(body: Record<string, unknown>): { service: string; database: string; user: string } | null | undefined {
+  if (body.postgresBackupConfig === undefined) return undefined;
+  if (body.postgresBackupConfig === null) return null;
+  const config = objectBody(body.postgresBackupConfig);
+  const service = stringField(config, 'service', 1, 128);
+  const database = stringField(config, 'database', 1, 128);
+  const user = stringField(config, 'user', 1, 128);
+  if (!SERVICE_NAME_PATTERN.test(service) || !/^[A-Za-z0-9_.-]+$/.test(database) || !/^[A-Za-z0-9_.-]+$/.test(user) || Object.keys(config).some((key) => !['service', 'database', 'user'].includes(key))) {
+    throw new ApiError(400, 'postgresBackupConfig contains invalid service, database, or user values.');
+  }
+  return { service, database, user };
+}
+
 function validateTelemetryObject(value: unknown, field: string, maxKeys: number): Record<string, unknown> {
   if (!value || typeof value !== 'object' || Array.isArray(value) || Object.keys(value).length > maxKeys) throw new ApiError(400, `${field} must be a bounded object.`);
   for (const [key, item] of Object.entries(value)) {
@@ -294,7 +314,17 @@ function validateTelemetry(body: Record<string, unknown>): { observedAt: string;
 function operationResult(result: Record<string, unknown> | null): Record<string, unknown> | null {
   if (!result) return null;
   const allowed = ['sizeBytes', 'fileCount', 'durationMs', 'checksum', 'startedAt', 'completedAt', 'message'];
-  return Object.fromEntries(allowed.filter((key) => ['string', 'number', 'boolean'].includes(typeof result[key])).map((key) => [key, result[key]]));
+  const sanitized = Object.fromEntries(allowed.filter((key) => ['string', 'number', 'boolean'].includes(typeof result[key])).map((key) => [key, result[key]]));
+  if (!sanitized.message && typeof result.error === 'string') sanitized.message = result.error.slice(0, 500);
+  if (Array.isArray(result.artifacts)) {
+    sanitized.artifacts = result.artifacts.slice(0, 100).flatMap((artifact) => {
+      if (!artifact || typeof artifact !== 'object' || Array.isArray(artifact)) return [];
+      const value = artifact as Record<string, unknown>;
+      if (!['volume_archive', 'postgres_dump'].includes(String(value.type)) || typeof value.name !== 'string' || value.name.length > 128 || typeof value.sizeBytes !== 'number' || typeof value.sha256 !== 'string' || !/^[a-f0-9]{64}$/i.test(value.sha256)) return [];
+      return [{ type: value.type, name: value.name, sizeBytes: value.sizeBytes, sha256: value.sha256 }];
+    });
+  }
+  return sanitized;
 }
 
 function publicBackup(item: StackBackup): Record<string, unknown> {
@@ -309,6 +339,20 @@ function publicRestore(item: StackRestore): Record<string, unknown> {
   return {
     id: item.id, stackId: item.stackId, backupId: item.backupId, agentId: item.agentId, commandId: item.commandId,
     status: item.status, result: operationResult(item.result), createdAt: item.createdAt, updatedAt: item.updatedAt, completedAt: item.completedAt,
+  };
+}
+
+function publicSystemBackup(item: SystemBackup): Record<string, unknown> {
+  return {
+    id: item.id, target: item.target, status: item.status, sizeBytes: item.sizeBytes, checksum: item.checksum,
+    error: item.error, createdAt: item.createdAt, completedAt: item.completedAt,
+  };
+}
+
+function publicSystemRestore(item: SystemRestore): Record<string, unknown> {
+  return {
+    id: item.id, backupId: item.backupId, status: item.status, error: item.error,
+    createdAt: item.createdAt, completedAt: item.completedAt,
   };
 }
 
@@ -335,7 +379,7 @@ export async function buildApp(options: BuildAppOptions) {
     trustProxy: options.trustProxy ?? false,
     logger: {
       level: process.env.NODE_ENV === 'test' ? 'silent' : 'info',
-      redact: ['req.headers.authorization', 'req.headers.cookie', 'res.headers.set-cookie', 'body.password', 'body.token', 'body.apiToken', 'body.botToken', 'body.groupId', 'body.enrollmentToken'],
+      redact: ['req.headers.authorization', 'req.headers.cookie', 'res.headers.set-cookie', 'body.password', 'body.passphrase', 'body.token', 'body.apiToken', 'body.botToken', 'body.groupId', 'body.enrollmentToken'],
     },
     bodyLimit: 1_048_576,
   });
@@ -433,7 +477,7 @@ export async function buildApp(options: BuildAppOptions) {
   });
 
   app.setErrorHandler((error, _request, reply) => {
-    if (error instanceof ApiError) return reply.code(error.statusCode).send({ error: error.message });
+    if (error instanceof ApiError) return reply.code(error.statusCode).send({ error: error.message, ...(error.code ? { code: error.code } : {}) });
     if ((error as { statusCode?: number }).statusCode === 413) return reply.code(413).send({ error: 'Request body is too large.' });
     if ((error as { code?: string }).code === '23505') return reply.code(409).send({ error: 'A record with that value already exists.' });
     if ((error as { statusCode?: number }).statusCode === 429) return reply.code(429).send({ error: 'Too many requests. Try again later.' });
@@ -633,12 +677,14 @@ export async function buildApp(options: BuildAppOptions) {
     const projectName = stringField(body, 'projectName', 1, 63);
     if (!PROJECT_NAME_PATTERN.test(projectName)) throw new ApiError(400, 'projectName must use lowercase letters, numbers, underscores, or hyphens.');
     const composeYaml = validateComposeYaml(opaqueStringField(body, 'composeYaml', 1, MAX_COMPOSE_BYTES));
+    const postgresBackupConfig = optionalPostgresBackupConfig(body);
     const stack = await options.store.createStack({
       agentId,
       name,
       projectName,
       encryptedComposeYaml: secretBox.encrypt(composeYaml),
       enabled: optionalBoolean(body, 'enabled') ?? true,
+      ...(postgresBackupConfig ? { postgresBackupConfig } : {}),
     });
     if (!stack) throw new ApiError(404, 'Enabled agent not found.');
     return reply.code(201).send({ stack });
@@ -648,11 +694,13 @@ export async function buildApp(options: BuildAppOptions) {
     const name = body.name === undefined ? undefined : validateResourceName(stringField(body, 'name', 1, 63));
     const composeYaml = body.composeYaml === undefined ? undefined : validateComposeYaml(opaqueStringField(body, 'composeYaml', 1, MAX_COMPOSE_BYTES));
     const enabled = optionalBoolean(body, 'enabled');
-    if (name === undefined && composeYaml === undefined && enabled === undefined) throw new ApiError(400, 'At least one editable field is required.');
+    const postgresBackupConfig = optionalPostgresBackupConfig(body);
+    if (name === undefined && composeYaml === undefined && enabled === undefined && postgresBackupConfig === undefined) throw new ApiError(400, 'At least one editable field is required.');
     const stack = await options.store.updateStack(idParameter(request), {
       ...(name !== undefined ? { name } : {}),
       ...(composeYaml !== undefined ? { encryptedComposeYaml: secretBox.encrypt(composeYaml) } : {}),
       ...(enabled !== undefined ? { enabled } : {}),
+      ...(postgresBackupConfig !== undefined ? { postgresBackupConfig } : {}),
     });
     if (!stack) throw new ApiError(404, 'Stack or enabled agent not found.');
     return { stack };
@@ -790,6 +838,8 @@ export async function buildApp(options: BuildAppOptions) {
         agent.id,
         agent.name,
         options.traefikDynamicVolume ?? 'gateway-traefik-dynamic',
+        options.systemBackupNasRoot ?? '/mnt/gateway-control-backups',
+        options.systemBackupNasMarker ?? '.gateway-control-nas',
       );
     }
     return reply.code(201).send(response);
@@ -813,6 +863,8 @@ export async function buildApp(options: BuildAppOptions) {
         agentId,
         stringField(body, 'agentName', 1, 120),
         options.traefikDynamicVolume ?? 'gateway-traefik-dynamic',
+        options.systemBackupNasRoot ?? '/mnt/gateway-control-backups',
+        options.systemBackupNasMarker ?? '.gateway-control-nas',
       ),
     };
   });
@@ -912,6 +964,7 @@ export async function buildApp(options: BuildAppOptions) {
         commands.push({ ...command, payload: {
           backupId, stackId: deployment.stack.id, projectName: deployment.stack.projectName, revision: deployment.backup.stackRevision,
           target: deployment.backup.target, stackPath: deployment.stack.id, composePath: `${deployment.stack.id}/compose.yaml`,
+          ...(deployment.stack.postgresBackupConfig ? { postgres: deployment.stack.postgresBackupConfig } : {}),
         } });
         continue;
       }
@@ -926,6 +979,7 @@ export async function buildApp(options: BuildAppOptions) {
           restoreId, backupId: deployment.backup.id, stackId: deployment.stack.id, projectName: deployment.stack.projectName,
           revision: deployment.backup.stackRevision, target: deployment.backup.target,
           stackPath: deployment.stack.id, composePath: `${deployment.stack.id}/compose.yaml`,
+          ...(deployment.stack.postgresBackupConfig ? { postgres: deployment.stack.postgresBackupConfig } : {}),
         } });
         continue;
       }
@@ -979,6 +1033,17 @@ export async function buildApp(options: BuildAppOptions) {
       }),
     };
   });
+  app.get('/api/commands/:id', { preHandler: (request, reply) => requireUser(request, reply) }, async (request) => {
+    const command = await options.store.getCommand(idParameter(request));
+    if (!command) throw new ApiError(404, 'Command not found.');
+    if (command.type !== 'agent.diagnostics.run') return { command: { id: command.id, status: command.status, type: command.type } };
+    return { command };
+  });
+  app.post('/api/agents/:id/diagnostics', { preHandler: (request, reply) => requireUser(request, reply, 'operator') }, async (request, reply) => {
+    const command = await options.store.createCommand(idParameter(request), 'agent.diagnostics.run', {});
+    if (!command) throw new ApiError(404, 'Enabled Agent not found.');
+    return reply.code(202).send({ command });
+  });
   app.get('/api/log-requests/:id', { preHandler: (request, reply) => requireUser(request, reply, 'operator') }, async (request) => {
     const command = await options.store.getLogRequest(idParameter(request), (request as AuthenticatedRequest).authenticatedUser.id);
     if (!command) throw new ApiError(404, 'Log request not found.');
@@ -998,6 +1063,35 @@ export async function buildApp(options: BuildAppOptions) {
     if (created === 'active') throw new ApiError(409, 'This stack already has an active backup or restore operation.');
     if (!created) throw new ApiError(409, 'Only a succeeded backup for an enabled stack and agent can be restored.');
     return reply.code(202).send({ restore: publicRestore(created) });
+  });
+  app.get('/api/system-backups', { preHandler: (request, reply) => requireUser(request, reply, 'owner') }, async () => ({
+    backups: (await options.store.listSystemBackups()).map(publicSystemBackup),
+    restores: (await options.store.listSystemRestores()).map(publicSystemRestore),
+  }));
+  app.post('/api/system-backups', { preHandler: (request, reply) => requireUser(request, reply, 'owner') }, async (request, reply) => {
+    if (!options.systemRecoveryService) throw new ApiError(503, 'System recovery is not configured.');
+    const body = objectBody(request.body);
+    const target = stringField(body, 'target') as 'local' | 'nas';
+    if (!['local', 'nas'].includes(target)) throw new ApiError(400, 'target must be local or nas.');
+    const passphrase = opaqueStringField(body, 'passphrase', 16, 1024);
+    try {
+      const backup = await options.systemRecoveryService.createBackup({ requestedByUserId: (request as AuthenticatedRequest).authenticatedUser.id, target, passphrase });
+      return reply.code(201).send({ backup: publicSystemBackup(backup) });
+    } catch (error) {
+      if (error instanceof SystemRecoveryFailure) throw new ApiError(error.statusCode, error.message, error.code);
+      throw error;
+    }
+  });
+  app.post('/api/system-backups/:id/stage-restore', { preHandler: (request, reply) => requireUser(request, reply, 'owner') }, async (request, reply) => {
+    if (!options.systemRecoveryService) throw new ApiError(503, 'System recovery is not configured.');
+    const passphrase = opaqueStringField(objectBody(request.body), 'passphrase', 16, 1024);
+    try {
+      const result = await options.systemRecoveryService.stageRestore({ backupId: idParameter(request), requestedByUserId: (request as AuthenticatedRequest).authenticatedUser.id, passphrase });
+      return reply.code(202).send({ restore: publicSystemRestore(result.restore), restartRequired: result.restartRequired });
+    } catch (error) {
+      if (error instanceof SystemRecoveryFailure) throw new ApiError(error.statusCode, error.message, error.code);
+      throw error;
+    }
   });
   app.post('/api/commands', { preHandler: (request, reply) => requireUser(request, reply, 'operator') }, async (request, reply) => {
     const body = objectBody(request.body);

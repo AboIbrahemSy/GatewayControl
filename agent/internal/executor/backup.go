@@ -18,7 +18,13 @@ import (
 	"gatewaycontrol/agent/internal/types"
 )
 
-const backupManifestVersion = 1
+const backupManifestVersion = 2
+
+type postgresBackupConfig struct {
+	Service  string `json:"service"`
+	Database string `json:"database"`
+	User     string `json:"user"`
+}
 
 type stackBackupPayload struct {
 	BackupID    string `json:"backupId"`
@@ -28,6 +34,7 @@ type stackBackupPayload struct {
 	Target      string `json:"target"`
 	StackPath   string `json:"stackPath"`
 	ComposePath string `json:"composePath"`
+	Postgres    *postgresBackupConfig `json:"postgres,omitempty"`
 }
 
 type stackRestorePayload struct {
@@ -39,6 +46,7 @@ type stackRestorePayload struct {
 	Target      string `json:"target"`
 	StackPath   string `json:"stackPath"`
 	ComposePath string `json:"composePath"`
+	Postgres    *postgresBackupConfig `json:"postgres,omitempty"`
 }
 
 type backupManifest struct {
@@ -50,11 +58,22 @@ type backupManifest struct {
 	Target      string           `json:"target"`
 	CreatedAt   time.Time        `json:"createdAt"`
 	Volumes     []manifestVolume `json:"volumes"`
+	Databases   []manifestDatabase `json:"databases,omitempty"`
 }
 
 type manifestVolume struct {
 	LogicalName string `json:"logicalName"`
 	DockerName  string `json:"dockerName"`
+	ArchiveName string `json:"archiveName"`
+	SizeBytes   int64  `json:"sizeBytes"`
+	SHA256      string `json:"sha256"`
+}
+
+type manifestDatabase struct {
+	Engine      string `json:"engine"`
+	Service     string `json:"service"`
+	Database    string `json:"database"`
+	User        string `json:"user"`
 	ArchiveName string `json:"archiveName"`
 	SizeBytes   int64  `json:"sizeBytes"`
 	SHA256      string `json:"sha256"`
@@ -81,6 +100,9 @@ func (e *Executor) executeStackBackup(ctx context.Context, result types.CommandR
 	if err != nil {
 		return e.failure(result, err)
 	}
+	if len(volumes) == 0 && payload.Postgres == nil {
+		return e.failure(result, errors.New("stack has no owned volumes or configured PostgreSQL database to back up"))
+	}
 	backupRoot, hostBackupRoot, err := e.backupRoots(payload.Target)
 	if err != nil {
 		return e.failure(result, err)
@@ -90,6 +112,14 @@ func (e *Executor) executeStackBackup(ctx context.Context, result types.CommandR
 		return e.failure(result, errors.New("prepare backup destination"))
 	}
 	hostDestination := filepath.Join(hostBackupRoot, strings.ToLower(payload.StackID), strings.ToLower(payload.BackupID))
+	manifest := backupManifest{Version: backupManifestVersion, BackupID: strings.ToLower(payload.BackupID), StackID: strings.ToLower(payload.StackID), ProjectName: payload.ProjectName, Revision: payload.Revision, Target: payload.Target, CreatedAt: time.Now().UTC(), Volumes: make([]manifestVolume, 0, len(volumes)), Databases: make([]manifestDatabase, 0, 1)}
+	if payload.Postgres != nil {
+		database, dumpErr := e.backupPostgres(commandContext, payload.BackupID, payload.ProjectName, destination, *payload.Postgres)
+		if dumpErr != nil {
+			return e.failure(result, dumpErr)
+		}
+		manifest.Databases = append(manifest.Databases, database)
+	}
 	running, err := e.runningServices(commandContext, base)
 	if err != nil {
 		return e.failure(result, err)
@@ -99,7 +129,6 @@ func (e *Executor) executeStackBackup(ctx context.Context, result types.CommandR
 	}
 	defer e.restartServices(commandContext, base, running)
 
-	manifest := backupManifest{Version: backupManifestVersion, BackupID: strings.ToLower(payload.BackupID), StackID: strings.ToLower(payload.StackID), ProjectName: payload.ProjectName, Revision: payload.Revision, Target: payload.Target, CreatedAt: time.Now().UTC(), Volumes: make([]manifestVolume, 0, len(volumes))}
 	for _, volume := range volumes {
 		archiveName := volume.logical + ".tar.gz"
 		if err := e.runHelper(commandContext, "backup", volume.docker, hostDestination, archiveName); err != nil {
@@ -186,6 +215,11 @@ func (e *Executor) executeStackRestore(ctx context.Context, result types.Command
 			return e.failure(result, errors.New("volume restore failed; restore journal retained"))
 		}
 	}
+	for _, database := range manifest.Databases {
+		if err := e.restorePostgres(commandContext, base, hostDirectory, payload.ProjectName, database); err != nil {
+			return e.failure(result, errors.New("PostgreSQL logical restore failed; restore journal retained"))
+		}
+	}
 	if err := os.Remove(journalPath); err != nil {
 		return e.failure(result, errors.New("clear completed restore journal"))
 	}
@@ -200,6 +234,9 @@ func decodeStackBackupPayload(raw json.RawMessage) (stackBackupPayload, error) {
 	if err := validateOperationFields(payload.BackupID, payload.StackID, payload.ProjectName, payload.Revision, payload.Target, payload.StackPath, payload.ComposePath); err != nil {
 		return payload, err
 	}
+	if payload.Postgres != nil && (!composeServicePattern.MatchString(payload.Postgres.Service) || !composeServicePattern.MatchString(payload.Postgres.Database) || !composeServicePattern.MatchString(payload.Postgres.User)) {
+		return payload, errors.New("PostgreSQL backup configuration is invalid")
+	}
 	return payload, nil
 }
 
@@ -213,6 +250,9 @@ func decodeStackRestorePayload(raw json.RawMessage) (stackRestorePayload, error)
 	}
 	if err := validateOperationFields(payload.BackupID, payload.StackID, payload.ProjectName, payload.Revision, payload.Target, payload.StackPath, payload.ComposePath); err != nil {
 		return payload, err
+	}
+	if payload.Postgres != nil && (!composeServicePattern.MatchString(payload.Postgres.Service) || !composeServicePattern.MatchString(payload.Postgres.Database) || !composeServicePattern.MatchString(payload.Postgres.User)) {
+		return payload, errors.New("PostgreSQL restore configuration is invalid")
 	}
 	return payload, nil
 }
@@ -339,13 +379,84 @@ func (e *Executor) runHelper(ctx context.Context, mode, volume, hostDirectory, a
 	return err
 }
 
+func (e *Executor) backupPostgres(ctx context.Context, backupID, projectName, destination string, config postgresBackupConfig) (manifestDatabase, error) {
+	if !composeServicePattern.MatchString(config.Service) || !composeServicePattern.MatchString(config.Database) || !composeServicePattern.MatchString(config.User) {
+		return manifestDatabase{}, errors.New("PostgreSQL backup configuration is invalid")
+	}
+	container, err := e.composeServiceContainer(ctx, projectName, config.Service)
+	if err != nil {
+		return manifestDatabase{}, err
+	}
+	containerPath := "/tmp/gateway-control-" + strings.ToLower(backupID) + ".dump"
+	archiveName := "postgresql-" + config.Service + ".dump"
+	if _, err := e.runner.Run(ctx, "docker", []string{"container", "exec", container, "pg_dump", "--format=custom", "--no-owner", "--no-privileges", "--file", containerPath, "--username", config.User, config.Database}, e.maxOutput); err != nil {
+		return manifestDatabase{}, errors.New("PostgreSQL logical dump failed")
+	}
+	defer e.runner.Run(context.Background(), "docker", []string{"container", "exec", container, "rm", "-f", containerPath}, e.maxOutput)
+	temporaryPath := filepath.Join(destination, "."+archiveName+".tmp")
+	if _, err := e.runner.Run(ctx, "docker", []string{"container", "cp", container + ":" + containerPath, temporaryPath}, e.maxOutput); err != nil {
+		return manifestDatabase{}, errors.New("copy PostgreSQL logical dump")
+	}
+	defer os.Remove(temporaryPath)
+	finalPath := filepath.Join(destination, archiveName)
+	if err := os.Rename(temporaryPath, finalPath); err != nil {
+		return manifestDatabase{}, errors.New("publish PostgreSQL logical dump")
+	}
+	size, checksum, err := checksumRegularFile(finalPath)
+	if err != nil {
+		return manifestDatabase{}, errors.New("verify PostgreSQL logical dump")
+	}
+	return manifestDatabase{Engine: "postgresql", Service: config.Service, Database: config.Database, User: config.User, ArchiveName: archiveName, SizeBytes: size, SHA256: checksum}, nil
+}
+
+func (e *Executor) composeServiceContainer(ctx context.Context, projectName, service string) (string, error) {
+	output, err := e.runner.Run(ctx, "docker", []string{"container", "ls", "--quiet", "--filter", "label=com.docker.compose.project=" + projectName, "--filter", "label=com.docker.compose.service=" + service}, e.maxOutput)
+	containers := nonemptyUniqueLines(output.stdout)
+	if err != nil || len(containers) != 1 || !dockerObjectNamePattern.MatchString(containers[0]) {
+		return "", errors.New("PostgreSQL Compose service must have exactly one running container")
+	}
+	return containers[0], nil
+}
+
+func (e *Executor) restorePostgres(ctx context.Context, base []string, hostDirectory, projectName string, database manifestDatabase) error {
+	if _, err := e.runner.Run(ctx, "docker", append(append([]string{}, base...), "up", "--detach", "--no-deps", database.Service), e.maxOutput); err != nil {
+		return err
+	}
+	container, err := e.composeServiceContainer(ctx, projectName, database.Service)
+	if err != nil {
+		return err
+	}
+	ready := false
+	for attempt := 0; attempt < 30; attempt++ {
+		if _, readyErr := e.runner.Run(ctx, "docker", []string{"container", "exec", container, "pg_isready", "--username", database.User, "--dbname", database.Database}, e.maxOutput); readyErr == nil {
+			ready = true
+			break
+		}
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-time.After(time.Second):
+		}
+	}
+	if !ready {
+		return errors.New("PostgreSQL service did not become ready")
+	}
+	containerPath := "/tmp/" + database.ArchiveName
+	if _, err := e.runner.Run(ctx, "docker", []string{"container", "cp", filepath.Join(hostDirectory, database.ArchiveName), container + ":" + containerPath}, e.maxOutput); err != nil {
+		return err
+	}
+	defer e.runner.Run(context.Background(), "docker", []string{"container", "exec", container, "rm", "-f", containerPath}, e.maxOutput)
+	_, err = e.runner.Run(ctx, "docker", []string{"container", "exec", container, "pg_restore", "--clean", "--if-exists", "--no-owner", "--no-privileges", "--username", database.User, "--dbname", database.Database, containerPath}, e.maxOutput)
+	return err
+}
+
 func loadAndValidateManifest(directory string, payload stackRestorePayload) (backupManifest, error) {
 	contents, exists, err := readRegularFile(filepath.Join(directory, "manifest.json"))
 	if err != nil || !exists || len(contents) > 1<<20 {
 		return backupManifest{}, errors.New("backup manifest is unavailable")
 	}
 	var manifest backupManifest
-	if err := strictDecode(contents, &manifest); err != nil || manifest.Version != backupManifestVersion || !strings.EqualFold(manifest.BackupID, payload.BackupID) || !strings.EqualFold(manifest.StackID, payload.StackID) || manifest.ProjectName != payload.ProjectName || manifest.Revision != payload.Revision || manifest.Target != payload.Target || manifest.CreatedAt.IsZero() || manifest.CreatedAt.After(time.Now().UTC().Add(5*time.Minute)) || len(manifest.Volumes) > 1000 {
+	if err := strictDecode(contents, &manifest); err != nil || (manifest.Version != 1 && manifest.Version != backupManifestVersion) || !strings.EqualFold(manifest.BackupID, payload.BackupID) || !strings.EqualFold(manifest.StackID, payload.StackID) || manifest.ProjectName != payload.ProjectName || manifest.Revision != payload.Revision || manifest.Target != payload.Target || manifest.CreatedAt.IsZero() || manifest.CreatedAt.After(time.Now().UTC().Add(5*time.Minute)) || len(manifest.Volumes) > 1000 || len(manifest.Databases) > 10 {
 		return backupManifest{}, errors.New("backup manifest does not match restore request")
 	}
 	seen := make(map[string]struct{})
@@ -363,6 +474,12 @@ func loadAndValidateManifest(directory string, payload stackRestorePayload) (bac
 		}
 		if err := backuphelper.ValidateArchive(filepath.Join(directory, volume.ArchiveName)); err != nil {
 			return backupManifest{}, errors.New("backup archive safety validation failed")
+		}
+	}
+	for _, database := range manifest.Databases {
+		size, checksum, checksumErr := checksumRegularFile(filepath.Join(directory, database.ArchiveName))
+		if database.Engine != "postgresql" || !composeServicePattern.MatchString(database.Service) || !composeServicePattern.MatchString(database.Database) || !composeServicePattern.MatchString(database.User) || database.ArchiveName != "postgresql-"+database.Service+".dump" || checksumErr != nil || size != database.SizeBytes || !strings.EqualFold(checksum, database.SHA256) {
+			return backupManifest{}, errors.New("backup PostgreSQL artifact validation failed")
 		}
 	}
 	return manifest, nil
@@ -407,11 +524,17 @@ func backupSuccess(result types.CommandResult, backupID, restoreID, stackID, tar
 	var size int64
 	for _, volume := range manifest.Volumes {
 		size += volume.SizeBytes
+		result.Artifacts = append(result.Artifacts, types.BackupArtifact{Type: "volume_archive", Name: volume.LogicalName, SizeBytes: volume.SizeBytes, SHA256: volume.SHA256})
+	}
+	for _, database := range manifest.Databases {
+		size += database.SizeBytes
+		result.Artifacts = append(result.Artifacts, types.BackupArtifact{Type: "postgres_dump", Name: database.Database, SizeBytes: database.SizeBytes, SHA256: database.SHA256})
 	}
 	encoded, _ := json.Marshal(manifest)
 	checksum := sha256.Sum256(encoded)
 	result.Success, result.ExitCode, result.FinishedAt = true, 0, time.Now().UTC()
 	result.BackupID, result.RestoreID, result.StackID, result.Target, result.Revision = backupID, restoreID, stackID, target, revision
-	result.SizeBytes, result.FileCount, result.Checksum = size, len(manifest.Volumes), hex.EncodeToString(checksum[:])
+	result.SizeBytes, result.FileCount, result.Checksum = size, len(result.Artifacts), hex.EncodeToString(checksum[:])
+	result.DurationMs = result.FinishedAt.Sub(result.StartedAt).Milliseconds()
 	return result
 }

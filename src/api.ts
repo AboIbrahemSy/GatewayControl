@@ -13,6 +13,11 @@ export type Connector = {
   enabled: boolean
   cloudflareAccountId: string | null
   tunnelId: string | null
+  deploymentStatus: 'pending' | 'deploying' | 'active' | 'failed' | 'stopped'
+  runtimeStatus: 'unknown' | 'connected' | 'origin_unhealthy' | 'reconnecting' | 'stopped' | 'failed'
+  lastError: string | null
+  lastDeployedAt: string | null
+  lastObservedAt: string | null
   createdAt?: string
   updatedAt?: string
 }
@@ -62,6 +67,11 @@ export type Agent = {
   enrolledAt?: string | null
   enrollmentExpiresAt?: string | null
   lastHeartbeatAt?: string | null
+  lastTelemetryAt?: string | null
+  lastCommandPollAt?: string | null
+  lastCommandResultAt?: string | null
+  healthStatus: 'pending' | 'connected' | 'degraded' | 'offline'
+  diagnostics?: { checks?: Record<string, { state?: 'ready' | 'failed' | 'not_configured'; detail?: string }> } | null
   enabled?: boolean
   metadata?: unknown
   createdAt?: string
@@ -86,6 +96,7 @@ export type ManagedStack = {
   configured: boolean
   revision: number
   status: DeploymentStatus
+  postgresBackupConfig: { service: string; database: string; user: string } | null
   createdAt: string
   updatedAt: string
 }
@@ -147,6 +158,7 @@ export type BackupResult = {
   startedAt?: string
   completedAt?: string
   message?: string
+  artifacts?: Array<{ type: 'volume_archive' | 'postgres_dump'; name: string; sizeBytes: number; sha256: string }>
 }
 
 export type StackBackup = {
@@ -176,8 +188,28 @@ export type StackRestore = {
   completedAt: string | null
 }
 
-export type CreateStackInput = Pick<ManagedStack, 'agentId' | 'name' | 'projectName' | 'enabled'> & { composeYaml: string }
-export type UpdateStackInput = Partial<Pick<ManagedStack, 'name' | 'enabled'>> & { composeYaml?: string }
+export type SystemBackup = {
+  id: string
+  target: 'local' | 'nas'
+  status: 'running' | 'succeeded' | 'failed'
+  sizeBytes: number | null
+  checksum: string | null
+  error: string | null
+  createdAt: string
+  completedAt: string | null
+}
+
+export type SystemRestore = {
+  id: string
+  backupId: string
+  status: 'staging' | 'staged' | 'failed'
+  error: string | null
+  createdAt: string
+  completedAt: string | null
+}
+
+export type CreateStackInput = Pick<ManagedStack, 'agentId' | 'name' | 'projectName' | 'enabled'> & { composeYaml: string; postgresBackupConfig?: ManagedStack['postgresBackupConfig'] }
+export type UpdateStackInput = Partial<Pick<ManagedStack, 'name' | 'enabled' | 'postgresBackupConfig'>> & { composeYaml?: string }
 export type CreateRouteInput = Pick<ManagedRoute, 'gatewayAgentId' | 'name' | 'hostname' | 'exposure' | 'backends' | 'enabled'>
 export type UpdateRouteInput = Partial<CreateRouteInput>
 export type CreateConnectorInput = Pick<Connector, 'agentId' | 'name' | 'enabled'> & {
@@ -191,7 +223,7 @@ export type UpdateCloudflareAccountInput = Partial<Pick<CloudflareAccount, 'name
 export type CreateCloudflarePublicHostnameInput = Pick<CloudflarePublicHostname, 'connectorId' | 'routeId' | 'proxied'> & { zoneId: string }
 
 export class ApiError extends Error {
-  public constructor(public readonly status: number, message: string) {
+  public constructor(public readonly status: number, message: string, public readonly code?: string) {
     super(message)
     this.name = 'ApiError'
   }
@@ -210,17 +242,19 @@ async function request<T>(path: string, init: RequestInit = {}): Promise<T> {
 
   if (!response.ok) {
     let message = 'The request could not be completed.'
+    let code: string | undefined
 
     try {
-      const body = (await response.json()) as { error?: unknown }
+      const body = (await response.json()) as { error?: unknown; code?: unknown }
       if (typeof body.error === 'string' && body.error.length <= 500) {
         message = body.error
       }
+      if (typeof body.code === 'string' && /^[a-z][a-z0-9_]{0,63}$/.test(body.code)) code = body.code
     } catch {
       // Do not expose proxy responses or untrusted HTML as application errors.
     }
 
-    throw new ApiError(response.status, message)
+    throw new ApiError(response.status, message, code)
   }
 
   if (response.status === 204) {
@@ -279,6 +313,9 @@ export const api = {
     }>('/agents', { method: 'POST', body: JSON.stringify({ name, baseUrl, image }) }),
   removeAgent: (id: string) =>
     request<{ mode: 'deleted' | 'archived'; cleanupCommand: string }>(`/agents/${encodeURIComponent(id)}`, { method: 'DELETE' }),
+  runAgentDiagnostics: (id: string) =>
+    request<{ command: { id: string; status: CommandStatus } }>(`/agents/${encodeURIComponent(id)}/diagnostics`, { method: 'POST' }),
+  command: (id: string) => request<{ command: { id: string; status: CommandStatus; result?: Record<string, unknown> | null } }>(`/commands/${encodeURIComponent(id)}`),
   stacks: () => request<{ stacks: ManagedStack[] }>('/stacks'),
   createStack: (input: CreateStackInput) =>
     request<{ stack: ManagedStack }>('/stacks', { method: 'POST', body: JSON.stringify(input) }),
@@ -305,6 +342,11 @@ export const api = {
     }),
   restoreBackup: (id: string) =>
     request<{ restore: StackRestore }>(`/backups/${encodeURIComponent(id)}/restore`, { method: 'POST' }),
+  systemBackups: () => request<{ backups: SystemBackup[]; restores: SystemRestore[] }>('/system-backups'),
+  createSystemBackup: (target: SystemBackup['target'], passphrase: string) =>
+    request<{ backup: SystemBackup }>('/system-backups', { method: 'POST', body: JSON.stringify({ target, passphrase }) }),
+  stageSystemRestore: (id: string, passphrase: string) =>
+    request<{ restore: SystemRestore; restartRequired: true }>(`/system-backups/${encodeURIComponent(id)}/stage-restore`, { method: 'POST', body: JSON.stringify({ passphrase }) }),
   routes: () => request<{ routes: ManagedRoute[] }>('/routes'),
   createRoute: (input: CreateRouteInput) =>
     request<{ route: ManagedRoute }>('/routes', { method: 'POST', body: JSON.stringify(input) }),

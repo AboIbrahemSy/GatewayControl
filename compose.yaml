@@ -19,9 +19,11 @@ services:
         chmod 0400 /secrets/master-key
         chmod 0444 /secrets/database-password
         install -d -o 10001 -g 10001 -m 0755 /traefik-dynamic
+        install -d -o 1000 -g 1000 -m 0700 /system-backups
     volumes:
       - gateway_secrets:/secrets
       - traefik_dynamic:/traefik-dynamic
+      - ${GATEWAY_SYSTEM_BACKUP_LOCAL_ROOT:-/opt/gateway-control/backups/system}:/system-backups
     security_opt:
       - no-new-privileges:true
 
@@ -70,8 +72,14 @@ services:
       TRUST_PROXY: ${TRUST_PROXY:-false}
       GATEWAY_AGENT_IMAGE: ${GATEWAY_AGENT_IMAGE:-gateway-control-agent:local}
       GATEWAY_TRAEFIK_DYNAMIC_VOLUME: ${GATEWAY_TRAEFIK_DYNAMIC_VOLUME:-gateway-traefik-dynamic}
+      GATEWAY_SYSTEM_BACKUP_LOCAL_ROOT: ${GATEWAY_SYSTEM_BACKUP_LOCAL_ROOT:-/opt/gateway-control/backups/system}
+      GATEWAY_SYSTEM_BACKUP_NAS_ROOT: ${GATEWAY_SYSTEM_BACKUP_NAS_ROOT:-/mnt/gateway-control-backups}
+      GATEWAY_SYSTEM_BACKUP_NAS_MARKER: ${GATEWAY_SYSTEM_BACKUP_NAS_MARKER:-.gateway-control-nas}
+      GATEWAY_SYSTEM_RESTORE_STAGE_ROOT: ${GATEWAY_SYSTEM_RESTORE_STAGE_ROOT:-/opt/gateway-control/backups/system/.restore-stage}
     volumes:
       - gateway_secrets:/run/gateway-secrets:ro
+      - ${GATEWAY_SYSTEM_BACKUP_LOCAL_ROOT:-/opt/gateway-control/backups/system}:${GATEWAY_SYSTEM_BACKUP_LOCAL_ROOT:-/opt/gateway-control/backups/system}
+      - ${GATEWAY_SYSTEM_BACKUP_NAS_ROOT:-/mnt/gateway-control-backups}:${GATEWAY_SYSTEM_BACKUP_NAS_ROOT:-/mnt/gateway-control-backups}
     networks:
       - control
       - edge

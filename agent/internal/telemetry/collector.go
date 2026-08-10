@@ -27,6 +27,8 @@ type Runner interface {
 type Collector struct {
 	procRoot string
 	runner   Runner
+	previousCPUTotal uint64
+	previousCPUIdle  uint64
 }
 
 func New(procRoot string) *Collector {
@@ -87,7 +89,39 @@ func (c *Collector) collectNode() (types.TelemetryNode, error) {
 	if scanner.Err() != nil || total == 0 || available > total {
 		return types.TelemetryNode{}, errors.New("parse host memory")
 	}
-	return types.TelemetryNode{UptimeSeconds: numbers[0], Load1: numbers[1], Load5: numbers[2], Load15: numbers[3], MemoryTotalBytes: total, MemoryAvailableBytes: available}, nil
+	cpuPercent := c.collectCPUPercent()
+	return types.TelemetryNode{UptimeSeconds: numbers[0], Load1: numbers[1], Load5: numbers[2], Load15: numbers[3], MemoryTotalBytes: total, MemoryAvailableBytes: available, CPUPercent: cpuPercent}, nil
+}
+
+func (c *Collector) collectCPUPercent() float64 {
+	fields, err := readFields(filepath.Join(c.procRoot, "stat"))
+	if err != nil || len(fields) < 6 || fields[0] != "cpu" {
+		return 0
+	}
+	var total uint64
+	values := make([]uint64, 0, len(fields)-1)
+	for _, field := range fields[1:] {
+		value, parseErr := strconv.ParseUint(field, 10, 64)
+		if parseErr != nil {
+			return 0
+		}
+		values = append(values, value)
+		total += value
+	}
+	idle := values[3]
+	if len(values) > 4 {
+		idle += values[4]
+	}
+	previousTotal, previousIdle := c.previousCPUTotal, c.previousCPUIdle
+	c.previousCPUTotal, c.previousCPUIdle = total, idle
+	if previousTotal == 0 || total <= previousTotal || idle < previousIdle {
+		return 0
+	}
+	totalDelta, idleDelta := total-previousTotal, idle-previousIdle
+	if idleDelta >= totalDelta {
+		return 0
+	}
+	return float64(totalDelta-idleDelta) * 100 / float64(totalDelta)
 }
 
 func (c *Collector) collectServices(ctx context.Context) ([]types.TelemetryService, error) {

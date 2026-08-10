@@ -114,6 +114,10 @@ The root `.env.example` contains safe local defaults:
 | `SESSION_COOKIE_SECURE` | Restrict session cookies to HTTPS | `false` for local setup |
 | `TRUST_PROXY` | Trust forwarded proxy information | `false` |
 | `GATEWAY_TRAEFIK_DYNAMIC_VOLUME` | Shared Agent and Traefik route volume | `gateway-traefik-dynamic` |
+| `GATEWAY_SYSTEM_BACKUP_LOCAL_ROOT` | Control-plane system backup and restore-staging root | `/opt/gateway-control/backups/system` |
+| `GATEWAY_SYSTEM_BACKUP_NAS_ROOT` | Canonical pre-mounted NAS path passed to the control plane and generated Agents | `/mnt/gateway-control-backups` |
+| `GATEWAY_SYSTEM_BACKUP_NAS_MARKER` | Required regular marker file name passed to the control plane and generated Agents | `.gateway-control-nas` |
+| `GATEWAY_SYSTEM_RESTORE_STAGE_ROOT` | Private startup restore staging directory | `/opt/gateway-control/backups/system/.restore-stage` |
 
 Do not commit `.env`. Database credentials and the control-plane encryption key are generated into a Docker volume during bootstrap.
 
@@ -233,7 +237,9 @@ sudo chown -R 10001:10001 /mnt/gateway-control-backups
 
 Configure a persistent mount with the host's normal system configuration, such as `/etc/fstab`. Adapt ownership and access controls to the NAS implementation while ensuring Agent UID `10001` can write.
 
-The marker file is mandatory. If the NAS path or marker is unavailable, the operation fails and never falls back silently to local storage.
+The marker file is mandatory. Configure `GATEWAY_SYSTEM_BACKUP_NAS_ROOT` and `GATEWAY_SYSTEM_BACKUP_NAS_MARKER` before generating enrollment commands; GatewayControl passes that same root and marker contract to Agents and mounts the root at the identical container path. If the NAS path or marker is unavailable, the operation fails and never falls back silently to local storage.
+
+Owner system recovery is a same-instance database rollback feature, not master-key disaster recovery. Its encrypted archive includes `master.key` only as an authenticated instance identity check. Restoring requires the original configured master key, and the archived key is never installed or restored.
 
 ## Restore
 

@@ -14,6 +14,11 @@ export interface Connector {
   enabled: boolean;
   cloudflareAccountId: string | null;
   tunnelId: string | null;
+  deploymentStatus: 'pending' | 'deploying' | 'active' | 'failed' | 'stopped';
+  runtimeStatus: 'unknown' | 'connected' | 'origin_unhealthy' | 'reconnecting' | 'stopped' | 'failed';
+  lastError: string | null;
+  lastDeployedAt: string | null;
+  lastObservedAt: string | null;
   createdAt: string;
   updatedAt: string;
 }
@@ -89,6 +94,7 @@ export interface ManagedStack {
   configured: boolean;
   revision: number;
   status: DeploymentStatus;
+  postgresBackupConfig: { service: string; database: string; user: string } | null;
   createdAt: string;
   updatedAt: string;
 }
@@ -122,6 +128,12 @@ export interface Agent {
   enabled: boolean;
   enrolledAt: string | null;
   lastHeartbeatAt: string | null;
+  lastTelemetryAt: string | null;
+  lastCommandPollAt: string | null;
+  lastCommandResultAt: string | null;
+  healthStatus: 'pending' | 'connected' | 'degraded' | 'offline';
+  diagnostics: Record<string, unknown> | null;
+  metadata: Record<string, unknown> | null;
   createdAt: string;
 }
 
@@ -176,6 +188,32 @@ export interface StackRestore {
   completedAt: string | null;
 }
 
+export interface SystemBackup {
+  id: string;
+  requestedByUserId: string;
+  target: BackupTarget;
+  status: 'running' | 'succeeded' | 'failed';
+  sizeBytes: number | null;
+  checksum: string | null;
+  error: string | null;
+  createdAt: string;
+  completedAt: string | null;
+}
+
+export interface StoredSystemBackup extends SystemBackup {
+  artifactPath: string;
+}
+
+export interface SystemRestore {
+  id: string;
+  backupId: string;
+  requestedByUserId: string;
+  status: 'staging' | 'staged' | 'failed';
+  error: string | null;
+  createdAt: string;
+  completedAt: string | null;
+}
+
 export interface NotificationDelivery {
   id: string;
   eventId: string;
@@ -210,8 +248,8 @@ export interface Store {
   getCloudflareHostnameDeployment(id: string): Promise<CloudflareHostnameDeployment | null>;
   markCloudflareHostnameOutcome(id: string, values: { status: 'active' | 'failed'; enabled: boolean; dnsRecordId?: string | null; lastError?: string | null }): Promise<CloudflarePublicHostname | null>;
   listStacks(): Promise<ManagedStack[]>;
-  createStack(values: { agentId: string; name: string; projectName: string; encryptedComposeYaml: string; enabled: boolean }): Promise<ManagedStack | null>;
-  updateStack(id: string, values: { name?: string; encryptedComposeYaml?: string; enabled?: boolean }): Promise<ManagedStack | null>;
+  createStack(values: { agentId: string; name: string; projectName: string; encryptedComposeYaml: string; enabled: boolean; postgresBackupConfig?: { service: string; database: string; user: string } }): Promise<ManagedStack | null>;
+  updateStack(id: string, values: { name?: string; encryptedComposeYaml?: string; enabled?: boolean; postgresBackupConfig?: { service: string; database: string; user: string } | null }): Promise<ManagedStack | null>;
   getStackDeployment(stackId: string): Promise<StackDeployment | null>;
   queueStackAction(stackId: string, type: 'compose.restart' | 'compose.stop'): Promise<AgentCommand | null>;
   listRoutes(): Promise<ManagedRoute[]>;
@@ -238,6 +276,14 @@ export interface Store {
   createRestore(backupId: string, requestedByUserId: string): Promise<StackRestore | 'active' | null>;
   listRestores(): Promise<StackRestore[]>;
   getRestoreDeployment(restoreId: string): Promise<{ restore: StackRestore; backup: StackBackup; stack: StackDeployment } | null>;
+  createSystemBackup(requestedByUserId: string, target: BackupTarget, artifactPath: string): Promise<StoredSystemBackup>;
+  completeSystemBackup(id: string, sizeBytes: number, checksum: string): Promise<SystemBackup>;
+  failSystemBackup(id: string, error: string): Promise<SystemBackup>;
+  listSystemBackups(): Promise<SystemBackup[]>;
+  getSystemBackup(id: string): Promise<StoredSystemBackup | null>;
+  createSystemRestore(backupId: string, requestedByUserId: string, status: 'staging' | 'failed', error?: string): Promise<SystemRestore>;
+  updateSystemRestore(id: string, status: 'staged' | 'failed', error?: string): Promise<SystemRestore>;
+  listSystemRestores(): Promise<SystemRestore[]>;
   claimNotificationDelivery(): Promise<NotificationDelivery | null>;
   completeNotificationDelivery(id: string): Promise<void>;
   retryNotificationDelivery(id: string, error: string, delaySeconds: number, terminal: boolean): Promise<void>;
@@ -245,6 +291,7 @@ export interface Store {
   failStaleCommands(staleBefore: Date): Promise<number>;
   createCommand(agentId: string, type: string, payload: Record<string, unknown>): Promise<AgentCommand | null>;
   listCommands(agentId?: string): Promise<AgentCommand[]>;
+  getCommand(id: string): Promise<AgentCommand | null>;
   claimCommands(agentId: string, limit: number): Promise<AgentCommand[]>;
   completeCommand(agentId: string, commandId: string, status: 'succeeded' | 'failed', result: Record<string, unknown>): Promise<'updated' | 'idempotent' | 'conflict' | 'missing'>;
   close(): Promise<void>;

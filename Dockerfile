@@ -26,7 +26,7 @@ ENV NODE_ENV=production \
     PORT=3000 \
     WEB_ROOT=/app/public
 WORKDIR /app/server
-RUN apk add --no-cache ca-certificates dumb-init
+RUN apk add --no-cache ca-certificates dumb-init postgresql17-client tar
 COPY server/package.json server/package-lock.json ./
 RUN npm ci --omit=dev --no-audit --no-fund
 COPY --from=server-build /build/server/dist ./dist

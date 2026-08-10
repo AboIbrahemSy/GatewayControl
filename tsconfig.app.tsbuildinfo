@@ -1,1 +1,1 @@
-{"root":["./src/app.tsx","./src/backupspage.tsx","./src/cloudflaremanagementpage.tsx","./src/observabilitypages.tsx","./src/operationspages.tsx","./src/api.ts","./src/clipboard.ts","./src/main.tsx"],"version":"5.9.3"}
+{"root":["./src/app.tsx","./src/backupspage.tsx","./src/cloudflaremanagementpage.tsx","./src/modal.tsx","./src/observabilitypages.tsx","./src/operationspages.tsx","./src/api.ts","./src/clipboard.ts","./src/main.tsx"],"version":"5.9.3"}

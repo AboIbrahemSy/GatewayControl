@@ -57,7 +57,7 @@ func (e *Executor) executeConnectorSync(ctx context.Context, result types.Comman
 		if tokenErr != nil {
 			return e.connectorFailure(result, commandContext, payload.Token, "remove connector token", runOutput{}, tokenErr)
 		}
-		return connectorSuccess(result, "cloudflare connector disabled")
+		return connectorSuccess(result, "cloudflare connector disabled", "stopped")
 	}
 
 	if err := writeTokenAtomically(tokenPath, payload.Token); err != nil {
@@ -100,7 +100,8 @@ func (e *Executor) executeConnectorSync(ctx context.Context, result types.Comman
 	if output, err := e.runner.Run(commandContext, "docker", []string{"container", "rename", candidateContainerName, containerName}, e.maxOutput); err != nil {
 		return e.connectorFailure(result, commandContext, payload.Token, "promote connector candidate", output, err)
 	}
-	return connectorSuccess(result, "cloudflare connector enabled")
+	diagnostic := e.connectorRuntimeDiagnostic(commandContext, payload.ConnectorID)
+	return connectorSuccess(result, "cloudflare connector enabled", diagnostic.Status)
 }
 
 func decodeConnectorSyncPayload(raw json.RawMessage) (connectorSyncPayload, error) {
@@ -263,12 +264,50 @@ func currentNumericIdentity() string {
 	return current.Uid + ":" + current.Gid
 }
 
-func connectorSuccess(result types.CommandResult, message string) types.CommandResult {
+func connectorSuccess(result types.CommandResult, message, runtimeStatus string) types.CommandResult {
 	result.Success = true
 	result.ExitCode = 0
 	result.Stdout = message
+	result.Message = message
+	result.RuntimeStatus = runtimeStatus
 	result.FinishedAt = time.Now().UTC()
 	return result
+}
+
+func (e *Executor) connectorDiagnostics(ctx context.Context) map[string]types.ConnectorDiagnostic {
+	entries, err := os.ReadDir(filepath.Join(e.stateDir, "connectors"))
+	if err != nil {
+		return nil
+	}
+	result := make(map[string]types.ConnectorDiagnostic)
+	for _, entry := range entries {
+		if entry.IsDir() || filepath.Ext(entry.Name()) != ".token" {
+			continue
+		}
+		connectorID := strings.TrimSuffix(entry.Name(), ".token")
+		if !connectorUUIDPattern.MatchString(connectorID) || len(result) >= 100 {
+			continue
+		}
+		result[connectorID] = e.connectorRuntimeDiagnostic(ctx, connectorID)
+	}
+	return result
+}
+
+func (e *Executor) connectorRuntimeDiagnostic(ctx context.Context, connectorID string) types.ConnectorDiagnostic {
+	containerName := connectorContainerName(connectorID)
+	output, err := e.runner.Run(ctx, "docker", []string{"container", "inspect", "--format", "{{.State.Running}}", containerName}, e.maxOutput)
+	if err != nil || strings.TrimSpace(output.stdout) != "true" {
+		return types.ConnectorDiagnostic{Status: "stopped", Error: "connector container is not running"}
+	}
+	logs, _ := e.runner.Run(ctx, "docker", []string{"container", "logs", "--tail", "200", containerName}, e.maxOutput)
+	text := strings.ToLower(logs.stdout + "\n" + logs.stderr)
+	if strings.Contains(text, "unable to reach the origin service") {
+		return types.ConnectorDiagnostic{Status: "origin_unhealthy", Error: "Cloudflare is connected but the origin service is unreachable"}
+	}
+	if strings.Contains(text, "registered tunnel connection") {
+		return types.ConnectorDiagnostic{Status: "connected"}
+	}
+	return types.ConnectorDiagnostic{Status: "reconnecting", Error: "waiting for a registered tunnel connection"}
 }
 
 func (e *Executor) connectorFailure(result types.CommandResult, ctx context.Context, token, action string, output runOutput, err error) types.CommandResult {

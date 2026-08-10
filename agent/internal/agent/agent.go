@@ -74,6 +74,7 @@ func (a *Agent) Run(ctx context.Context) error {
 		EdgeNetwork: a.config.EdgeNetwork, Timeout: a.config.CommandTimeout,
 		TraefikDynamicRoot: a.config.TraefikDynamicRoot, TraefikDynamicVolume: a.config.TraefikDynamicVolume,
 		InfoTimeout: a.config.DockerInfoTimeout, MaxOutput: a.config.MaxOutputBytes,
+		HostProcRoot: a.config.HostProcRoot,
 	}, a.config.EnrollmentToken, credentials.APICredential)
 	if err != nil {
 		return err
@@ -173,7 +174,7 @@ func (a *Agent) sendHeartbeat(ctx context.Context, credentials state.Credentials
 	operatingSystem, architecture := executor.RuntimePlatform()
 	heartbeat := types.Heartbeat{
 		Hostname: hostname, OS: operatingSystem, Architecture: architecture,
-		AgentVersion: a.version, Docker: a.executor.DockerStatus(ctx),
+		AgentVersion: a.version, Docker: a.executor.DockerStatus(ctx), Diagnostics: a.executor.Diagnostics(ctx),
 	}
 	if err := a.client.Heartbeat(ctx, credentials, heartbeat); err != nil && ctx.Err() == nil {
 		a.logger.Warn("heartbeat failed", "error", err)

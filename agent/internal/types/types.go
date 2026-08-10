@@ -38,12 +38,41 @@ type CommandResult struct {
 	SizeBytes  int64     `json:"sizeBytes,omitempty"`
 	FileCount  int       `json:"fileCount,omitempty"`
 	Checksum   string    `json:"checksum,omitempty"`
+	Diagnostics *Diagnostics `json:"diagnostics,omitempty"`
+	RuntimeStatus string       `json:"runtimeStatus,omitempty"`
+	Message       string       `json:"message,omitempty"`
+	DurationMs    int64        `json:"durationMs,omitempty"`
+	Artifacts     []BackupArtifact `json:"artifacts,omitempty"`
+}
+
+type BackupArtifact struct {
+	Type      string `json:"type"`
+	Name      string `json:"name"`
+	SizeBytes int64  `json:"sizeBytes"`
+	SHA256    string `json:"sha256"`
 }
 
 type DockerStatus struct {
 	CLIAvailable    bool   `json:"cli_available"`
 	DaemonAvailable bool   `json:"daemon_available"`
 	Version         string `json:"version,omitempty"`
+	ComposeAvailable bool   `json:"compose_available"`
+	ComposeVersion   string `json:"compose_version,omitempty"`
+}
+
+type DiagnosticCheck struct {
+	State  string `json:"state"`
+	Detail string `json:"detail,omitempty"`
+}
+
+type Diagnostics struct {
+	Checks     map[string]DiagnosticCheck     `json:"checks"`
+	Connectors map[string]ConnectorDiagnostic `json:"connectors,omitempty"`
+}
+
+type ConnectorDiagnostic struct {
+	Status string `json:"status"`
+	Error  string `json:"error,omitempty"`
 }
 
 type Heartbeat struct {
@@ -52,6 +81,7 @@ type Heartbeat struct {
 	Architecture string       `json:"architecture"`
 	AgentVersion string       `json:"agent_version"`
 	Docker       DockerStatus `json:"docker"`
+	Diagnostics  Diagnostics  `json:"diagnostics"`
 }
 
 type Telemetry struct {
@@ -67,6 +97,7 @@ type TelemetryNode struct {
 	Load15               float64 `json:"load15"`
 	MemoryTotalBytes     uint64  `json:"memoryTotalBytes"`
 	MemoryAvailableBytes uint64  `json:"memoryAvailableBytes"`
+	CPUPercent           float64 `json:"cpuPercent"`
 }
 
 type TelemetryService struct {

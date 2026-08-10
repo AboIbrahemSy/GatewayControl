@@ -36,6 +36,7 @@ type Executor struct {
 	edgeNetwork          string
 	traefikDynamicRoot   string
 	traefikDynamicVolume string
+	hostProcRoot          string
 	timeout              time.Duration
 	backupTimeout        time.Duration
 	infoTimeout          time.Duration
@@ -59,6 +60,7 @@ type Options struct {
 	EdgeNetwork          string
 	TraefikDynamicRoot   string
 	TraefikDynamicVolume string
+	HostProcRoot          string
 	Timeout              time.Duration
 	BackupTimeout        time.Duration
 	InfoTimeout          time.Duration
@@ -87,6 +89,9 @@ func New(options Options, secrets ...string) (*Executor, error) {
 		if strings.ContainsAny(value, ",\r\n\x00") {
 			return nil, fmt.Errorf("%s contains unsafe Docker mount characters", name)
 		}
+	}
+	if !filepath.IsAbs(options.HostProcRoot) || filepath.Clean(options.HostProcRoot) != options.HostProcRoot {
+		return nil, errors.New("host proc root must be an absolute, clean path")
 	}
 	if backupPathsOverlap(options.LocalBackupRoot, options.NASBackupRoot) || backupPathsOverlap(options.HostLocalBackupRoot, options.HostNASBackupRoot) {
 		return nil, errors.New("local and NAS backup roots must not overlap")
@@ -125,6 +130,7 @@ func New(options Options, secrets ...string) (*Executor, error) {
 		nasMarker: options.NASMarker, agentImage: options.AgentImage, backupTimeout: options.BackupTimeout,
 		edgeNetwork: options.EdgeNetwork, timeout: options.Timeout, infoTimeout: options.InfoTimeout,
 		traefikDynamicRoot: traefikDynamicRoot, traefikDynamicVolume: options.TraefikDynamicVolume,
+		hostProcRoot: options.HostProcRoot,
 		maxOutput: options.MaxOutput, secrets: secrets, runner: osCommandRunner{},
 	}, nil
 }
@@ -164,6 +170,13 @@ func (e *Executor) Execute(ctx context.Context, command types.Command) types.Com
 			return e.failure(result, err)
 		}
 		name, args, timeout = "docker", []string{"info", "--format", "{{json .}}"}, e.infoTimeout
+	case "agent.diagnostics.run":
+		if err := requireEmptyPayload(command.Payload); err != nil {
+			return e.failure(result, err)
+		}
+		diagnostics := e.Diagnostics(ctx)
+		result.Success, result.ExitCode, result.Diagnostics, result.FinishedAt = true, 0, &diagnostics, time.Now().UTC()
+		return result
 	case "compose.ps", "compose.up", "compose.stop", "compose.restart":
 		payload, err := decodeComposePayload(command.Payload)
 		if err != nil {
@@ -243,7 +256,74 @@ func (e *Executor) DockerStatus(ctx context.Context) types.DockerStatus {
 		status.DaemonAvailable = true
 		status.Version = strings.TrimSpace(output.stdout)
 	}
+	composeOutput, composeErr := e.runner.Run(commandContext, "docker", []string{"compose", "version", "--short"}, e.maxOutput)
+	if composeErr == nil {
+		status.ComposeAvailable = true
+		status.ComposeVersion = strings.TrimSpace(composeOutput.stdout)
+	}
 	return status
+}
+
+func (e *Executor) Diagnostics(ctx context.Context) types.Diagnostics {
+	checks := map[string]types.DiagnosticCheck{
+		"hostProc":        pathReadableCheck(filepath.Join(e.hostProcRoot, "uptime")),
+		"stateStorage":    pathWritableCheck(e.stateDir),
+		"stacksStorage":   pathWritableCheck(e.stacksRoot),
+		"localBackups":    pathWritableCheck(e.localBackupRoot),
+		"traefikStorage":  pathWritableCheck(e.traefikDynamicRoot),
+		"nasBackups":      e.nasDiagnostic(),
+		"edgeNetwork":     e.dockerObjectDiagnostic(ctx, "network", e.edgeNetwork),
+		"agentImage":      e.dockerObjectDiagnostic(ctx, "image", e.agentImage),
+		"cloudflaredImage": e.dockerObjectDiagnostic(ctx, "image", e.cloudflaredImage),
+	}
+	return types.Diagnostics{Checks: checks, Connectors: e.connectorDiagnostics(ctx)}
+}
+
+func pathReadableCheck(path string) types.DiagnosticCheck {
+	info, err := os.Stat(path)
+	if err != nil || !info.Mode().IsRegular() {
+		return types.DiagnosticCheck{State: "failed", Detail: "required host file is unavailable"}
+	}
+	return types.DiagnosticCheck{State: "ready"}
+}
+
+func pathWritableCheck(path string) types.DiagnosticCheck {
+	info, err := os.Stat(path)
+	if err != nil || !info.IsDir() {
+		return types.DiagnosticCheck{State: "failed", Detail: "required directory is unavailable"}
+	}
+	file, err := os.CreateTemp(path, ".gateway-control-write-check-*")
+	if err != nil {
+		return types.DiagnosticCheck{State: "failed", Detail: "required directory is not writable"}
+	}
+	name := file.Name()
+	closeErr := file.Close()
+	removeErr := os.Remove(name)
+	if closeErr != nil || removeErr != nil {
+		return types.DiagnosticCheck{State: "failed", Detail: "temporary write check could not be completed"}
+	}
+	return types.DiagnosticCheck{State: "ready"}
+}
+
+func (e *Executor) nasDiagnostic() types.DiagnosticCheck {
+	info, err := os.Stat(e.nasBackupRoot)
+	if err != nil || !info.IsDir() {
+		return types.DiagnosticCheck{State: "not_configured"}
+	}
+	marker, err := os.Stat(filepath.Join(e.nasBackupRoot, e.nasMarker))
+	if err != nil || !marker.Mode().IsRegular() {
+		return types.DiagnosticCheck{State: "not_configured"}
+	}
+	return pathWritableCheck(e.nasBackupRoot)
+}
+
+func (e *Executor) dockerObjectDiagnostic(ctx context.Context, kind, name string) types.DiagnosticCheck {
+	commandContext, cancel := context.WithTimeout(ctx, e.infoTimeout)
+	defer cancel()
+	if _, err := e.runner.Run(commandContext, "docker", []string{kind, "inspect", name}, e.maxOutput); err != nil {
+		return types.DiagnosticCheck{State: "failed", Detail: kind + " is unavailable"}
+	}
+	return types.DiagnosticCheck{State: "ready"}
 }
 
 func decodeComposePayload(raw json.RawMessage) (types.ComposePayload, error) {

@@ -1,5 +1,5 @@
 import { randomUUID } from 'node:crypto';
-import type { Agent, AgentCommand, BackupTarget, CloudflareAccount, CloudflareAccountSecret, CloudflareHostnameDeployment, CloudflarePublicHostname, CloudflareZone, Connector, ConnectorDeployment, ManagedRoute, ManagedStack, NotificationDelivery, NotificationSettings, OperationalEventType, Role, StackBackup, StackDeployment, StackRestore, Store, TelemetrySnapshot, User } from '../src/types.js';
+import type { Agent, AgentCommand, BackupTarget, CloudflareAccount, CloudflareAccountSecret, CloudflareHostnameDeployment, CloudflarePublicHostname, CloudflareZone, Connector, ConnectorDeployment, ManagedRoute, ManagedStack, NotificationDelivery, NotificationSettings, OperationalEventType, Role, StackBackup, StackDeployment, StackRestore, Store, StoredSystemBackup, SystemBackup, SystemRestore, TelemetrySnapshot, User } from '../src/types.js';
 
 export class FakeStore implements Store {
   public users: User[] = [];
@@ -17,6 +17,8 @@ export class FakeStore implements Store {
   public telemetry: TelemetrySnapshot[] = [];
   public backups: StackBackup[] = [];
   public restores: StackRestore[] = [];
+  public systemBackups: StoredSystemBackup[] = [];
+  public systemRestores: SystemRestore[] = [];
   public events: Array<{ id: string; type: OperationalEventType; payload: Record<string, unknown>; occurredAt: string }> = [];
   public deliveries: Array<NotificationDelivery & { status: 'pending' | 'dispatching' | 'succeeded' | 'failed'; error?: string }> = [];
 
@@ -45,7 +47,11 @@ export class FakeStore implements Store {
     if (!this.agents.some((agent) => agent.id === agentId && agent.enabled)) return null;
     if (cloudflareAccountId && !this.cloudflareAccounts.some((account) => account.id === cloudflareAccountId)) return null;
     const now = new Date().toISOString();
-    const created = { id: randomUUID(), agentId, name, enabled, cloudflareAccountId: cloudflareAccountId ?? null, tunnelId: tunnelId ?? null, encryptedToken, createdAt: now, updatedAt: now };
+    const created = {
+      id: randomUUID(), agentId, name, enabled, cloudflareAccountId: cloudflareAccountId ?? null, tunnelId: tunnelId ?? null,
+      deploymentStatus: 'pending' as const, runtimeStatus: 'unknown' as const, lastError: null, lastDeployedAt: null,
+      lastObservedAt: null, encryptedToken, createdAt: now, updatedAt: now,
+    };
     this.connectors.push(created);
     if (enabled) this.queueInternalSync(agentId, 'cloudflare.connector.sync', 'connectorId', created.id);
     const { encryptedToken: _, ...publicConnector } = created;
@@ -57,7 +63,7 @@ export class FakeStore implements Store {
     const targetAgentId = values.agentId ?? item.agentId;
     if (!this.agents.some((agent) => agent.id === targetAgentId && agent.enabled)) return null;
     if (values.cloudflareAccountId && !this.cloudflareAccounts.some((account) => account.id === values.cloudflareAccountId)) return null;
-    Object.assign(item, values, { updatedAt: new Date().toISOString() });
+    Object.assign(item, values, { deploymentStatus: 'pending', runtimeStatus: 'unknown', lastError: null, updatedAt: new Date().toISOString() });
     this.queueInternalSync(item.agentId, 'cloudflare.connector.sync', 'connectorId', item.id);
     const { encryptedToken: _, ...publicConnector } = item;
     return publicConnector;
@@ -136,16 +142,16 @@ export class FakeStore implements Store {
     return item;
   }
   public async listStacks(): Promise<ManagedStack[]> { return this.stacks.map(({ encryptedComposeYaml: _, ...item }) => item); }
-  public async createStack(values: { agentId: string; name: string; projectName: string; encryptedComposeYaml: string; enabled: boolean }): Promise<ManagedStack | null> {
+  public async createStack(values: { agentId: string; name: string; projectName: string; encryptedComposeYaml: string; enabled: boolean; postgresBackupConfig?: { service: string; database: string; user: string } }): Promise<ManagedStack | null> {
     if (!this.agents.some((agent) => agent.id === values.agentId && agent.enabled)) return null;
     const now = new Date().toISOString();
-    const created = { id: randomUUID(), ...values, configured: true, revision: 1, status: 'pending' as const, createdAt: now, updatedAt: now };
+    const created = { id: randomUUID(), ...values, postgresBackupConfig: values.postgresBackupConfig ?? null, configured: true, revision: 1, status: 'pending' as const, createdAt: now, updatedAt: now };
     this.stacks.push(created);
     this.queueInternalSync(created.agentId, 'compose.stack.sync', 'stackId', created.id);
     const { encryptedComposeYaml: _, ...publicStack } = created;
     return publicStack;
   }
-  public async updateStack(id: string, values: { name?: string; encryptedComposeYaml?: string; enabled?: boolean }): Promise<ManagedStack | null> {
+  public async updateStack(id: string, values: { name?: string; encryptedComposeYaml?: string; enabled?: boolean; postgresBackupConfig?: { service: string; database: string; user: string } | null }): Promise<ManagedStack | null> {
     const item = this.stacks.find((stack) => stack.id === id);
     if (!item || !this.agents.some((agent) => agent.id === item.agentId && agent.enabled)) return null;
     Object.assign(item, values, { revision: item.revision + 1, status: 'pending', updatedAt: new Date().toISOString() });
@@ -186,7 +192,11 @@ export class FakeStore implements Store {
   }
   public async listAgents(): Promise<Agent[]> { return this.agents.filter((item) => !item.archivedAt); }
   public async createAgent(name: string, enrollmentTokenHash: string): Promise<Agent> {
-    const created = { id: randomUUID(), name, enabled: true, enrolledAt: null, lastHeartbeatAt: null, createdAt: new Date().toISOString(), enrollmentTokenHash };
+    const created = {
+      id: randomUUID(), name, enabled: true, enrolledAt: null, lastHeartbeatAt: null, lastTelemetryAt: null,
+      lastCommandPollAt: null, lastCommandResultAt: null, healthStatus: 'pending' as const,
+      diagnostics: null, metadata: null, createdAt: new Date().toISOString(), enrollmentTokenHash,
+    };
     this.agents.push(created);
     return created;
   }
@@ -219,19 +229,25 @@ export class FakeStore implements Store {
     delete item.enrollmentTokenHash;
     item.credentialHash = credentialHash;
     item.enrolledAt = new Date().toISOString();
+    item.healthStatus = 'offline';
     return item;
   }
   public async authenticateAgent(credentialHash: string): Promise<Agent | null> { return this.agents.find((item) => item.credentialHash === credentialHash && item.enabled) ?? null; }
-  public async heartbeatAgent(id: string): Promise<void> {
+  public async heartbeatAgent(id: string, metadata: Record<string, unknown> = {}): Promise<void> {
     const item = this.agents.find((agent) => agent.id === id);
-    if (item) item.lastHeartbeatAt = new Date().toISOString();
+    if (item) {
+      item.lastHeartbeatAt = new Date().toISOString();
+      item.metadata = metadata;
+      item.diagnostics = metadata.diagnostics && typeof metadata.diagnostics === 'object' && !Array.isArray(metadata.diagnostics) ? metadata.diagnostics as Record<string, unknown> : item.diagnostics;
+      item.healthStatus = 'connected';
+    }
   }
   public async recordTelemetry(agentId: string, snapshot: Omit<TelemetrySnapshot, 'agentId' | 'receivedAt'>): Promise<void> {
     const previous = this.telemetry.find((item) => item.agentId === agentId);
     const receivedAt = new Date().toISOString();
     this.telemetry.unshift({ agentId, ...snapshot, receivedAt });
     const agent = this.agents.find((item) => item.id === agentId);
-    if (agent) agent.lastHeartbeatAt = receivedAt;
+    if (agent) { agent.lastTelemetryAt = receivedAt; agent.healthStatus = 'connected'; }
     const previousServices = new Map((previous?.services ?? []).map((service) => [service.name, service]));
     for (const service of snapshot.services) {
       if (service.status === 'unhealthy' && previousServices.get(service.name)?.status !== 'unhealthy') this.queueEvent('service.unhealthy', { service: service.name });
@@ -289,6 +305,36 @@ export class FakeStore implements Store {
     return created;
   }
   public async listRestores(): Promise<StackRestore[]> { return this.restores; }
+  public async createSystemBackup(requestedByUserId: string, target: BackupTarget, artifactPath: string): Promise<StoredSystemBackup> {
+    const created: StoredSystemBackup = { id: randomUUID(), requestedByUserId, target, artifactPath, status: 'running', sizeBytes: null, checksum: null, error: null, createdAt: new Date().toISOString(), completedAt: null };
+    this.systemBackups.unshift(created);
+    return created;
+  }
+  public async completeSystemBackup(id: string, sizeBytes: number, checksum: string): Promise<SystemBackup> {
+    const found = this.systemBackups.find((item) => item.id === id)!;
+    Object.assign(found, { status: 'succeeded', sizeBytes, checksum, completedAt: new Date().toISOString() });
+    return found;
+  }
+  public async failSystemBackup(id: string, error: string): Promise<SystemBackup> {
+    const found = this.systemBackups.find((item) => item.id === id)!;
+    Object.assign(found, { status: 'failed', error, completedAt: new Date().toISOString() });
+    return found;
+  }
+  public async listSystemBackups(): Promise<SystemBackup[]> { return this.systemBackups; }
+  public async getSystemBackup(id: string): Promise<StoredSystemBackup | null> { return this.systemBackups.find((item) => item.id === id && item.status === 'succeeded') ?? null; }
+  public async createSystemRestore(backupId: string, requestedByUserId: string, status: 'staging' | 'failed', error?: string): Promise<SystemRestore> {
+    const now = new Date().toISOString();
+    const created: SystemRestore = { id: randomUUID(), backupId, requestedByUserId, status, error: error ?? null, createdAt: now, completedAt: status === 'failed' ? now : null };
+    this.systemRestores.unshift(created);
+    return created;
+  }
+  public async updateSystemRestore(id: string, status: 'staged' | 'failed', error?: string): Promise<SystemRestore> {
+    const found = this.systemRestores.find((item) => item.id === id && item.status === 'staging');
+    if (!found) throw new Error('The system restore audit record could not be transitioned.');
+    Object.assign(found, { status, error: error ?? null, completedAt: new Date().toISOString() });
+    return found;
+  }
+  public async listSystemRestores(): Promise<SystemRestore[]> { return this.systemRestores; }
   public async getRestoreDeployment(restoreId: string): Promise<{ restore: StackRestore; backup: StackBackup; stack: StackDeployment } | null> {
     const found = this.restores.find((item) => item.id === restoreId);
     const source = found ? this.backups.find((item) => item.id === found.backupId) : undefined;
@@ -302,7 +348,10 @@ export class FakeStore implements Store {
     return created;
   }
   public async listCommands(agentId?: string): Promise<AgentCommand[]> { return this.commands.filter((item) => !agentId || item.agentId === agentId); }
+  public async getCommand(id: string): Promise<AgentCommand | null> { return this.commands.find((item) => item.id === id) ?? null; }
   public async claimCommands(agentId: string, limit: number): Promise<AgentCommand[]> {
+    const agent = this.agents.find((item) => item.id === agentId);
+    if (agent) agent.lastCommandPollAt = new Date().toISOString();
     const selected = this.commands.filter((item) => item.agentId === agentId && item.status === 'pending').slice(0, limit);
     selected.forEach((item) => {
       item.status = 'claimed';
@@ -324,6 +373,20 @@ export class FakeStore implements Store {
     if (item.status !== 'claimed') return 'conflict';
     item.status = status;
     item.result = result;
+    const agent = this.agents.find((candidate) => candidate.id === agentId);
+    if (agent) {
+      agent.lastCommandResultAt = new Date().toISOString();
+      if (item.type === 'agent.diagnostics.run' && status === 'succeeded' && result.diagnostics && typeof result.diagnostics === 'object') agent.diagnostics = result.diagnostics as Record<string, unknown>;
+    }
+    if (item.type === 'cloudflare.connector.sync' && typeof item.payload.connectorId === 'string') {
+      const connector = this.connectors.find((candidate) => candidate.id === item.payload.connectorId && candidate.agentId === agentId);
+      if (connector) Object.assign(connector, {
+        deploymentStatus: status === 'succeeded' ? 'active' : 'failed',
+        runtimeStatus: status === 'failed' ? 'failed' : result.runtimeStatus === 'origin_unhealthy' ? 'origin_unhealthy' : result.runtimeStatus === 'stopped' ? 'stopped' : result.runtimeStatus === 'connected' ? 'connected' : 'reconnecting',
+        lastError: status === 'failed' ? String(result.error || 'Connector deployment failed.') : null,
+        lastDeployedAt: new Date().toISOString(), lastObservedAt: new Date().toISOString(),
+      });
+    }
     const deploymentStatus = status === 'succeeded' ? 'active' : 'failed';
     if (item.type === 'compose.stack.sync' && typeof item.payload.stackId === 'string') {
       const stack = this.stacks.find((candidate) => candidate.id === item.payload.stackId && candidate.agentId === agentId);

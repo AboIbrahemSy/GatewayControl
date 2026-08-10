@@ -167,12 +167,12 @@ export function LogsPage({ t, locale, role }: { t: Translate; locale: Locale; ro
     {role === 'viewer' && <Notice>{t('logsPermissionNotice')}</Notice>}
     {error && <Alert>{error}</Alert>}
     {loading ? <Loading t={t} /> : <>
-      {role !== 'viewer' && <form onSubmit={submit} className={`${panelClass} grid grid-cols-1 gap-5 p-5 sm:grid-cols-2 sm:p-6 xl:grid-cols-12 xl:items-end`}>
+      {role !== 'viewer' && <form onSubmit={submit} className={`${panelClass} grid grid-cols-1 gap-5 p-5 sm:grid-cols-2 sm:p-6 xl:grid-cols-12 items-start`}>
         <Field label={t('stack')} className="xl:col-span-3"><select required value={stackId} onChange={(event) => setStackId(event.target.value)} className={inputClass}><option value="">{t('chooseStack')}</option>{stacks.map((stack) => <option key={stack.id} value={stack.id}>{stack.name}</option>)}</select></Field>
         <Field label={t('composeService')} hint={t('composeServiceHint')} className="xl:col-span-3"><input required dir="ltr" maxLength={128} pattern="[a-zA-Z0-9][a-zA-Z0-9_.-]*" value={service} onChange={(event) => setService(event.target.value)} className={inputClass} /></Field>
         <Field label={t('tailLines')} className="xl:col-span-2"><select value={tail} onChange={(event) => setTail(Number(event.target.value))} className={inputClass}>{[100, 200, 500, 1000].map((value) => <option key={value} value={value}>{formatNumber(value, locale)}</option>)}</select></Field>
         <Field label={t('timeWindow')} className="xl:col-span-2"><select value={windowMinutes} onChange={(event) => setWindowMinutes(Number(event.target.value))} className={inputClass}><option value={15}>{t('last15Minutes')}</option><option value={60}>{t('lastHour')}</option><option value={360}>{t('last6Hours')}</option><option value={1440}>{t('last24Hours')}</option><option value={0}>{t('availableHistory')}</option></select></Field>
-        <button disabled={busy || stacks.length === 0} className={`${primaryButton} xl:col-span-2`}><FileText size={16} />{t('requestLogs')}</button>
+        <div className="flex flex-col gap-2 sm:col-span-2 xl:col-span-2"><span className="hidden text-xs font-extrabold text-transparent select-none xl:block" aria-hidden="true">&nbsp;</span><button disabled={busy || stacks.length === 0} className={primaryButton}><FileText size={16} />{t('requestLogs')}</button></div>
       </form>}
       {!loading && stacks.length === 0 && <Notice>{t('noStacksForLogs')}</Notice>}
       <section className={`${panelClass} min-w-0 overflow-hidden`}>

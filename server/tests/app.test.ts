@@ -3,6 +3,7 @@ import { afterEach, describe, expect, it, vi } from 'vitest';
 import { buildApp } from '../src/app.js';
 import { hashToken } from '../src/crypto.js';
 import { FakeStore } from './fake-store.js';
+import { SystemRecoveryFailure, type SystemRecoveryService } from '../src/system-recovery.js';
 
 const apps: Array<Awaited<ReturnType<typeof buildApp>>> = [];
 
@@ -10,7 +11,7 @@ afterEach(async () => {
   await Promise.all(apps.splice(0).map((app) => app.close()));
 });
 
-async function appWithOwner(options: { fetch?: typeof globalThis.fetch; notificationIntervalMs?: number } = {}) {
+async function appWithOwner(options: { fetch?: typeof globalThis.fetch; notificationIntervalMs?: number; systemRecoveryService?: SystemRecoveryService } = {}) {
   const store = new FakeStore();
   const app = await buildApp({ store, masterKey: randomBytes(32), secureCookie: false, ...options });
   apps.push(app);
@@ -108,7 +109,8 @@ describe('control-plane API', () => {
     expect(body.enrollmentCommand).toContain("GATEWAY_AGENT_IMAGE='example/gateway-agent:1.0.0'");
     expect(body.enrollmentCommand).toContain('GATEWAY_HOST_PROC_ROOT=/host/proc');
     expect(body.enrollmentCommand).toContain('GATEWAY_LOCAL_BACKUP_ROOT=/opt/gateway-control/backups/local');
-    expect(body.enrollmentCommand).toContain('GATEWAY_NAS_BACKUP_ROOT=/mnt/gateway-control-backups');
+    expect(body.enrollmentCommand).toContain("GATEWAY_NAS_BACKUP_ROOT='/mnt/gateway-control-backups'");
+    expect(body.enrollmentCommand).toContain("GATEWAY_NAS_MARKER='.gateway-control-nas'");
     expect(body.enrollmentCommand).toContain('GATEWAY_TRAEFIK_DYNAMIC_ROOT=/srv/traefik-dynamic');
     expect(body.enrollmentCommand).toContain("GATEWAY_TRAEFIK_DYNAMIC_VOLUME='gateway-traefik-dynamic'");
     expect(body.enrollmentCommand).toContain('/var/run/docker.sock:/var/run/docker.sock');
@@ -116,7 +118,7 @@ describe('control-plane API', () => {
     expect(body.enrollmentCommand).toContain('/opt/gateway-control/stacks:/opt/gateway-control/stacks');
     expect(body.enrollmentCommand).toContain('/proc:/host/proc:ro');
     expect(body.enrollmentCommand).toContain('/opt/gateway-control/backups/local:/opt/gateway-control/backups/local');
-    expect(body.enrollmentCommand).toContain('/mnt/gateway-control-backups:/mnt/gateway-control-backups');
+    expect(body.enrollmentCommand).toContain("'/mnt/gateway-control-backups:/mnt/gateway-control-backups'");
     expect(body.enrollmentCommand).toContain("'gateway-traefik-dynamic':/srv/traefik-dynamic");
     expect(body.enrollmentCommand).toContain('--group-add');
     expect(store.agents[0]?.enrollmentTokenHash).not.toBe(body.enrollmentToken);
@@ -138,6 +140,35 @@ describe('control-plane API', () => {
     expect(localDefinition.json().enrollmentCommand).toContain('GATEWAY_ALLOW_INSECURE_HTTP=true');
     expect(localDefinition.json().enrollmentCommand).toContain("GATEWAY_CONTROL_URL='http://host.docker.internal:8080'");
     expect(localDefinition.json().enrollmentCommand).toContain('--add-host host.docker.internal:host-gateway');
+  });
+
+  it('propagates the canonical configurable NAS root and marker to Agent enrollment', async () => {
+    const store = new FakeStore();
+    const app = await buildApp({
+      store,
+      masterKey: randomBytes(32),
+      secureCookie: false,
+      systemBackupNasRoot: '/srv/shared-gateway-nas',
+      systemBackupNasMarker: '.trusted-gateway-nas',
+    });
+    apps.push(app);
+    await app.inject({ method: 'POST', url: '/api/setup', payload: { email: 'owner@example.com', password: 'correct horse battery staple' } });
+    const login = await app.inject({ method: 'POST', url: '/api/auth/login', payload: { email: 'owner@example.com', password: 'correct horse battery staple' } });
+    const cookie = String(login.headers['set-cookie']).split(';')[0];
+
+    const response = await app.inject({
+      method: 'POST',
+      url: '/api/agents',
+      headers: { cookie },
+      payload: { name: 'custom-nas', baseUrl: 'https://control.example.test', image: 'example/gateway-agent:1.0.0' },
+    });
+
+    expect(response.statusCode).toBe(201);
+    expect(response.json().enrollmentCommand).toContain("GATEWAY_NAS_BACKUP_ROOT='/srv/shared-gateway-nas'");
+    expect(response.json().enrollmentCommand).toContain("GATEWAY_HOST_NAS_BACKUP_ROOT='/srv/shared-gateway-nas'");
+    expect(response.json().enrollmentCommand).toContain("GATEWAY_NAS_MARKER='.trusted-gateway-nas'");
+    expect(response.json().enrollmentCommand).toContain("'/srv/shared-gateway-nas:/srv/shared-gateway-nas'");
+    expect(response.json().enrollmentCommand).not.toContain('/mnt/gateway-control-backups');
   });
 
   it('lets only owners safely remove unassigned agents and returns host cleanup instructions', async () => {
@@ -454,6 +485,56 @@ describe('control-plane API', () => {
     expect(listedRestores.json().restores[0]).toMatchObject({ id: restored.json().restore.id, backupId, status: 'pending' });
     const restorePoll = await app.inject({ method: 'GET', url: '/api/agent/commands', headers: { authorization: `Bearer ${credential}` } });
     expect(restorePoll.json().commands[0].payload).toMatchObject({ backupId, target: 'nas', projectName: 'data_project' });
+  });
+
+  it('restricts system recovery to owners, validates passphrases, and returns metadata-only staging results', async () => {
+    const now = new Date().toISOString();
+    const createBackup = vi.fn(async () => ({
+      id: randomUUID(), requestedByUserId: 'private-user', target: 'local' as const, status: 'succeeded' as const,
+      sizeBytes: 4096, checksum: 'a'.repeat(64), error: null, createdAt: now, completedAt: now,
+      artifactPath: '/private/system.gcsb', masterKey: 'private-key', passphrase: 'never-return-this',
+    }));
+    const stageRestore = vi.fn(async (input: { backupId: string }) => ({
+      restore: { id: randomUUID(), backupId: input.backupId, requestedByUserId: 'private-user', status: 'staged' as const, error: null, createdAt: now, completedAt: now },
+      restartRequired: true as const,
+    }));
+    const { app, store, cookie } = await appWithOwner({ systemRecoveryService: { createBackup, stageRestore } });
+    const operator = await store.createUser('system-operator@example.com', store.users[0]!.passwordHash, 'operator');
+    store.sessions.set(hashToken('system-operator-session-token-long-enough'), operator.id);
+    const operatorCookie = 'gateway_control_session=system-operator-session-token-long-enough';
+    expect((await app.inject({ method: 'GET', url: '/api/system-backups', headers: { cookie: operatorCookie } })).statusCode).toBe(403);
+    expect((await app.inject({ method: 'POST', url: '/api/system-backups', headers: { cookie: operatorCookie }, payload: { target: 'local', passphrase: 'valid-system-passphrase' } })).statusCode).toBe(403);
+    const tooShort = await app.inject({ method: 'POST', url: '/api/system-backups', headers: { cookie }, payload: { target: 'local', passphrase: 'fifteen-chars!!' } });
+    expect(tooShort.statusCode).toBe(400);
+    expect(createBackup).not.toHaveBeenCalled();
+    const created = await app.inject({ method: 'POST', url: '/api/system-backups', headers: { cookie }, payload: { target: 'local', passphrase: 'valid-system-passphrase' } });
+    expect(created.statusCode).toBe(201);
+    expect(created.body).not.toMatch(/artifactPath|masterKey|passphrase|private-user|private\/system/);
+    const backupId = created.json().backup.id;
+    const stored = await store.createSystemBackup(store.users[0]!.id, 'nas', '/private/listed-system.gcsb');
+    await store.completeSystemBackup(stored.id, 2048, 'b'.repeat(64));
+    const listed = await app.inject({ method: 'GET', url: '/api/system-backups', headers: { cookie } });
+    expect(listed.statusCode).toBe(200);
+    expect(listed.body).not.toMatch(/artifactPath|requestedByUserId|private\/listed-system/);
+    expect((await app.inject({ method: 'POST', url: `/api/system-backups/${backupId}/stage-restore`, headers: { cookie: operatorCookie }, payload: { passphrase: 'valid-system-passphrase' } })).statusCode).toBe(403);
+    expect((await app.inject({ method: 'POST', url: `/api/system-backups/${backupId}/stage-restore`, headers: { cookie }, payload: { passphrase: 'too-short' } })).statusCode).toBe(400);
+    expect(stageRestore).not.toHaveBeenCalled();
+    const staged = await app.inject({ method: 'POST', url: `/api/system-backups/${backupId}/stage-restore`, headers: { cookie }, payload: { passphrase: 'valid-system-passphrase' } });
+    expect(staged.statusCode).toBe(202);
+    expect(staged.json()).toMatchObject({ restartRequired: true, restore: { backupId, status: 'staged' } });
+    expect(staged.body).not.toMatch(/requestedByUserId|masterKey|passphrase|artifactPath/);
+    expect(stageRestore).toHaveBeenCalledWith(expect.objectContaining({ backupId, passphrase: 'valid-system-passphrase' }));
+  });
+
+  it('returns a stable machine-readable system recovery failure code', async () => {
+    const createBackup = vi.fn(async () => { throw new SystemRecoveryFailure(409, 'nas_unavailable', 'The NAS backup target is unavailable.'); });
+    const stageRestore = vi.fn();
+    const { app, cookie } = await appWithOwner({ systemRecoveryService: { createBackup, stageRestore } });
+
+    const response = await app.inject({ method: 'POST', url: '/api/system-backups', headers: { cookie }, payload: { target: 'nas', passphrase: 'valid-system-passphrase' } });
+
+    expect(response.statusCode).toBe(409);
+    expect(response.json()).toEqual({ error: 'The NAS backup target is unavailable.', code: 'nas_unavailable' });
   });
 
   it('fails backup and restore commands that remain incomplete for 24 hours', async () => {
