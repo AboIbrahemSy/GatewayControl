@@ -1,0 +1,13 @@
+services:
+  control-plane:
+    image: gateway-control:local
+    build:
+      context: .
+    environment:
+      GATEWAY_CONTROL_RELEASE: development
+      GATEWAY_AGENT_IMAGE: gateway-control-agent:local
+
+  control-plane-restore:
+    image: gateway-control:local
+    build:
+      context: .

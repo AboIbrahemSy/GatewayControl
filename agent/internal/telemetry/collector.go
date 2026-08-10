@@ -130,33 +130,58 @@ func (c *Collector) collectServices(ctx context.Context) ([]types.TelemetryServi
 		return nil, errors.New("collect Docker service state")
 	}
 	services := make([]types.TelemetryService, 0)
-	seen := make(map[string]struct{})
+	indexes := make(map[string]int)
 	for _, line := range strings.Split(strings.TrimSpace(string(output)), "\n") {
 		if line == "" {
 			continue
 		}
 		fields := strings.Split(line, "\t")
-		if len(fields) != 4 || !validComposeIdentifier(fields[0]) || !validComposeIdentifier(fields[1]) {
+		if len(fields) != 4 || !validComposeProjectName(fields[0]) || !validComposeServiceName(fields[1]) {
 			continue
 		}
-		name := fields[0] + "_" + fields[1]
-		if _, exists := seen[name]; exists {
-			continue
+		key := fields[0] + "\x00" + fields[1]
+		index, exists := indexes[key]
+		if !exists {
+			index = len(services)
+			indexes[key] = index
+			services = append(services, types.TelemetryService{Name: fields[0] + "/" + fields[1], ProjectName: fields[0], ServiceName: fields[1]})
 		}
-		seen[name] = struct{}{}
-		services = append(services, types.TelemetryService{Name: name, Status: normalizeStatus(fields[2], fields[3]), ProjectName: fields[0], ServiceName: fields[1]})
+		service := &services[index]
+		status := normalizeStatus(fields[2], fields[3])
+		service.Total++
+		switch status {
+		case "healthy": service.Running++; service.Healthy++
+		case "unhealthy": service.Running++; service.Unhealthy++
+		case "starting": service.Running++; service.Starting++
+		case "completed": service.Completed++
+		case "stopped": service.Stopped++
+		default: service.Running++
+		}
+		service.Status = aggregateStatus(*service)
 		if len(services) == MaximumServices {
-			break
+			if !exists { break }
 		}
 	}
 	return services, nil
 }
 
+func aggregateStatus(service types.TelemetryService) string {
+	if service.Unhealthy > 0 { return "unhealthy" }
+	if service.Starting > 0 { return "starting" }
+	if service.Completed == service.Total { return "completed" }
+	if service.Stopped > 0 { return "stopped" }
+	if service.Healthy == service.Total { return "healthy" }
+	return "unknown"
+}
+
 func normalizeStatus(state, detail string) string {
+	detail = strings.ToLower(detail)
+	if state == "exited" && strings.Contains(detail, "exited (0)") {
+		return "completed"
+	}
 	if state != "running" {
 		return "stopped"
 	}
-	detail = strings.ToLower(detail)
 	switch {
 	case strings.Contains(detail, "(healthy)"):
 		return "healthy"
@@ -169,12 +194,25 @@ func normalizeStatus(state, detail string) string {
 	}
 }
 
-func validComposeIdentifier(value string) bool {
+func validComposeProjectName(value string) bool {
 	if len(value) < 1 || len(value) > 63 {
 		return false
 	}
 	for index, character := range value {
 		if character >= 'a' && character <= 'z' || character >= '0' && character <= '9' || index > 0 && (character == '_' || character == '-') {
+			continue
+		}
+		return false
+	}
+	return true
+}
+
+func validComposeServiceName(value string) bool {
+	if len(value) < 1 || len(value) > 128 {
+		return false
+	}
+	for index, character := range value {
+		if character >= 'a' && character <= 'z' || character >= 'A' && character <= 'Z' || character >= '0' && character <= '9' || index > 0 && (character == '_' || character == '-' || character == '.') {
 			continue
 		}
 		return false

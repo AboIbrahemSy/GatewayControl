@@ -14,7 +14,7 @@ import (
 )
 
 const testConnectorID = "123e4567-e89b-12d3-a456-426614174000"
-const testConnectorToken = "connector-token-that-must-remain-secret"
+const testConnectorToken = "connector-token-that-must-remain-secret-and-is-long-enough-for-cloudflare"
 
 func TestConnectorEnableUsesTokenFileAndDeterministicContainerName(t *testing.T) {
 	executor := newTestExecutor(t)
@@ -88,6 +88,42 @@ func TestConnectorDisableRemovesContainerAndTokenIdempotently(t *testing.T) {
 	if runner.findCall("container", "rm") == nil {
 		t.Fatal("existing container was not removed")
 	}
+	for _, name := range []string{"gateway-cloudflared-" + testConnectorID + "-candidate", "gateway-cloudflared-" + testConnectorID} {
+		if runner.findCall("container", "inspect", name) == nil {
+			t.Fatalf("container %q was not included in idempotent cleanup", name)
+		}
+	}
+}
+
+func TestConnectorRemoveCommandRemovesBothContainersAndToken(t *testing.T) {
+	executor := newTestExecutor(t)
+	runner := &connectorRunner{containerExists: true}
+	executor.runner = runner
+	tokenPath := filepath.Join(executor.stateDir, "connectors", testConnectorID+".token")
+	if err := writeTokenAtomically(tokenPath, testConnectorToken); err != nil {
+		t.Fatal(err)
+	}
+	payload, _ := json.Marshal(map[string]any{"connectorId": testConnectorID, "revision": 2})
+	result := executor.Execute(context.Background(), types.Command{ID: "remove", Type: "cloudflare.connector.remove", Payload: payload})
+	if !result.Success {
+		t.Fatalf("result = %#v", result)
+	}
+	if _, err := os.Stat(tokenPath); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("token file error = %v, want not exist", err)
+	}
+}
+
+func TestConnectorStartFailureCleansCandidateWithoutMaskingError(t *testing.T) {
+	executor := newTestExecutor(t)
+	runner := &connectorRunner{failStart: true}
+	executor.runner = runner
+	result := executor.Execute(context.Background(), connectorCommand(true, nil))
+	if result.Success || !strings.Contains(result.Error, "start connector container failed") {
+		t.Fatalf("result = %#v", result)
+	}
+	if runner.findCall("container", "inspect", "gateway-cloudflared-"+testConnectorID+"-candidate") == nil {
+		t.Fatal("candidate cleanup was not attempted")
+	}
 }
 
 func TestConnectorPayloadRejectsTraversalAndUnknownFields(t *testing.T) {
@@ -98,6 +134,8 @@ func TestConnectorPayloadRejectsTraversalAndUnknownFields(t *testing.T) {
 		json.RawMessage(`{"connectorId":"../../etc/passwd","name":"name","enabled":true,"token":"connector-token-that-is-long-enough"}`),
 		json.RawMessage(`{"connectorId":"` + testConnectorID + `","name":"name","enabled":true,"token":"connector-token-that-is-long-enough","args":[]}`),
 		json.RawMessage(`{"connectorId":"` + testConnectorID + `","name":"name","token":"connector-token-that-is-long-enough"}`),
+		json.RawMessage(`{"connectorId":"` + testConnectorID + `","revision":1,"name":"name","enabled":true,"token":"short"}`),
+		json.RawMessage(`{"connectorId":"` + testConnectorID + `","revision":1,"enabled":false,"token":"` + testConnectorToken + `"}`),
 	}
 	for _, payload := range invalid {
 		result := executor.Execute(context.Background(), types.Command{ID: "command", Type: "cloudflare.connector.sync", Payload: payload})
@@ -138,9 +176,12 @@ func TestConnectorContainerNameIsDeterministic(t *testing.T) {
 func connectorCommand(enabled bool, extra map[string]any) types.Command {
 	payload := map[string]any{
 		"connectorId": testConnectorID,
-		"name":        "Main tunnel",
+		"revision":    1,
 		"enabled":     enabled,
-		"token":       testConnectorToken,
+	}
+	if enabled {
+		payload["name"] = "Main tunnel"
+		payload["token"] = testConnectorToken
 	}
 	for key, value := range extra {
 		payload[key] = value
@@ -159,6 +200,7 @@ type connectorRunner struct {
 	containerExists    bool
 	networkExists      bool
 	networkErrorOutput string
+	failStart          bool
 }
 
 func (r *connectorRunner) Run(_ context.Context, name string, args []string, _ int64) (runOutput, error) {
@@ -178,6 +220,9 @@ func (r *connectorRunner) Run(_ context.Context, name string, args []string, _ i
 	}
 	if len(args) >= 2 && args[0] == "container" && args[1] == "inspect" {
 		if len(args) >= 3 && args[2] == "--format" {
+			if strings.Contains(args[3], "StartedAt") {
+				return runOutput{stdout: "true|2026-08-10T10:00:00Z\n", exitCode: 0}, nil
+			}
 			return runOutput{stdout: "true\n", exitCode: 0}, nil
 		}
 		if !r.containerExists {
@@ -192,6 +237,9 @@ func (r *connectorRunner) Run(_ context.Context, name string, args []string, _ i
 	if len(args) >= 2 && args[0] == "container" && args[1] == "create" {
 		r.containerExists = true
 		return runOutput{stdout: "container-id", exitCode: 0}, nil
+	}
+	if len(args) >= 2 && args[0] == "container" && args[1] == "start" && r.failStart {
+		return runOutput{stderr: "candidate failed to start", exitCode: 1}, errors.New("start failed")
 	}
 	return runOutput{exitCode: 0}, nil
 }

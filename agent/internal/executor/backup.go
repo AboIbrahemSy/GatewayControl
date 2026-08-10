@@ -113,13 +113,6 @@ func (e *Executor) executeStackBackup(ctx context.Context, result types.CommandR
 	}
 	hostDestination := filepath.Join(hostBackupRoot, strings.ToLower(payload.StackID), strings.ToLower(payload.BackupID))
 	manifest := backupManifest{Version: backupManifestVersion, BackupID: strings.ToLower(payload.BackupID), StackID: strings.ToLower(payload.StackID), ProjectName: payload.ProjectName, Revision: payload.Revision, Target: payload.Target, CreatedAt: time.Now().UTC(), Volumes: make([]manifestVolume, 0, len(volumes)), Databases: make([]manifestDatabase, 0, 1)}
-	if payload.Postgres != nil {
-		database, dumpErr := e.backupPostgres(commandContext, payload.BackupID, payload.ProjectName, destination, *payload.Postgres)
-		if dumpErr != nil {
-			return e.failure(result, dumpErr)
-		}
-		manifest.Databases = append(manifest.Databases, database)
-	}
 	running, err := e.runningServices(commandContext, base)
 	if err != nil {
 		return e.failure(result, err)
@@ -128,6 +121,13 @@ func (e *Executor) executeStackBackup(ctx context.Context, result types.CommandR
 		return e.failure(result, errors.New("stop stack for backup"))
 	}
 	defer e.restartServices(commandContext, base, running)
+	if payload.Postgres != nil {
+		database, dumpErr := e.backupPostgres(commandContext, base, payload.BackupID, payload.ProjectName, destination, *payload.Postgres)
+		if dumpErr != nil {
+			return e.failure(result, dumpErr)
+		}
+		manifest.Databases = append(manifest.Databases, database)
+	}
 
 	for _, volume := range volumes {
 		archiveName := volume.logical + ".tar.gz"
@@ -258,7 +258,7 @@ func decodeStackRestorePayload(raw json.RawMessage) (stackRestorePayload, error)
 }
 
 func validateOperationFields(backupID, stackID, projectName string, revision int64, target, stackPath, composePath string) error {
-	if !connectorUUIDPattern.MatchString(backupID) || !connectorUUIDPattern.MatchString(stackID) || !projectPattern.MatchString(projectName) || revision < 1 {
+	if !connectorUUIDPattern.MatchString(backupID) || !connectorUUIDPattern.MatchString(stackID) || !composeProjectPattern.MatchString(projectName) || revision < 1 {
 		return errors.New("invalid backup or stack fields")
 	}
 	if target != "local" && target != "nas" {
@@ -359,7 +359,7 @@ func (e *Executor) restartServices(ctx context.Context, base, services []string)
 		ctx, cancel = context.WithTimeout(context.Background(), e.timeout)
 		defer cancel()
 	}
-	args := append(append([]string{}, base...), "up", "--detach", "--no-deps")
+	args := append(append([]string{}, base...), "start")
 	args = append(args, services...)
 	_, _ = e.runner.Run(ctx, "docker", args, e.maxOutput)
 }
@@ -379,24 +379,60 @@ func (e *Executor) runHelper(ctx context.Context, mode, volume, hostDirectory, a
 	return err
 }
 
-func (e *Executor) backupPostgres(ctx context.Context, backupID, projectName, destination string, config postgresBackupConfig) (manifestDatabase, error) {
+func (e *Executor) backupPostgres(ctx context.Context, base []string, backupID, projectName, destination string, config postgresBackupConfig) (manifestDatabase, error) {
 	if !composeServicePattern.MatchString(config.Service) || !composeServicePattern.MatchString(config.Database) || !composeServicePattern.MatchString(config.User) {
 		return manifestDatabase{}, errors.New("PostgreSQL backup configuration is invalid")
 	}
+	if _, err := e.runner.Run(ctx, "docker", append(append([]string{}, base...), "start", config.Service), e.maxOutput); err != nil {
+		return manifestDatabase{}, errors.New("start PostgreSQL service for offline backup")
+	}
+	databaseRunning := true
+	defer func() {
+		if databaseRunning {
+			stopContext, cancel := context.WithTimeout(context.Background(), e.timeout)
+			defer cancel()
+			_, _ = e.runner.Run(stopContext, "docker", append(append([]string{}, base...), "stop", config.Service), e.maxOutput)
+		}
+	}()
 	container, err := e.composeServiceContainer(ctx, projectName, config.Service)
 	if err != nil {
 		return manifestDatabase{}, err
 	}
+	ready := false
+	for attempt := 0; attempt < 30; attempt++ {
+		if _, readyErr := e.runner.Run(ctx, "docker", []string{"container", "exec", container, "pg_isready", "--username", config.User, "--dbname", config.Database}, e.maxOutput); readyErr == nil {
+			ready = true
+			break
+		}
+		select {
+		case <-ctx.Done():
+			return manifestDatabase{}, ctx.Err()
+		case <-time.After(time.Second):
+		}
+	}
+	if !ready {
+		return manifestDatabase{}, errors.New("PostgreSQL service did not become ready for backup")
+	}
 	containerPath := "/tmp/gateway-control-" + strings.ToLower(backupID) + ".dump"
 	archiveName := "postgresql-" + config.Service + ".dump"
+	containerDumpExists := false
 	if _, err := e.runner.Run(ctx, "docker", []string{"container", "exec", container, "pg_dump", "--format=custom", "--no-owner", "--no-privileges", "--file", containerPath, "--username", config.User, config.Database}, e.maxOutput); err != nil {
 		return manifestDatabase{}, errors.New("PostgreSQL logical dump failed")
 	}
-	defer e.runner.Run(context.Background(), "docker", []string{"container", "exec", container, "rm", "-f", containerPath}, e.maxOutput)
+	containerDumpExists = true
+	defer func() {
+		if containerDumpExists {
+			_, _ = e.runner.Run(context.Background(), "docker", []string{"container", "exec", container, "rm", "-f", containerPath}, e.maxOutput)
+		}
+	}()
 	temporaryPath := filepath.Join(destination, "."+archiveName+".tmp")
 	if _, err := e.runner.Run(ctx, "docker", []string{"container", "cp", container + ":" + containerPath, temporaryPath}, e.maxOutput); err != nil {
 		return manifestDatabase{}, errors.New("copy PostgreSQL logical dump")
 	}
+	if _, err := e.runner.Run(ctx, "docker", []string{"container", "exec", container, "rm", "-f", containerPath}, e.maxOutput); err != nil {
+		return manifestDatabase{}, errors.New("remove temporary PostgreSQL logical dump")
+	}
+	containerDumpExists = false
 	defer os.Remove(temporaryPath)
 	finalPath := filepath.Join(destination, archiveName)
 	if err := os.Rename(temporaryPath, finalPath); err != nil {
@@ -406,6 +442,10 @@ func (e *Executor) backupPostgres(ctx context.Context, backupID, projectName, de
 	if err != nil {
 		return manifestDatabase{}, errors.New("verify PostgreSQL logical dump")
 	}
+	if _, err := e.runner.Run(ctx, "docker", append(append([]string{}, base...), "stop", config.Service), e.maxOutput); err != nil {
+		return manifestDatabase{}, errors.New("stop PostgreSQL service after offline backup")
+	}
+	databaseRunning = false
 	return manifestDatabase{Engine: "postgresql", Service: config.Service, Database: config.Database, User: config.User, ArchiveName: archiveName, SizeBytes: size, SHA256: checksum}, nil
 }
 
@@ -446,7 +486,7 @@ func (e *Executor) restorePostgres(ctx context.Context, base []string, hostDirec
 		return err
 	}
 	defer e.runner.Run(context.Background(), "docker", []string{"container", "exec", container, "rm", "-f", containerPath}, e.maxOutput)
-	_, err = e.runner.Run(ctx, "docker", []string{"container", "exec", container, "pg_restore", "--clean", "--if-exists", "--no-owner", "--no-privileges", "--username", database.User, "--dbname", database.Database, containerPath}, e.maxOutput)
+	_, err = e.runner.Run(ctx, "docker", []string{"container", "exec", container, "pg_restore", "--exit-on-error", "--single-transaction", "--clean", "--if-exists", "--no-owner", "--no-privileges", "--username", database.User, "--dbname", database.Database, containerPath}, e.maxOutput)
 	return err
 }
 

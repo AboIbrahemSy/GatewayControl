@@ -33,6 +33,7 @@ type controlClient interface {
 type commandExecutor interface {
 	Execute(context.Context, types.Command) types.CommandResult
 	DockerStatus(context.Context) types.DockerStatus
+	Diagnostics(context.Context) types.Diagnostics
 }
 
 type telemetryCollector interface {
@@ -73,7 +74,7 @@ func (a *Agent) Run(ctx context.Context) error {
 		NASMarker: a.config.NASMarker, AgentImage: a.config.AgentImage, BackupTimeout: a.config.BackupTimeout,
 		EdgeNetwork: a.config.EdgeNetwork, Timeout: a.config.CommandTimeout,
 		TraefikDynamicRoot: a.config.TraefikDynamicRoot, TraefikDynamicVolume: a.config.TraefikDynamicVolume,
-		InfoTimeout: a.config.DockerInfoTimeout, MaxOutput: a.config.MaxOutputBytes,
+		InfoTimeout: a.config.DockerInfoTimeout, MaxOutput: a.config.MaxOutputBytes, ProtectedProjects: a.config.ProtectedProjects,
 		HostProcRoot: a.config.HostProcRoot,
 	}, a.config.EnrollmentToken, credentials.APICredential)
 	if err != nil {

@@ -1,5 +1,5 @@
 import { randomUUID } from 'node:crypto';
-import { lstat, mkdir, mkdtemp, readFile, readdir, rm, writeFile } from 'node:fs/promises';
+import { lstat, mkdir, mkdtemp, readFile, readdir, rename, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { afterEach, describe, expect, it, vi } from 'vitest';
@@ -74,7 +74,10 @@ describe('system recovery service', () => {
     const backup = await service.createBackup({ requestedByUserId: randomUUID(), target: 'local', passphrase: 'correct horse battery staple' });
     const result = await service.stageRestore({ backupId: backup.id, requestedByUserId: randomUUID(), passphrase: 'correct horse battery staple' });
 
-    expect(result.restartRequired).toBe(true);
+    expect(result).toMatchObject({
+      manualRestoreRequired: true,
+      restoreCommand: 'sh docker/recover.sh',
+    });
     const marker = JSON.parse(await readFile(join(stageRoot, 'restore.pending'), 'utf8')) as { restoreId: string; backupId: string; token: string; dump: string };
     expect(marker).toMatchObject({ restoreId: result.restore.id, backupId: backup.id });
     expect(marker.dump).toBe(`database-${backup.id}-${marker.token}.dump`);
@@ -196,7 +199,7 @@ describe('system recovery service', () => {
 });
 
 describe('startup system restore', () => {
-  it('uses one transaction and removes marker and dump only after success', async () => {
+  it('atomically transitions pending through applied and cleans marker last among active files', async () => {
     const { stageRoot } = await fixture();
     const restoreId = randomUUID();
     const backupId = randomUUID();
@@ -206,7 +209,8 @@ describe('startup system restore', () => {
     await writeFile(join(stageRoot, dump), 'dump');
     await writeFile(join(stageRoot, 'restore.pending'), JSON.stringify({ version: 1, restoreId, backupId, token, dump }));
     await writeFile(join(stageRoot, 'restore.lock'), `${token}\n`);
-    const calls: string[] = [];
+    const removals: string[] = [];
+    const renames: string[] = [];
     const runner: ToolRunner = { run: vi.fn(async (_command, args, environment) => {
       expect(args).toContain('--single-transaction');
       expect(environment?.PATH).toBe(process.env.PATH);
@@ -217,9 +221,14 @@ describe('startup system restore', () => {
       stageRoot,
       databaseUrl: 'postgresql://user:pass@db/app',
       toolRunner: runner,
-      removeFile: async (path) => { calls.push(path); await rm(path); },
+      renameFile: async (source, destination) => { renames.push(`${source}->${destination}`); await rename(source, destination); },
+      removeFile: async (path) => { removals.push(path); await rm(path); },
     })).resolves.toBe(true);
-    expect(calls).toEqual([join(stageRoot, 'restore.pending'), join(stageRoot, dump), join(stageRoot, 'restore.lock')]);
+    expect(renames).toEqual([
+      `${join(stageRoot, 'restore.pending')}->${join(stageRoot, 'restore.applying')}`,
+      `${join(stageRoot, 'restore.applying')}->${join(stageRoot, 'restore.applied')}`,
+    ]);
+    expect(removals).toEqual([join(stageRoot, 'restore.lock'), join(stageRoot, 'restore.applied'), join(stageRoot, dump)]);
     expect(await readdir(stageRoot)).toEqual([]);
   });
 
@@ -236,10 +245,58 @@ describe('startup system restore', () => {
     const runner: ToolRunner = { run: vi.fn(async () => { throw new Error('restore failed'); }) };
 
     await expect(applyStagedSystemRestore({ stageRoot, databaseUrl: 'postgresql://user:pass@db/app', toolRunner: runner })).rejects.toThrow('restore failed');
-    expect(await readdir(stageRoot)).toEqual(expect.arrayContaining(['restore.pending', dump]));
+    expect(await readdir(stageRoot)).toEqual(expect.arrayContaining(['restore.applying', dump, 'restore.lock']));
   });
 
-  it('keeps the dump and lock when marker cleanup fails', async () => {
+  it('resumes applying while the wrapper keeps the writer stopped', async () => {
+    const { stageRoot } = await fixture();
+    const restoreId = randomUUID();
+    const backupId = randomUUID();
+    const token = randomUUID();
+    const dump = `database-${backupId}-${token}.dump`;
+    await mkdir(stageRoot);
+    await writeFile(join(stageRoot, dump), 'dump');
+    await writeFile(join(stageRoot, 'restore.applying'), JSON.stringify({ version: 1, restoreId, backupId, token, dump }));
+    await writeFile(join(stageRoot, 'restore.lock'), `${token}\n`);
+    const runner: ToolRunner = { run: vi.fn(async () => '') };
+
+    await expect(applyStagedSystemRestore({ stageRoot, databaseUrl: 'postgresql://user:pass@db/app', toolRunner: runner })).resolves.toBe(true);
+    expect(runner.run).toHaveBeenCalledOnce();
+    expect(await readdir(stageRoot)).toEqual([]);
+  });
+
+  it('treats applied as cleanup-only and can retry after marker cleanup fails', async () => {
+    const { stageRoot } = await fixture();
+    const restoreId = randomUUID();
+    const backupId = randomUUID();
+    const token = randomUUID();
+    const dump = `database-${backupId}-${token}.dump`;
+    const appliedPath = join(stageRoot, 'restore.applied');
+    await mkdir(stageRoot);
+    await writeFile(join(stageRoot, dump), 'dump');
+    await writeFile(appliedPath, JSON.stringify({ version: 1, restoreId, backupId, token, dump }));
+    await writeFile(join(stageRoot, 'restore.lock'), `${token}\n`);
+    const runner: ToolRunner = { run: vi.fn(async () => { throw new Error('must not run'); }) };
+
+    await expect(applyStagedSystemRestore({
+      stageRoot,
+      databaseUrl: 'postgresql://user:pass@db/app',
+      toolRunner: runner,
+      removeFile: async (path) => {
+        if (path === appliedPath) throw new Error('marker delete failed');
+        await rm(path);
+      },
+    })).rejects.toThrow('marker delete failed');
+    expect(runner.run).not.toHaveBeenCalled();
+    expect(await readdir(stageRoot)).toEqual(expect.arrayContaining(['restore.applied', dump]));
+    expect(await lstat(join(stageRoot, 'restore.lock')).catch(() => null)).toBeNull();
+
+    await expect(applyStagedSystemRestore({ stageRoot, databaseUrl: 'postgresql://user:pass@db/app', toolRunner: runner })).resolves.toBe(true);
+    expect(runner.run).not.toHaveBeenCalled();
+    expect(await readdir(stageRoot)).toEqual([]);
+  });
+
+  it('leaves pending intact when the first atomic transition fails', async () => {
     const { stageRoot } = await fixture();
     const restoreId = randomUUID();
     const backupId = randomUUID();
@@ -249,15 +306,62 @@ describe('startup system restore', () => {
     await writeFile(join(stageRoot, dump), 'dump');
     await writeFile(join(stageRoot, 'restore.pending'), JSON.stringify({ version: 1, restoreId, backupId, token, dump }));
     await writeFile(join(stageRoot, 'restore.lock'), `${token}\n`);
-    const removals: string[] = [];
+
+    await expect(applyStagedSystemRestore({
+      stageRoot,
+      databaseUrl: 'postgresql://user:pass@db/app',
+      renameFile: async () => { throw new Error('rename failed'); },
+    })).rejects.toThrow('rename failed');
+    expect(await readdir(stageRoot)).toEqual(expect.arrayContaining(['restore.pending', dump, 'restore.lock']));
+  });
+
+  it('leaves applying durable when publishing applied fails after pg_restore', async () => {
+    const { stageRoot } = await fixture();
+    const restoreId = randomUUID();
+    const backupId = randomUUID();
+    const token = randomUUID();
+    const dump = `database-${backupId}-${token}.dump`;
+    await mkdir(stageRoot);
+    await writeFile(join(stageRoot, dump), 'dump');
+    await writeFile(join(stageRoot, 'restore.pending'), JSON.stringify({ version: 1, restoreId, backupId, token, dump }));
+    await writeFile(join(stageRoot, 'restore.lock'), `${token}\n`);
+    let transitions = 0;
 
     await expect(applyStagedSystemRestore({
       stageRoot,
       databaseUrl: 'postgresql://user:pass@db/app',
       toolRunner: { run: vi.fn(async () => '') },
-      removeFile: async (path) => { removals.push(path); throw new Error('marker delete failed'); },
-    })).rejects.toThrow('marker delete failed');
-    expect(removals).toEqual([join(stageRoot, 'restore.pending')]);
-    expect(await readdir(stageRoot)).toEqual(expect.arrayContaining(['restore.pending', dump, 'restore.lock']));
+      renameFile: async (source, destination) => {
+        transitions += 1;
+        if (transitions === 2) throw new Error('applied marker rename failed');
+        await rename(source, destination);
+      },
+    })).rejects.toThrow('applied marker rename failed');
+    expect(await readdir(stageRoot)).toEqual(expect.arrayContaining(['restore.applying', dump, 'restore.lock']));
+  });
+
+  it('retains the complete applied state when lock cleanup fails', async () => {
+    const { stageRoot } = await fixture();
+    const restoreId = randomUUID();
+    const backupId = randomUUID();
+    const token = randomUUID();
+    const dump = `database-${backupId}-${token}.dump`;
+    await mkdir(stageRoot);
+    await writeFile(join(stageRoot, dump), 'dump');
+    await writeFile(join(stageRoot, 'restore.applied'), JSON.stringify({ version: 1, restoreId, backupId, token, dump }));
+    await writeFile(join(stageRoot, 'restore.lock'), `${token}\n`);
+
+    await expect(applyStagedSystemRestore({
+      stageRoot,
+      databaseUrl: 'postgresql://user:pass@db/app',
+      removeFile: async () => { throw new Error('lock delete failed'); },
+    })).rejects.toThrow('lock delete failed');
+    expect(await readdir(stageRoot)).toEqual(expect.arrayContaining(['restore.applied', dump, 'restore.lock']));
+  });
+
+  it('returns false when normal startup has no restore marker', async () => {
+    const { stageRoot } = await fixture();
+    await mkdir(stageRoot);
+    await expect(applyStagedSystemRestore({ stageRoot, databaseUrl: 'postgresql://user:pass@db/app' })).resolves.toBe(false);
   });
 });

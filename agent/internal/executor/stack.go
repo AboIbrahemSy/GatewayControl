@@ -105,7 +105,7 @@ func decodeStackSyncPayload(raw json.RawMessage) (stackSyncPayload, error) {
 	if !validDisplayName(payload.Name, 120) {
 		return payload, errors.New("name must contain 1 to 120 valid, non-control characters")
 	}
-	if !projectPattern.MatchString(payload.ProjectName) {
+	if !composeProjectPattern.MatchString(payload.ProjectName) {
 		return payload, errors.New("projectName must be a valid Compose project name")
 	}
 	if payload.Enabled == nil {

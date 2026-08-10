@@ -17,9 +17,14 @@ import (
 )
 
 var stackPattern = regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9_.-]{0,127}$`)
-var projectPattern = regexp.MustCompile(`^[a-z0-9][a-z0-9_-]{0,62}$`)
-var sensitivePattern = regexp.MustCompile(`(?i)(password|passwd|secret|token|api[_-]?key|authorization)(\s*[=:]\s*|\s+)([^\s,;]+)`)
+var composeProjectPattern = regexp.MustCompile(`^[a-z0-9][a-z0-9_-]{0,62}$`)
+var sensitivePattern = regexp.MustCompile(`(?i)("?(?:password|passwd|secret|token|api[_-]?key|access[_-]?key|client[_-]?secret|private[_-]?key|authorization|database[_-]?url)"?)(\s*[=:]\s*|\s+)("[^"\r\n]*"|'[^'\r\n]*'|[^\s,;]+)`)
 var bearerPattern = regexp.MustCompile(`(?i)bearer\s+[A-Za-z0-9._~+/-]+=*`)
+var credentialURLPattern = regexp.MustCompile(`(?i)([a-z][a-z0-9+.-]*://[^\s/:@]+:)[^\s/@]+(@)`)
+var jwtPattern = regexp.MustCompile(`\beyJ[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+\b`)
+var privateKeyPattern = regexp.MustCompile(`(?s)-----BEGIN (?:[A-Z0-9 ]+ )?PRIVATE KEY-----.*?-----END (?:[A-Z0-9 ]+ )?PRIVATE KEY-----`)
+var cloudflareTokenPattern = regexp.MustCompile(`\b[A-Za-z0-9_-]{40,}\b`)
+var telegramTokenPattern = regexp.MustCompile(`\b\d{6,12}:[A-Za-z0-9_-]{30,}\b`)
 
 type Executor struct {
 	stacksRoot           string
@@ -42,6 +47,7 @@ type Executor struct {
 	infoTimeout          time.Duration
 	maxOutput            int64
 	secrets              []string
+	protectedProjects    map[string]struct{}
 	runner               commandRunner
 }
 
@@ -65,6 +71,7 @@ type Options struct {
 	BackupTimeout        time.Duration
 	InfoTimeout          time.Duration
 	MaxOutput            int64
+	ProtectedProjects    []string
 }
 
 func New(options Options, secrets ...string) (*Executor, error) {
@@ -122,6 +129,11 @@ func New(options Options, secrets ...string) (*Executor, error) {
 		strings.HasSuffix(strings.ToLower(options.CloudflaredImage), ":latest") {
 		return nil, errors.New("cloudflared image must be explicitly pinned")
 	}
+	protectedProjects := map[string]struct{}{"gateway-control": {}}
+	for _, project := range options.ProtectedProjects {
+		if !composeProjectPattern.MatchString(project) { return nil, fmt.Errorf("protected project %q is invalid", project) }
+		protectedProjects[project] = struct{}{}
+	}
 	return &Executor{
 		stacksRoot: root, stateDir: stateDir, stateVolume: options.StateVolume,
 		hostStacksRoot: filepath.Clean(options.HostStacksRoot), cloudflaredImage: options.CloudflaredImage,
@@ -131,7 +143,7 @@ func New(options Options, secrets ...string) (*Executor, error) {
 		edgeNetwork: options.EdgeNetwork, timeout: options.Timeout, infoTimeout: options.InfoTimeout,
 		traefikDynamicRoot: traefikDynamicRoot, traefikDynamicVolume: options.TraefikDynamicVolume,
 		hostProcRoot: options.HostProcRoot,
-		maxOutput: options.MaxOutput, secrets: secrets, runner: osCommandRunner{},
+		maxOutput: options.MaxOutput, secrets: secrets, protectedProjects: protectedProjects, runner: osCommandRunner{},
 	}, nil
 }
 
@@ -204,8 +216,14 @@ func (e *Executor) Execute(ctx context.Context, command types.Command) types.Com
 		}
 	case "cloudflare.connector.sync":
 		return e.executeConnectorSync(ctx, result, command.Payload)
+	case "cloudflare.connector.remove":
+		return e.executeConnectorRemove(ctx, result, command.Payload)
 	case "compose.stack.sync":
-		return e.executeStackSync(ctx, result, command.Payload)
+		return e.failure(result, errors.New("command type \"compose.stack.sync\" is permanently unsupported"))
+	case "compose.runtime.action":
+		return e.executeRuntimeAction(ctx, result, command.Payload)
+	case "compose.runtime.logs":
+		return e.executeRuntimeLogs(ctx, result, command.Payload)
 	case "traefik.route.sync":
 		return e.executeRouteSync(result, command.Payload)
 	case "service.logs.read":
@@ -342,7 +360,7 @@ func decodeComposePayload(raw json.RawMessage) (types.ComposePayload, error) {
 	if !stackPattern.MatchString(payload.Stack) {
 		return payload, errors.New("stack must be a valid identifier")
 	}
-	if !projectPattern.MatchString(payload.Project) {
+	if !composeProjectPattern.MatchString(payload.Project) {
 		return payload, errors.New("project must use 1 to 63 lowercase letters, numbers, underscores, or hyphens and start with a letter or number")
 	}
 	return payload, nil
@@ -398,7 +416,12 @@ func (e *Executor) failure(result types.CommandResult, err error) types.CommandR
 }
 
 func (e *Executor) redact(value string) string {
+	value = privateKeyPattern.ReplaceAllString(value, "[REDACTED PRIVATE KEY]")
+	value = credentialURLPattern.ReplaceAllString(value, "$1[REDACTED]$2")
 	value = bearerPattern.ReplaceAllString(value, "Bearer [REDACTED]")
+	value = jwtPattern.ReplaceAllString(value, "[REDACTED JWT]")
+	value = telegramTokenPattern.ReplaceAllString(value, "[REDACTED TELEGRAM TOKEN]")
+	value = cloudflareTokenPattern.ReplaceAllString(value, "[REDACTED TOKEN]")
 	value = sensitivePattern.ReplaceAllString(value, "$1$2[REDACTED]")
 	for _, secret := range e.secrets {
 		if secret != "" {

@@ -42,6 +42,9 @@ type CommandResult struct {
 	RuntimeStatus string       `json:"runtimeStatus,omitempty"`
 	Message       string       `json:"message,omitempty"`
 	DurationMs    int64        `json:"durationMs,omitempty"`
+	Matched       int          `json:"matched,omitempty"`
+	Succeeded     int          `json:"succeeded,omitempty"`
+	Failed        int          `json:"failed,omitempty"`
 	Artifacts     []BackupArtifact `json:"artifacts,omitempty"`
 }
 
@@ -105,4 +108,11 @@ type TelemetryService struct {
 	Status      string `json:"status"`
 	ProjectName string `json:"projectName,omitempty"`
 	ServiceName string `json:"serviceName,omitempty"`
+	Total       int    `json:"total"`
+	Running     int    `json:"running"`
+	Healthy     int    `json:"healthy"`
+	Unhealthy   int    `json:"unhealthy"`
+	Starting    int    `json:"starting"`
+	Stopped     int    `json:"stopped"`
+	Completed   int    `json:"completed"`
 }

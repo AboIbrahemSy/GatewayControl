@@ -1,5 +1,5 @@
 import { Pool, type PoolClient, type QueryResultRow } from 'pg';
-import type { Agent, AgentCommand, BackupTarget, CloudflareAccount, CloudflareAccountSecret, CloudflareHostnameDeployment, CloudflarePublicHostname, CloudflareZone, Connector, ConnectorDeployment, ManagedRoute, ManagedStack, NotificationDelivery, NotificationSettings, OperationalEventType, StackBackup, StackDeployment, StackRestore, Store, StoredSystemBackup, SystemBackup, SystemRestore, TelemetrySnapshot, User } from './types.js';
+import type { Agent, AgentCommand, BackupTarget, CloudflareAccount, CloudflareAccountSecret, CloudflareDomainAccess, CloudflareDomainAccessDeployment, CloudflareZone, Connector, ConnectorDeployment, ConnectorIdentityDeployment, ConnectorIdentityExpectation, DomainAccessDnsRecord, ManagedRoute, ManagedStack, NotificationDelivery, NotificationSettings, OperationalEventType, RuntimeInventory, RuntimeLogRequest, RuntimeOperation, RuntimeAction, RuntimeScope, StackBackup, StackDeployment, StackRestore, Store, StoredSystemBackup, SystemBackup, SystemRestore, TelemetrySnapshot, User } from './types.js';
 
 function user(row: QueryResultRow): User {
   return { id: row.id, email: row.email, role: row.role, passwordHash: row.password_hash } as User;
@@ -9,6 +9,9 @@ function connector(row: QueryResultRow): Connector {
   return {
     id: row.id, agentId: row.agent_id, name: row.name, enabled: row.enabled,
     cloudflareAccountId: row.cloudflare_account_id ?? null, tunnelId: row.tunnel_id ?? null,
+    desiredRevision: Number(row.desired_revision), tokenAccountIdentifier: row.token_account_identifier ?? null,
+    tokenTunnelId: row.token_tunnel_id ?? null, identityStatus: row.identity_status,
+    identityVerifiedAt: row.identity_verified_at?.toISOString() ?? null, identityError: row.identity_error ?? null,
     deploymentStatus: row.deployment_status, runtimeStatus: row.runtime_status,
     lastError: row.last_error ?? null, lastDeployedAt: row.last_deployed_at?.toISOString() ?? null,
     lastObservedAt: row.last_observed_at?.toISOString() ?? null,
@@ -31,13 +34,16 @@ function cloudflareZone(row: QueryResultRow): CloudflareZone {
   };
 }
 
-function cloudflarePublicHostname(row: QueryResultRow): CloudflarePublicHostname {
+function cloudflareDomainAccess(row: QueryResultRow): CloudflareDomainAccess {
   return {
     id: row.id, cloudflareZoneId: row.cloudflare_zone_id, cloudflareAccountId: row.cloudflare_account_id,
-    connectorId: row.connector_id, routeId: row.route_id, hostname: row.hostname, dnsRecordId: row.dns_record_id ?? null,
-    enabled: row.enabled, proxied: row.proxied, status: row.status, lastError: row.last_error ?? null,
+    connectorId: row.connector_id ?? null, routeId: row.route_id, hostname: row.hostname,
+    accessMethod: row.access_method, publicIpv4: row.public_ipv4 ?? [], publicIpv6: row.public_ipv6 ?? [],
+    ownedDnsRecords: row.owned_dns_records ?? [], dnsRecordId: row.dns_record_id ?? null,
+    enabled: row.enabled, revision: Number(row.revision), proxied: row.proxied, status: row.status, lastError: row.last_error ?? null,
+    lastReconciledAt: row.last_reconciled_at?.toISOString() ?? null,
     createdAt: row.created_at.toISOString(), updatedAt: row.updated_at.toISOString(),
-  } as CloudflarePublicHostname;
+  } as CloudflareDomainAccess;
 }
 
 function agent(row: QueryResultRow): Agent {
@@ -110,6 +116,24 @@ function telemetry(row: QueryResultRow): TelemetrySnapshot {
   return { agentId: row.agent_id, observedAt: row.observed_at.toISOString(), node: row.node, services: row.services, receivedAt: row.created_at.toISOString() };
 }
 
+function runtimeOperation(row: QueryResultRow): RuntimeOperation {
+  return {
+    id: row.id, requestedByUserId: row.requested_by_user_id, agentId: row.agent_id, commandId: row.command_id ?? null,
+    action: row.action, scope: row.scope, projectName: row.project_name, serviceName: row.service_name ?? null,
+    status: row.status, result: row.result ?? null, error: row.error ?? null, createdAt: row.created_at.toISOString(),
+    updatedAt: row.updated_at.toISOString(), completedAt: row.completed_at?.toISOString() ?? null,
+  } as RuntimeOperation;
+}
+
+function runtimeLogRequest(row: QueryResultRow): RuntimeLogRequest {
+  return {
+    id: row.id, requestedByUserId: row.requested_by_user_id, agentId: row.agent_id, commandId: row.command_id ?? null,
+    projectName: row.project_name, serviceName: row.service_name, tail: row.tail, since: row.since?.toISOString() ?? null,
+    status: row.status, result: row.result ?? null, error: row.error ?? null, createdAt: row.created_at.toISOString(),
+    updatedAt: row.updated_at.toISOString(), completedAt: row.completed_at?.toISOString() ?? null,
+  } as RuntimeLogRequest;
+}
+
 function backup(row: QueryResultRow): StackBackup {
   return {
     id: row.id, stackId: row.stack_id, agentId: row.agent_id, commandId: row.command_id,
@@ -148,8 +172,19 @@ export class PgStore implements Store {
   private readonly pool: Pool;
 
   public constructor(connectionString: string) {
-    this.pool = new Pool({ connectionString, max: 10, idleTimeoutMillis: 30_000, connectionTimeoutMillis: 5_000 });
+    this.pool = new Pool({
+      connectionString,
+      max: 10,
+      idleTimeoutMillis: 30_000,
+      connectionTimeoutMillis: 2_500,
+      query_timeout: 2_500,
+      statement_timeout: 2_000,
+    });
     this.pool.on('error', (error) => console.error('Unexpected PostgreSQL pool error.', { message: error.message }));
+  }
+
+  public async checkReady(): Promise<void> {
+    await this.pool.query('SELECT 1');
   }
 
   public async isSetupComplete(): Promise<boolean> {
@@ -206,53 +241,73 @@ export class PgStore implements Store {
     return result.rows.map(connector);
   }
 
-  public async createConnector(name: string, encryptedToken: string, enabled: boolean, agentId: string, cloudflareAccountId?: string, tunnelId?: string): Promise<Connector | null> {
+  public async createConnector(values: { name: string; encryptedToken: string; enabled: boolean; agentId: string; accountId: string; accountIdentifier: string; tunnelId: string }): Promise<Connector | null> {
     return this.transaction(async (client) => {
       const result = await client.query(
-        `INSERT INTO cloudflare_connectors (name, token_encrypted, enabled, agent_id, cloudflare_account_id, tunnel_id)
-         SELECT $1, $2, $3, a.id, $5, $6 FROM agents a WHERE a.id = $4 AND a.enabled AND a.enrolled_at IS NOT NULL
-           AND ($5::uuid IS NULL OR EXISTS (SELECT 1 FROM cloudflare_accounts WHERE id = $5))
+        `INSERT INTO cloudflare_connectors
+           (name, token_encrypted, enabled, agent_id, cloudflare_account_id, tunnel_id, desired_revision,
+            token_account_identifier, token_tunnel_id, identity_status, identity_verified_at)
+         SELECT $1, $2, $3, a.id, cf.id, $7, 1, $6, $7::uuid, 'verified', now()
+         FROM agents a JOIN cloudflare_accounts cf ON cf.id = $5 AND cf.enabled AND lower(cf.account_identifier) = lower($6)
+         WHERE a.id = $4 AND a.enabled AND a.enrolled_at IS NOT NULL
          RETURNING *`,
-        [name, encryptedToken, enabled, agentId, cloudflareAccountId ?? null, tunnelId ?? null],
+        [values.name, values.encryptedToken, values.enabled, values.agentId, values.accountId, values.accountIdentifier, values.tunnelId],
       );
       if (!result.rows[0]) return null;
       const created = connector(result.rows[0]);
-      if (enabled) await this.queueConnectorSync(client, created.agentId, created.id);
+      if (values.enabled) await this.queueConnectorSync(client, created.agentId, created.id, created.desiredRevision);
       return created;
     });
   }
 
-  public async updateConnector(id: string, values: { name?: string; encryptedToken?: string; enabled?: boolean; agentId?: string; cloudflareAccountId?: string | null; tunnelId?: string | null }): Promise<Connector | null> {
+  public async updateConnector(id: string, values: { name?: string; encryptedToken?: string; enabled?: boolean; agentId?: string; accountId?: string; accountIdentifier?: string; tunnelId?: string }): Promise<Connector | null> {
     return this.transaction(async (client) => {
-      const current = await client.query('SELECT agent_id FROM cloudflare_connectors WHERE id = $1 FOR UPDATE', [id]);
+      const current = await client.query('SELECT agent_id, identity_status, desired_revision FROM cloudflare_connectors WHERE id = $1 FOR UPDATE', [id]);
       if (!current.rows[0]) return null;
       const targetAgentId = values.agentId ?? current.rows[0].agent_id;
-      const targetAgent = await client.query('SELECT 1 FROM agents WHERE id = $1 AND enabled', [targetAgentId]);
+      const targetAgent = await client.query('SELECT 1 FROM agents WHERE id = $1 AND enabled AND enrolled_at IS NOT NULL', [targetAgentId]);
       if (!targetAgent.rows[0]) return null;
-      if (values.cloudflareAccountId && !(await client.query('SELECT 1 FROM cloudflare_accounts WHERE id = $1', [values.cloudflareAccountId])).rows[0]) return null;
+      if (values.accountId && !(await client.query('SELECT 1 FROM cloudflare_accounts WHERE id = $1 AND enabled AND lower(account_identifier) = lower($2)', [values.accountId, values.accountIdentifier])).rows[0]) return null;
+      if (values.enabled === true && !values.encryptedToken && current.rows[0].identity_status !== 'verified') return null;
+      if (values.agentId && values.agentId !== current.rows[0].agent_id) {
+        await client.query(
+          `INSERT INTO agent_commands (agent_id, type, payload)
+           VALUES ($1, 'cloudflare.connector.remove', jsonb_build_object('connectorId', $2::text, 'revision', $3::bigint))`,
+          [current.rows[0].agent_id, id, Number(current.rows[0].desired_revision) + 1],
+        );
+      }
       const result = await client.query(
         `UPDATE cloudflare_connectors SET
            name = COALESCE($2, name), token_encrypted = COALESCE($3, token_encrypted),
            enabled = COALESCE($4, enabled), agent_id = COALESCE($5, agent_id),
-           cloudflare_account_id = CASE WHEN $6 THEN $7::uuid ELSE cloudflare_account_id END,
-           tunnel_id = CASE WHEN $8 THEN $9::text ELSE tunnel_id END, updated_at = now()
+            cloudflare_account_id = CASE WHEN $6 THEN $7::uuid ELSE cloudflare_account_id END,
+            tunnel_id = CASE WHEN $6 THEN $9::text ELSE tunnel_id END,
+            token_account_identifier = CASE WHEN $6 THEN $8 ELSE token_account_identifier END,
+            token_tunnel_id = CASE WHEN $6 THEN $9::uuid ELSE token_tunnel_id END,
+            identity_status = CASE WHEN $6 THEN 'verified' ELSE identity_status END,
+            identity_verified_at = CASE WHEN $6 THEN now() ELSE identity_verified_at END,
+            identity_error = CASE WHEN $6 THEN NULL ELSE identity_error END,
+            desired_revision = desired_revision + 1,
+            deployment_status = CASE WHEN COALESCE($4, enabled) THEN 'pending' ELSE 'stopping' END,
+            runtime_status = CASE WHEN COALESCE($4, enabled) THEN 'unknown' ELSE runtime_status END,
+            last_error = NULL, updated_at = now()
           WHERE id = $1 RETURNING *`,
         [id, values.name ?? null, values.encryptedToken ?? null, values.enabled ?? null, values.agentId ?? null,
-          values.cloudflareAccountId !== undefined, values.cloudflareAccountId ?? null, values.tunnelId !== undefined, values.tunnelId ?? null],
+          values.accountId !== undefined, values.accountId ?? null, values.accountIdentifier ?? null, values.tunnelId ?? null],
       );
       const updated = connector(result.rows[0]);
-      await this.queueConnectorSync(client, updated.agentId, updated.id);
+      await this.queueConnectorSync(client, updated.agentId, updated.id, updated.desiredRevision, !updated.enabled);
       return updated;
     });
   }
 
   public async getConnectorDeployment(connectorId: string): Promise<ConnectorDeployment | null> {
     const result = await this.pool.query(
-      'SELECT id, agent_id, name, enabled, token_encrypted, cloudflare_account_id, tunnel_id FROM cloudflare_connectors WHERE id = $1',
+      'SELECT id, agent_id, name, enabled, desired_revision, token_encrypted, cloudflare_account_id, tunnel_id, identity_status FROM cloudflare_connectors WHERE id = $1',
       [connectorId],
     );
     const row = result.rows[0];
-    return row ? { connectorId: row.id, agentId: row.agent_id, name: row.name, enabled: row.enabled, encryptedToken: row.token_encrypted, cloudflareAccountId: row.cloudflare_account_id ?? null, tunnelId: row.tunnel_id ?? null } : null;
+    return row ? { connectorId: row.id, agentId: row.agent_id, name: row.name, enabled: row.enabled, desiredRevision: Number(row.desired_revision), encryptedToken: row.token_encrypted, cloudflareAccountId: row.cloudflare_account_id ?? null, tunnelId: row.tunnel_id ?? null, identityStatus: row.identity_status } : null;
   }
 
   public async listCloudflareAccounts(): Promise<CloudflareAccount[]> {
@@ -284,6 +339,56 @@ export class PgStore implements Store {
     return result.rows[0] ? { ...cloudflareAccount(result.rows[0]), encryptedApiToken: result.rows[0].api_token_encrypted } : null;
   }
 
+  public async getCloudflareAccountSecretByIdentifier(accountIdentifier: string): Promise<CloudflareAccountSecret | null> {
+    const result = await this.pool.query('SELECT * FROM cloudflare_accounts WHERE enabled AND lower(account_identifier) = lower($1)', [accountIdentifier]);
+    return result.rows[0] ? { ...cloudflareAccount(result.rows[0]), encryptedApiToken: result.rows[0].api_token_encrypted } : null;
+  }
+
+  public async listConnectorIdentityDeployments(limit: number): Promise<ConnectorIdentityDeployment[]> {
+    const result = await this.pool.query(
+      `SELECT id, agent_id, name, enabled, desired_revision, token_encrypted, cloudflare_account_id, tunnel_id, identity_status
+       FROM cloudflare_connectors WHERE identity_status IN ('pending', 'parsed', 'failed') ORDER BY updated_at LIMIT $1`,
+      [Math.max(1, Math.min(limit, 50))],
+    );
+    return result.rows.map((row) => ({
+      connectorId: row.id, agentId: row.agent_id, name: row.name, enabled: row.enabled,
+      desiredRevision: Number(row.desired_revision), encryptedToken: row.token_encrypted,
+      cloudflareAccountId: row.cloudflare_account_id ?? null, tunnelId: row.tunnel_id ?? null,
+      identityStatus: row.identity_status,
+    }));
+  }
+
+  public async markConnectorIdentity(id: string, expected: ConnectorIdentityExpectation, values: { status: Connector['identityStatus']; accountId?: string; accountIdentifier?: string; tunnelId?: string; error?: string }): Promise<Connector | null> {
+    const result = await this.pool.query(
+      `UPDATE cloudflare_connectors SET
+       identity_status = CASE WHEN $4 = 'verified' AND (
+         (cloudflare_account_id IS NOT NULL AND cloudflare_account_id IS DISTINCT FROM $5::uuid)
+         OR (tunnel_id IS NOT NULL AND lower(tunnel_id) IS DISTINCT FROM lower($7::text))
+       ) THEN 'mismatch' ELSE $4 END,
+       cloudflare_account_id = CASE WHEN $4 = 'verified'
+         AND (cloudflare_account_id IS NULL OR cloudflare_account_id = $5::uuid)
+         AND (tunnel_id IS NULL OR lower(tunnel_id) = lower($7::text))
+         THEN COALESCE(cloudflare_account_id, $5::uuid) ELSE cloudflare_account_id END,
+       tunnel_id = CASE WHEN $4 = 'verified'
+         AND (cloudflare_account_id IS NULL OR cloudflare_account_id = $5::uuid)
+         AND (tunnel_id IS NULL OR lower(tunnel_id) = lower($7::text))
+         THEN COALESCE(tunnel_id, $7::text) ELSE tunnel_id END,
+       token_account_identifier = $6, token_tunnel_id = $7::uuid,
+       identity_verified_at = CASE WHEN $4 = 'verified'
+         AND (cloudflare_account_id IS NULL OR cloudflare_account_id = $5::uuid)
+         AND (tunnel_id IS NULL OR lower(tunnel_id) = lower($7::text)) THEN now() ELSE NULL END,
+       identity_error = CASE WHEN $4 = 'verified' AND (
+         (cloudflare_account_id IS NOT NULL AND cloudflare_account_id IS DISTINCT FROM $5::uuid)
+         OR (tunnel_id IS NOT NULL AND lower(tunnel_id) IS DISTINCT FROM lower($7::text))
+       ) THEN 'connector_identity_mismatch' WHEN $4 = 'verified' THEN NULL ELSE $8 END,
+       updated_at = now()
+       WHERE id = $1 AND desired_revision = $2 AND token_encrypted = $3 RETURNING *`,
+      [id, expected.desiredRevision, expected.encryptedToken, values.status, values.accountId ?? null,
+        values.accountIdentifier ?? null, values.tunnelId ?? null, values.error?.slice(0, 100) ?? null],
+    );
+    return result.rows[0] ? connector(result.rows[0]) : null;
+  }
+
   public async syncCloudflareZones(accountId: string, zones: Array<{ zoneIdentifier: string; name: string; status: string }>, error?: string): Promise<CloudflareZone[] | null> {
     return this.transaction(async (client) => {
       const account = await client.query(
@@ -293,6 +398,11 @@ export class PgStore implements Store {
       );
       if (!account.rows[0]) return null;
       if (!error) {
+        await client.query(
+          `UPDATE cloudflare_zones SET status = 'unavailable', updated_at = now()
+           WHERE cloudflare_account_id = $1 AND NOT (zone_identifier = ANY($2::text[]))`,
+          [accountId, zones.map((zone) => zone.zoneIdentifier)],
+        );
         for (const zone of zones) {
           await client.query(
             `INSERT INTO cloudflare_zones (cloudflare_account_id, zone_identifier, name, status) VALUES ($1, $2, $3, $4)
@@ -313,55 +423,147 @@ export class PgStore implements Store {
     return result.rows.map(cloudflareZone);
   }
 
-  public async listCloudflarePublicHostnames(): Promise<CloudflarePublicHostname[]> {
-    const result = await this.pool.query('SELECT * FROM cloudflare_public_hostnames ORDER BY hostname');
-    return result.rows.map(cloudflarePublicHostname);
+  public async listCloudflareDomainAccess(): Promise<CloudflareDomainAccess[]> {
+    const result = await this.pool.query(`SELECT ${this.domainAccessColumns()} FROM cloudflare_public_hostnames h ORDER BY h.hostname`);
+    return result.rows.map(cloudflareDomainAccess);
   }
 
-  public async createPendingCloudflarePublicHostname(values: { zoneId: string; connectorId: string; routeId: string; proxied: boolean }): Promise<CloudflarePublicHostname | null> {
+  public async withDomainAccessLock<T>(id: string, callback: () => Promise<T>): Promise<T> {
+    const client = await this.pool.connect();
+    const keys = [`domain-access:${id}`];
+    try {
+      await this.acquireAdvisoryLock(client, keys[0]!);
+      const result = await client.query(
+        'SELECT access_method, deployed_account_identifier, deployed_tunnel_id FROM cloudflare_public_hostnames WHERE id = $1',
+        [id],
+      );
+      const row = result.rows[0];
+      if (row?.access_method === 'tunnel' && row.deployed_account_identifier && row.deployed_tunnel_id) {
+        keys.push(`cloudflare-tunnel:${row.deployed_account_identifier}:${row.deployed_tunnel_id}`);
+        await this.acquireAdvisoryLock(client, keys[1]!);
+      }
+      return await callback();
+    } finally {
+      for (const key of keys.reverse()) {
+        try { await client.query('SELECT pg_advisory_unlock(hashtextextended($1, 0))', [key]); } catch { /* Client release also releases session locks. */ }
+      }
+      client.release();
+    }
+  }
+
+  public async hasEnabledDomainAccessDependency(dependency: 'account' | 'connector' | 'route', id: string): Promise<boolean> {
+    const column = dependency === 'account' ? 'cloudflare_account_id' : dependency === 'connector' ? 'connector_id' : 'route_id';
+    const result = await this.pool.query(`SELECT EXISTS (SELECT 1 FROM cloudflare_public_hostnames WHERE enabled AND ${column} = $1) AS linked`, [id]);
+    return result.rows[0].linked;
+  }
+
+  public async createPendingDomainAccess(values: { accountId: string; zoneId: string; routeId: string; accessMethod: 'tunnel' | 'public_ip'; connectorId?: string; publicIpv4: string[]; publicIpv6: string[]; proxied: boolean }): Promise<CloudflareDomainAccess | null> {
     const result = await this.pool.query(
-      `INSERT INTO cloudflare_public_hostnames (cloudflare_zone_id, cloudflare_account_id, connector_id, route_id, hostname, proxied)
-       SELECT z.id, z.cloudflare_account_id, c.id, r.id, r.hostname, $4
+      `INSERT INTO cloudflare_public_hostnames
+         (cloudflare_zone_id, cloudflare_account_id, connector_id, route_id, hostname, access_method, public_ipv4, public_ipv6, proxied,
+          deployed_account_identifier, deployed_zone_identifier, deployed_tunnel_id)
+       SELECT z.id, a.id, c.id, r.id, r.hostname, $4, $6::inet[], $7::inet[], $8, a.account_identifier, z.zone_identifier, c.tunnel_id
        FROM cloudflare_zones z JOIN cloudflare_accounts a ON a.id = z.cloudflare_account_id
-       JOIN cloudflare_connectors c ON c.id = $2 AND c.cloudflare_account_id = a.id
        JOIN managed_routes r ON r.id = $3
-       WHERE z.id = $1 AND a.enabled AND c.enabled AND c.tunnel_id IS NOT NULL AND r.enabled AND r.exposure = 'tunnel'
+       LEFT JOIN cloudflare_connectors c ON c.id = $5
+       WHERE z.id = $2 AND a.id = $1 AND a.enabled AND z.status = 'active' AND r.enabled AND r.status = 'active'
+           AND (($4 = 'tunnel' AND r.exposure = 'tunnel' AND c.enabled AND c.identity_status = 'verified' AND c.tunnel_id IS NOT NULL
+                AND c.cloudflare_account_id = a.id AND lower(c.token_account_identifier) = lower(a.account_identifier)
+                AND lower(c.token_tunnel_id::text) = lower(c.tunnel_id) AND c.agent_id = r.gateway_agent_id)
+           OR ($4 = 'public_ip' AND r.exposure = 'public' AND c.id IS NULL))
          AND (lower(r.hostname) = lower(z.name) OR lower(r.hostname) LIKE '%.' || lower(z.name))
-       RETURNING *`, [values.zoneId, values.connectorId, values.routeId, values.proxied],
+       ON CONFLICT DO NOTHING RETURNING *`,
+      [values.accountId, values.zoneId, values.routeId, values.accessMethod, values.connectorId ?? null, values.publicIpv4, values.publicIpv6, values.proxied],
     );
-    return result.rows[0] ? cloudflarePublicHostname(result.rows[0]) : null;
+    if (!result.rows[0]) return null;
+    return (await this.getDomainAccess(result.rows[0].id))!;
   }
 
-  public async setCloudflarePublicHostnamePending(id: string, enabled: boolean): Promise<CloudflarePublicHostname | null> {
+  public async setDomainAccessPending(id: string, enabled?: boolean): Promise<CloudflareDomainAccess | null> {
     const result = await this.pool.query(
-      `UPDATE cloudflare_public_hostnames SET enabled = $2,
-       status = CASE WHEN enabled = $2 AND status = 'active' THEN status ELSE 'pending' END,
-       last_error = CASE WHEN enabled = $2 AND status = 'active' THEN last_error ELSE NULL END, updated_at = now()
-       WHERE id = $1 RETURNING *`, [id, enabled],
+      `UPDATE cloudflare_public_hostnames SET enabled = COALESCE($2, enabled), revision = revision + 1, status = 'pending',
+       last_error = NULL, updated_at = now() WHERE id = $1 RETURNING id`, [id, enabled ?? null],
     );
-    return result.rows[0] ? cloudflarePublicHostname(result.rows[0]) : null;
+    return result.rows[0] ? this.getDomainAccess(id) : null;
   }
 
-  public async getCloudflareHostnameDeployment(id: string): Promise<CloudflareHostnameDeployment | null> {
+  public async getCloudflareDomainAccessDeployment(id: string): Promise<CloudflareDomainAccessDeployment | null> {
     const result = await this.pool.query(
-      `SELECT h.*, a.account_identifier, a.api_token_encrypted, z.zone_identifier, c.tunnel_id
-       FROM cloudflare_public_hostnames h JOIN cloudflare_accounts a ON a.id = h.cloudflare_account_id
-       JOIN cloudflare_zones z ON z.id = h.cloudflare_zone_id JOIN cloudflare_connectors c ON c.id = h.connector_id
-       WHERE h.id = $1 AND c.cloudflare_account_id = h.cloudflare_account_id AND z.cloudflare_account_id = h.cloudflare_account_id
-       AND c.tunnel_id IS NOT NULL`, [id],
+      `SELECT ${this.domainAccessColumns()}, h.deployed_account_identifier AS account_identifier, a.api_token_encrypted, a.enabled AS account_enabled,
+        h.deployed_zone_identifier AS zone_identifier, z.name AS zone_name, z.status AS zone_status, z.cloudflare_account_id AS zone_account_id,
+        r.enabled AS route_enabled, r.status AS route_status, r.hostname AS route_hostname,
+        r.exposure AS route_exposure, r.gateway_agent_id AS route_agent_id, c.enabled AS connector_enabled,
+         c.agent_id AS connector_agent_id, c.cloudflare_account_id AS connector_account_id, c.identity_status AS connector_identity_status,
+         c.token_account_identifier AS connector_token_account_identifier, c.token_tunnel_id::text AS connector_token_tunnel_id,
+        h.deployed_tunnel_id AS tunnel_id
+       FROM cloudflare_public_hostnames h
+       JOIN cloudflare_accounts a ON a.id = h.cloudflare_account_id
+       JOIN cloudflare_zones z ON z.id = h.cloudflare_zone_id
+       JOIN managed_routes r ON r.id = h.route_id
+       LEFT JOIN cloudflare_connectors c ON c.id = h.connector_id
+       WHERE h.id = $1`, [id],
     );
     const row = result.rows[0];
-    return row ? { ...cloudflarePublicHostname(row), accountIdentifier: row.account_identifier, encryptedApiToken: row.api_token_encrypted, zoneIdentifier: row.zone_identifier, tunnelId: row.tunnel_id } : null;
+    return row ? {
+      ...cloudflareDomainAccess(row), accountIdentifier: row.account_identifier, encryptedApiToken: row.api_token_encrypted,
+      zoneIdentifier: row.zone_identifier, zoneName: row.zone_name, zoneStatus: row.zone_status,
+      zoneAccountId: row.zone_account_id, accountEnabled: row.account_enabled,
+      routeEnabled: row.route_enabled, routeStatus: row.route_status, routeExposure: row.route_exposure,
+      routeAgentId: row.route_agent_id, routeHostname: row.route_hostname, connectorEnabled: row.connector_enabled ?? null,
+      connectorAgentId: row.connector_agent_id ?? null, connectorAccountId: row.connector_account_id ?? null,
+      connectorIdentityStatus: row.connector_identity_status ?? null,
+      connectorTokenAccountIdentifier: row.connector_token_account_identifier ?? null,
+      connectorTokenTunnelId: row.connector_token_tunnel_id ?? null,
+      tunnelId: row.tunnel_id ?? null,
+    } : null;
   }
 
-  public async markCloudflareHostnameOutcome(id: string, values: { status: 'active' | 'failed'; enabled: boolean; dnsRecordId?: string | null; lastError?: string | null }): Promise<CloudflarePublicHostname | null> {
+  public async saveDomainAccessDnsRecord(id: string, revision: number, record: Pick<DomainAccessDnsRecord, 'type' | 'content' | 'cloudflareRecordId' | 'ownershipMarker'>): Promise<CloudflareDomainAccess | null> {
     const result = await this.pool.query(
-      `UPDATE cloudflare_public_hostnames SET status = $2, enabled = $3,
-       dns_record_id = CASE WHEN $4 THEN $5::text ELSE dns_record_id END, last_error = $6, updated_at = now()
-       WHERE id = $1 RETURNING *`,
-      [id, values.status, values.enabled, values.dnsRecordId !== undefined, values.dnsRecordId ?? null, values.lastError ?? null],
+      `INSERT INTO cloudflare_domain_access_dns_records (domain_access_id, record_type, content, cloudflare_record_id, ownership_marker)
+       SELECT id, $3, $4, $5, $6 FROM cloudflare_public_hostnames WHERE id = $1 AND revision = $2
+       ON CONFLICT (domain_access_id, cloudflare_record_id) DO UPDATE
+       SET record_type = EXCLUDED.record_type, content = EXCLUDED.content, ownership_marker = EXCLUDED.ownership_marker,
+           status = 'active', last_error = NULL, updated_at = now()
+       RETURNING domain_access_id`, [id, revision, record.type, record.content, record.cloudflareRecordId, record.ownershipMarker],
     );
-    return result.rows[0] ? cloudflarePublicHostname(result.rows[0]) : null;
+    return result.rows[0] ? this.getDomainAccess(id) : null;
+  }
+
+  public async markDomainAccessDnsRecordStatus(id: string, revision: number, cloudflareRecordId: string, status: 'cleanup_pending' | 'deleted', lastError?: string): Promise<boolean> {
+    const result = await this.pool.query(
+      `UPDATE cloudflare_domain_access_dns_records d SET status = $4, last_error = $5, updated_at = now()
+       FROM cloudflare_public_hostnames h
+       WHERE d.domain_access_id = $1 AND d.cloudflare_record_id = $3
+         AND h.id = d.domain_access_id AND h.revision = $2`,
+      [id, revision, cloudflareRecordId, status, status === 'cleanup_pending' ? lastError?.slice(0, 500) ?? 'Cloudflare DNS cleanup failed.' : null],
+    );
+    return result.rowCount === 1;
+  }
+
+  public async markDomainAccessOutcome(id: string, revision: number, values: { status: 'active' | 'failed' | 'disabled'; lastError?: string | null }): Promise<CloudflareDomainAccess | null> {
+    const result = await this.pool.query(
+      `UPDATE cloudflare_public_hostnames SET status = $2, last_error = $3,
+       last_reconciled_at = now(), updated_at = now(),
+       dns_record_id = (SELECT cloudflare_record_id FROM cloudflare_domain_access_dns_records
+         WHERE domain_access_id = $1 AND record_type = 'CNAME' AND status = 'active' ORDER BY created_at LIMIT 1)
+       WHERE id = $1 AND revision = $4 RETURNING id`, [id, values.status, values.lastError ?? null, revision],
+    );
+    return result.rows[0] ? this.getDomainAccess(id) : null;
+  }
+
+  private async getDomainAccess(id: string): Promise<CloudflareDomainAccess | null> {
+    const result = await this.pool.query(
+      `SELECT ${this.domainAccessColumns()} FROM cloudflare_public_hostnames h WHERE h.id = $1`, [id],
+    );
+    return result.rows[0] ? cloudflareDomainAccess(result.rows[0]) : null;
+  }
+
+  private domainAccessColumns(): string {
+    return `h.*, COALESCE((SELECT jsonb_agg(jsonb_build_object(
+      'type', d.record_type, 'content', d.content, 'cloudflareRecordId', d.cloudflare_record_id,
+      'ownershipMarker', d.ownership_marker, 'status', d.status, 'lastError', d.last_error
+    ) ORDER BY d.created_at) FROM cloudflare_domain_access_dns_records d WHERE d.domain_access_id = h.id), '[]'::jsonb) AS owned_dns_records`;
   }
 
   public async listStacks(): Promise<ManagedStack[]> {
@@ -572,7 +774,7 @@ export class PgStore implements Store {
           if (!['connected', 'origin_unhealthy', 'reconnecting', 'stopped', 'failed'].includes(String(runtimeStatus))) continue;
           await client.query(
             `UPDATE cloudflare_connectors SET runtime_status = $3, last_error = $4, last_observed_at = now(), updated_at = now()
-             WHERE id = $1 AND agent_id = $2`,
+             WHERE id = $1 AND agent_id = $2 AND enabled`,
             [connectorId, id, runtimeStatus, typeof error === 'string' ? error.slice(0, 1000) : null],
           );
         }
@@ -582,7 +784,7 @@ export class PgStore implements Store {
 
   public async recordTelemetry(agentId: string, snapshot: Omit<TelemetrySnapshot, 'agentId' | 'receivedAt'>): Promise<void> {
     await this.transaction(async (client) => {
-      const previous = await client.query('SELECT services FROM agent_telemetry_snapshots WHERE agent_id = $1 ORDER BY observed_at DESC LIMIT 1', [agentId]);
+      const previous = await client.query('SELECT services FROM agent_telemetry_snapshots WHERE agent_id = $1 ORDER BY created_at DESC LIMIT 1', [agentId]);
       await client.query(
         'INSERT INTO agent_telemetry_snapshots (agent_id, observed_at, node, services) VALUES ($1, $2, $3, $4)',
         [agentId, snapshot.observedAt, snapshot.node, JSON.stringify(snapshot.services)],
@@ -608,7 +810,7 @@ export class PgStore implements Store {
     const result = await this.pool.query(
       `SELECT DISTINCT ON (snapshot.agent_id) snapshot.* FROM agent_telemetry_snapshots snapshot
        JOIN agents agent ON agent.id = snapshot.agent_id WHERE agent.archived_at IS NULL
-       ORDER BY snapshot.agent_id, snapshot.observed_at DESC`,
+        ORDER BY snapshot.agent_id, snapshot.created_at DESC`,
     );
     return result.rows.map(telemetry);
   }
@@ -616,9 +818,86 @@ export class PgStore implements Store {
   public async getAgentMonitoring(agentId: string): Promise<{ agent: Agent; latest: TelemetrySnapshot | null; history: TelemetrySnapshot[] } | null> {
     const agentResult = await this.pool.query('SELECT * FROM agents WHERE id = $1 AND archived_at IS NULL', [agentId]);
     if (!agentResult.rows[0]) return null;
-    const snapshots = await this.pool.query('SELECT * FROM agent_telemetry_snapshots WHERE agent_id = $1 ORDER BY observed_at DESC LIMIT 288', [agentId]);
+    const snapshots = await this.pool.query('SELECT * FROM agent_telemetry_snapshots WHERE agent_id = $1 ORDER BY created_at DESC LIMIT 288', [agentId]);
     const history = snapshots.rows.map(telemetry);
     return { agent: agent(agentResult.rows[0]), latest: history[0] ?? null, history };
+  }
+
+  public async getLatestRuntimeInventory(): Promise<RuntimeInventory[]> {
+    const result = await this.pool.query(
+      `SELECT a.*, s.observed_at AS snapshot_observed_at, s.node AS snapshot_node, s.services AS snapshot_services,
+        s.created_at AS snapshot_created_at FROM agents a LEFT JOIN LATERAL (
+          SELECT * FROM agent_telemetry_snapshots WHERE agent_id = a.id ORDER BY created_at DESC LIMIT 1
+        ) s ON true WHERE a.archived_at IS NULL ORDER BY a.name`,
+    );
+    return result.rows.map((row) => ({ agent: agent(row), latest: row.snapshot_observed_at ? {
+      agentId: row.id, observedAt: row.snapshot_observed_at.toISOString(), node: row.snapshot_node,
+      services: row.snapshot_services, receivedAt: row.snapshot_created_at.toISOString(),
+    } : null }));
+  }
+
+  public async createRuntimeOperation(values: { requestedByUserId: string; agentId: string; action: RuntimeAction; scope: RuntimeScope; projectName: string; serviceName?: string }): Promise<RuntimeOperation | 'active' | null> {
+    try {
+      return await this.transaction(async (client) => {
+        await client.query('SELECT pg_advisory_xact_lock(hashtextextended($1, 0))', [`${values.agentId}\u0000${values.projectName}`]);
+        const active = await client.query(
+          `SELECT 1 FROM runtime_operations WHERE agent_id = $1 AND project_name = $2 AND status IN ('pending', 'running')
+           AND (service_name IS NULL OR $3::text IS NULL OR service_name = $3) LIMIT 1`,
+          [values.agentId, values.projectName, values.serviceName ?? null],
+        );
+        if (active.rows[0]) return 'active';
+        const created = await client.query(
+          `INSERT INTO runtime_operations (requested_by_user_id, agent_id, action, scope, project_name, service_name)
+           SELECT $1, id, $3, $4, $5, $6 FROM agents WHERE id = $2 AND enabled AND enrolled_at IS NOT NULL RETURNING *`,
+          [values.requestedByUserId, values.agentId, values.action, values.scope, values.projectName, values.serviceName ?? null],
+        );
+        if (!created.rows[0]) return null;
+        const commandResult = await client.query(
+          "INSERT INTO agent_commands (agent_id, type, payload) VALUES ($1, 'compose.runtime.action', jsonb_build_object('operationId', $2::text)) RETURNING id",
+          [values.agentId, created.rows[0].id],
+        );
+        const updated = await client.query('UPDATE runtime_operations SET command_id = $2 WHERE id = $1 RETURNING *', [created.rows[0].id, commandResult.rows[0].id]);
+        return runtimeOperation(updated.rows[0]);
+      });
+    } catch (error) {
+      if ((error as { code?: string }).code === '23505') return 'active';
+      throw error;
+    }
+  }
+
+  public async listRuntimeOperations(): Promise<RuntimeOperation[]> {
+    const result = await this.pool.query('SELECT * FROM runtime_operations ORDER BY created_at DESC LIMIT 200');
+    return result.rows.map(runtimeOperation);
+  }
+
+  public async getRuntimeOperation(id: string): Promise<RuntimeOperation | null> {
+    const result = await this.pool.query('SELECT * FROM runtime_operations WHERE id = $1', [id]);
+    return result.rows[0] ? runtimeOperation(result.rows[0]) : null;
+  }
+
+  public async createRuntimeLogRequest(values: { requestedByUserId: string; agentId: string; projectName: string; serviceName: string; tail: number; since?: string }): Promise<RuntimeLogRequest | null> {
+    return this.transaction(async (client) => {
+      const created = await client.query(
+        `INSERT INTO runtime_log_requests (requested_by_user_id, agent_id, project_name, service_name, tail, since)
+         SELECT $1, id, $3, $4, $5, $6 FROM agents WHERE id = $2 AND enabled AND enrolled_at IS NOT NULL RETURNING *`,
+        [values.requestedByUserId, values.agentId, values.projectName, values.serviceName, values.tail, values.since ?? null],
+      );
+      if (!created.rows[0]) return null;
+      const commandResult = await client.query(
+        "INSERT INTO agent_commands (agent_id, type, payload) VALUES ($1, 'compose.runtime.logs', jsonb_build_object('requestId', $2::text)) RETURNING id",
+        [values.agentId, created.rows[0].id],
+      );
+      const updated = await client.query('UPDATE runtime_log_requests SET command_id = $2 WHERE id = $1 RETURNING *', [created.rows[0].id, commandResult.rows[0].id]);
+      return runtimeLogRequest(updated.rows[0]);
+    });
+  }
+
+  public async getRuntimeLogRequest(id: string, requestedByUserId?: string): Promise<RuntimeLogRequest | null> {
+    const result = await this.pool.query(
+      'SELECT * FROM runtime_log_requests WHERE id = $1 AND ($2::uuid IS NULL OR requested_by_user_id = $2)',
+      [id, requestedByUserId ?? null],
+    );
+    return result.rows[0] ? runtimeLogRequest(result.rows[0]) : null;
   }
 
   public async queueLogRequest(stackId: string, requestedByUserId: string, service: string, tail: number, since?: string): Promise<AgentCommand | null> {
@@ -788,8 +1067,9 @@ export class PgStore implements Store {
   }
 
   public async claimCommands(agentId: string, limit: number): Promise<AgentCommand[]> {
-    await this.pool.query('UPDATE agents SET last_command_poll_at = now(), updated_at = now() WHERE id = $1 AND enabled', [agentId]);
-    const result = await this.pool.query(
+    return this.transaction(async (client) => {
+    await client.query('UPDATE agents SET last_command_poll_at = now(), updated_at = now() WHERE id = $1 AND enabled', [agentId]);
+    const result = await client.query(
        `WITH selected AS (
           SELECT id FROM agent_commands
           WHERE agent_id = $1
@@ -803,35 +1083,45 @@ export class PgStore implements Store {
     );
     const commands = result.rows.map(command);
     for (const item of commands) {
-      if (item.type === 'cloudflare.connector.sync' && typeof item.payload.connectorId === 'string') {
-        await this.pool.query("UPDATE cloudflare_connectors SET deployment_status = 'deploying', last_error = NULL, updated_at = now() WHERE id = $1 AND agent_id = $2", [item.payload.connectorId, agentId]);
+      if (item.type === 'cloudflare.connector.sync' && typeof item.payload.connectorId === 'string' && typeof item.payload.revision === 'number') {
+        await client.query("UPDATE cloudflare_connectors SET deployment_status = CASE WHEN enabled THEN 'deploying' ELSE 'stopping' END, last_error = NULL, updated_at = now() WHERE id = $1 AND agent_id = $2 AND desired_revision = $3", [item.payload.connectorId, agentId, item.payload.revision]);
       }
-      if (item.type === 'stack.backup.create') await this.pool.query("UPDATE stack_backups SET status = 'running', started_at = COALESCE(started_at, now()), updated_at = now() WHERE id = $1 AND status = 'pending'", [item.payload.backupId]);
-      if (item.type === 'stack.restore.apply') await this.pool.query("UPDATE stack_restores SET status = 'running', started_at = COALESCE(started_at, now()), updated_at = now() WHERE id = $1 AND status = 'pending'", [item.payload.restoreId]);
+      if (item.type === 'stack.backup.create') await client.query("UPDATE stack_backups SET status = 'running', started_at = COALESCE(started_at, now()), updated_at = now() WHERE id = $1 AND status = 'pending'", [item.payload.backupId]);
+      if (item.type === 'stack.restore.apply') await client.query("UPDATE stack_restores SET status = 'running', started_at = COALESCE(started_at, now()), updated_at = now() WHERE id = $1 AND status = 'pending'", [item.payload.restoreId]);
+      if (item.type === 'compose.runtime.action') await client.query("UPDATE runtime_operations SET status = 'running', started_at = COALESCE(started_at, now()), updated_at = now() WHERE id = $1 AND agent_id = $2 AND status = 'pending'", [item.payload.operationId, agentId]);
+      if (item.type === 'compose.runtime.logs') await client.query("UPDATE runtime_log_requests SET status = 'running', started_at = COALESCE(started_at, now()), updated_at = now() WHERE id = $1 AND agent_id = $2 AND status = 'pending'", [item.payload.requestId, agentId]);
     }
     return commands;
+    });
   }
 
   public async completeCommand(agentId: string, commandId: string, status: 'succeeded' | 'failed', result: Record<string, unknown>): Promise<'updated' | 'idempotent' | 'conflict' | 'missing'> {
     return this.transaction(async (client) => {
       const current = await client.query('SELECT status, result, type, payload FROM agent_commands WHERE id = $1 AND agent_id = $2 FOR UPDATE', [commandId, agentId]);
       if (!current.rows[0]) return 'missing';
-      if (current.rows[0].status === status && JSON.stringify(current.rows[0].result) === JSON.stringify(result)) return 'idempotent';
+      const commandResult = current.rows[0].type === 'compose.runtime.logs'
+        ? { truncated: result.truncated === true }
+        : result;
+      if (current.rows[0].status === status) {
+        const duplicate = await client.query('SELECT $1::jsonb = $2::jsonb AS matches', [current.rows[0].result, commandResult]);
+        if (duplicate.rows[0].matches) return 'idempotent';
+      }
       if (current.rows[0].status !== 'claimed') return 'conflict';
-      await client.query('UPDATE agent_commands SET status = $3, result = $4, completed_at = now(), lease_expires_at = NULL WHERE id = $1 AND agent_id = $2', [commandId, agentId, status, result]);
+      await client.query('UPDATE agent_commands SET status = $3, result = $4, completed_at = now(), lease_expires_at = NULL WHERE id = $1 AND agent_id = $2', [commandId, agentId, status, commandResult]);
       await client.query('UPDATE agents SET last_command_result_at = now(), updated_at = now() WHERE id = $1', [agentId]);
       if (current.rows[0].type === 'agent.diagnostics.run' && status === 'succeeded' && result.diagnostics && typeof result.diagnostics === 'object') {
         await client.query('UPDATE agents SET last_diagnostics = $2, updated_at = now() WHERE id = $1', [agentId, result.diagnostics]);
       }
-      if (current.rows[0].type === 'cloudflare.connector.sync' && typeof current.rows[0].payload?.connectorId === 'string') {
+      if (current.rows[0].type === 'cloudflare.connector.sync' && typeof current.rows[0].payload?.connectorId === 'string' && typeof current.rows[0].payload?.revision === 'number') {
         const runtimeStatus = status === 'failed' ? 'failed' : result.runtimeStatus === 'origin_unhealthy' ? 'origin_unhealthy' : result.runtimeStatus === 'stopped' ? 'stopped' : result.runtimeStatus === 'connected' ? 'connected' : 'reconnecting';
         const safeError = status === 'failed'
           ? String(result.error || result.stderr || 'Connector deployment failed.').slice(0, 1000)
           : typeof result.message === 'string' ? result.message.slice(0, 1000) : null;
         await client.query(
           `UPDATE cloudflare_connectors SET deployment_status = $2, runtime_status = $3, last_error = $4,
-           last_deployed_at = now(), last_observed_at = now(), updated_at = now() WHERE id = $1 AND agent_id = $5`,
-          [current.rows[0].payload.connectorId, status === 'succeeded' ? (runtimeStatus === 'stopped' ? 'stopped' : 'active') : 'failed', runtimeStatus, safeError, agentId],
+           last_deployed_at = now(), last_observed_at = now(), updated_at = now()
+           WHERE id = $1 AND agent_id = $5 AND desired_revision = $6`,
+          [current.rows[0].payload.connectorId, status === 'succeeded' ? (runtimeStatus === 'stopped' ? 'stopped' : 'active') : 'failed', runtimeStatus, safeError, agentId, current.rows[0].payload.revision],
         );
       }
       const deploymentStatus = status === 'succeeded' ? 'active' : 'failed';
@@ -865,6 +1155,25 @@ export class PgStore implements Store {
           [current.rows[0].payload.restoreId, status, result, agentId],
         );
         if (status === 'failed' && updated.rows[0]) await this.enqueueEvent(client, 'backup.failed', { agentId, stackId: updated.rows[0].stack_id, payload: { restoreId: current.rows[0].payload.restoreId, backupId: updated.rows[0].backup_id, operation: 'restore' } });
+      }
+      if (current.rows[0].type === 'compose.runtime.action' && typeof current.rows[0].payload?.operationId === 'string') {
+        const safeResult = this.safeRuntimeResult(result);
+        const updated = await client.query(
+          `UPDATE runtime_operations SET status = $2, result = $3, error = $4, completed_at = now(), updated_at = now()
+            WHERE id = $1 AND agent_id = $5 AND status IN ('pending', 'running') RETURNING action, scope, project_name, service_name`,
+          [current.rows[0].payload.operationId, status, safeResult, status === 'failed' ? String(result.error || 'Runtime action failed.').slice(0, 500) : null, agentId],
+        );
+        if (updated.rows[0]) await this.enqueueEvent(client, status === 'succeeded' ? 'runtime.action.succeeded' : 'runtime.action.failed', {
+          agentId, payload: { agentId, projectName: updated.rows[0].project_name, ...(updated.rows[0].service_name ? { serviceName: updated.rows[0].service_name } : {}), action: updated.rows[0].action, scope: updated.rows[0].scope },
+        });
+      }
+      if (current.rows[0].type === 'compose.runtime.logs' && typeof current.rows[0].payload?.requestId === 'string') {
+        const logs = typeof result.logs === 'string' ? result.logs.slice(0, 262_144) : '';
+        await client.query(
+          `UPDATE runtime_log_requests SET status = $2, result = $3, error = $4, completed_at = now(), updated_at = now()
+            WHERE id = $1 AND agent_id = $5 AND status IN ('pending', 'running')`,
+          [current.rows[0].payload.requestId, status, status === 'succeeded' ? { logs, truncated: result.truncated === true } : null, status === 'failed' ? String(result.error || 'Runtime log request failed.').slice(0, 500) : null, agentId],
+        );
       }
       return 'updated';
     });
@@ -919,11 +1228,21 @@ export class PgStore implements Store {
       const safeResult = { error: 'The operation exceeded the 24-hour completion window.' };
       const commands = await client.query(
         `UPDATE agent_commands SET status = 'failed', result = $2, completed_at = now(), lease_expires_at = NULL
-         WHERE type IN ('stack.backup.create', 'stack.restore.apply') AND status IN ('pending', 'claimed') AND created_at < $1
+          WHERE status IN ('pending', 'claimed') AND (
+            (type IN ('stack.backup.create', 'stack.restore.apply', 'compose.runtime.action', 'compose.runtime.logs') AND created_at < $1)
+            OR (type IN ('cloudflare.connector.sync', 'cloudflare.connector.remove') AND created_at < now() - interval '30 minutes')
+          )
          RETURNING id, agent_id, type, payload`,
         [staleBefore, safeResult],
       );
       for (const commandRow of commands.rows) {
+        if (commandRow.type === 'cloudflare.connector.sync') {
+          await client.query(
+            `UPDATE cloudflare_connectors SET deployment_status = 'failed', last_error = $4, updated_at = now()
+             WHERE id = $1 AND agent_id = $2 AND desired_revision = $3`,
+            [commandRow.payload.connectorId, commandRow.agent_id, commandRow.payload.revision, safeResult.error],
+          );
+        }
         if (commandRow.type === 'stack.backup.create') {
           const operation = await client.query(
             `UPDATE stack_backups SET status = 'failed', result = $2, completed_at = now(), updated_at = now()
@@ -950,8 +1269,40 @@ export class PgStore implements Store {
             });
           }
         }
+        if (commandRow.type === 'compose.runtime.action') {
+          const operation = await client.query(
+            `UPDATE runtime_operations SET status = 'failed', result = $2, error = $3, completed_at = now(), updated_at = now()
+             WHERE command_id = $1 AND status IN ('pending', 'running') RETURNING action, scope, project_name, service_name`,
+            [commandRow.id, safeResult, safeResult.error],
+          );
+          if (operation.rows[0]) await this.enqueueEvent(client, 'runtime.action.failed', { agentId: commandRow.agent_id, payload: { agentId: commandRow.agent_id, projectName: operation.rows[0].project_name, ...(operation.rows[0].service_name ? { serviceName: operation.rows[0].service_name } : {}), action: operation.rows[0].action, scope: operation.rows[0].scope } });
+        }
+        if (commandRow.type === 'compose.runtime.logs') {
+          await client.query(
+            `UPDATE runtime_log_requests SET status = 'failed', result = $2, error = $3, completed_at = now(), updated_at = now()
+             WHERE command_id = $1 AND status IN ('pending', 'running')`,
+            [commandRow.id, safeResult, safeResult.error],
+          );
+        }
       }
       return commands.rowCount ?? 0;
+    });
+  }
+
+  public async purgeRuntimeLogResults(completedBefore: Date): Promise<number> {
+    return this.transaction(async (client) => {
+      const result = await client.query(
+        'UPDATE runtime_log_requests SET result = NULL, updated_at = now() WHERE result IS NOT NULL AND completed_at < $1 RETURNING command_id',
+        [completedBefore],
+      );
+      const commandIds = result.rows.map((row) => row.command_id).filter((id): id is string => typeof id === 'string');
+      if (commandIds.length > 0) {
+        await client.query(
+          "UPDATE agent_commands SET result = COALESCE(result - 'logs', '{}'::jsonb) WHERE id = ANY($1::uuid[]) AND type = 'compose.runtime.logs'",
+          [commandIds],
+        );
+      }
+      return result.rowCount ?? 0;
     });
   }
 
@@ -970,9 +1321,30 @@ export class PgStore implements Store {
     }
   }
 
-  private async queueConnectorSync(client: PoolClient, agentId: string, connectorId: string): Promise<void> {
-    await client.query("UPDATE cloudflare_connectors SET deployment_status = 'pending', runtime_status = 'unknown', last_error = NULL, updated_at = now() WHERE id = $1", [connectorId]);
-    await this.queueInternalSync(client, agentId, 'cloudflare.connector.sync', 'connectorId', connectorId);
+  private async acquireAdvisoryLock(client: PoolClient, key: string): Promise<void> {
+    const deadline = Date.now() + 30_000;
+    while (true) {
+      const result = await client.query('SELECT pg_try_advisory_lock(hashtextextended($1, 0)) AS acquired', [key]);
+      if (result.rows[0].acquired) return;
+      if (Date.now() >= deadline) throw new Error('Timed out waiting for domain access reconciliation lock.');
+      await new Promise((resolve) => setTimeout(resolve, 25));
+    }
+  }
+
+  private async queueConnectorSync(client: PoolClient, agentId: string, connectorId: string, revision: number, stopping = false): Promise<void> {
+    await client.query("UPDATE cloudflare_connectors SET deployment_status = $2, last_error = NULL, updated_at = now() WHERE id = $1", [connectorId, stopping ? 'stopping' : 'pending']);
+    const pending = await client.query(
+      `UPDATE agent_commands SET payload = jsonb_build_object('connectorId', $3::text, 'revision', $4::bigint), created_at = now()
+       WHERE agent_id = $1 AND type = 'cloudflare.connector.sync' AND status = 'pending' AND payload->>'connectorId' = $2 RETURNING id`,
+      [agentId, connectorId, connectorId, revision],
+    );
+    if (!pending.rows[0]) {
+      await client.query(
+        `INSERT INTO agent_commands (agent_id, type, payload)
+         VALUES ($1, 'cloudflare.connector.sync', jsonb_build_object('connectorId', $2::text, 'revision', $3::bigint))`,
+        [agentId, connectorId, revision],
+      );
+    }
   }
 
   private async queueInternalSync(client: PoolClient, agentId: string, type: 'cloudflare.connector.sync' | 'compose.stack.sync' | 'traefik.route.sync', entityKey: 'connectorId' | 'stackId' | 'routeId', entityId: string): Promise<void> {
@@ -1000,5 +1372,13 @@ export class PgStore implements Store {
       `INSERT INTO notification_deliveries (event_id, channel)
        SELECT $1, 'telegram' FROM notification_settings WHERE singleton AND selected_events ? $2`, [event.rows[0].id, type],
     );
+  }
+
+  private safeRuntimeResult(result: Record<string, unknown>): Record<string, unknown> {
+    const safe: Record<string, unknown> = {};
+    for (const key of ['matched', 'succeeded', 'failed', 'message']) {
+      if (typeof result[key] === 'number' || typeof result[key] === 'string') safe[key] = typeof result[key] === 'string' ? String(result[key]).slice(0, 500) : result[key];
+    }
+    return safe;
   }
 }

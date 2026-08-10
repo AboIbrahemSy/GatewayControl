@@ -13,7 +13,13 @@ export type Connector = {
   enabled: boolean
   cloudflareAccountId: string | null
   tunnelId: string | null
-  deploymentStatus: 'pending' | 'deploying' | 'active' | 'failed' | 'stopped'
+  desiredRevision: number
+  tokenAccountIdentifier: string | null
+  tokenTunnelId: string | null
+  identityStatus: 'parsed' | 'pending' | 'verified' | 'unmatched' | 'mismatch' | 'invalid' | 'failed'
+  identityVerifiedAt: string | null
+  identityError: string | null
+  deploymentStatus: 'pending' | 'deploying' | 'active' | 'failed' | 'stopping' | 'stopped'
   runtimeStatus: 'unknown' | 'connected' | 'origin_unhealthy' | 'reconnecting' | 'stopped' | 'failed'
   lastError: string | null
   lastDeployedAt: string | null
@@ -45,21 +51,35 @@ export type CloudflareZone = {
   updatedAt: string
 }
 
-export type CloudflarePublicHostname = {
+export type DomainAccessDnsRecord = {
+  type: 'A' | 'AAAA' | 'CNAME'
+  content: string
+  cloudflareRecordId: string
+  status: 'active' | 'deleted'
+}
+
+export type CloudflareDomainAccess = {
   id: string
   cloudflareZoneId: string
   cloudflareAccountId: string
-  connectorId: string
+  connectorId: string | null
   routeId: string
   hostname: string
+  accessMethod: 'tunnel' | 'public_ip'
+  publicIpv4: string[]
+  publicIpv6: string[]
+  ownedDnsRecords: DomainAccessDnsRecord[]
   dnsRecordId: string | null
   enabled: boolean
   proxied: boolean
-  status: DeploymentStatus
+  status: DeploymentStatus | 'disabled'
   lastError: string | null
+  lastReconciledAt: string | null
   createdAt: string
   updatedAt: string
 }
+
+export type CloudflarePublicHostname = CloudflareDomainAccess
 
 export type Agent = {
   id: string
@@ -85,7 +105,7 @@ export type TelegramSettings = {
 export type DeploymentStatus = 'pending' | 'active' | 'failed'
 export type CommandStatus = 'pending' | 'claimed' | 'succeeded' | 'failed'
 export type OperationStatus = 'pending' | 'running' | 'succeeded' | 'failed'
-export type RuntimeServiceStatus = 'healthy' | 'unhealthy' | 'starting' | 'stopped' | 'unknown'
+export type RuntimeServiceStatus = 'healthy' | 'unhealthy' | 'starting' | 'completed' | 'stopped' | 'unknown'
 
 export type ManagedStack = {
   id: string
@@ -129,6 +149,28 @@ export type TelemetryService = {
   status: RuntimeServiceStatus
   projectName: string
   serviceName: string
+  total: number
+  running: number
+  healthy: number
+  unhealthy: number
+  starting: number
+  stopped: number
+  completed: number
+}
+
+export type RuntimeService = Omit<TelemetryService, 'name' | 'projectName' | 'serviceName'> & { name: string }
+export type RuntimeProject = {
+  agentId: string; agentName: string; projectName: string; observedAt: string; receivedAt: string
+  stale: boolean; protected: boolean; actionable: boolean; status: RuntimeServiceStatus; services: RuntimeService[]
+}
+export type RuntimeOperation = {
+  id: string; agentId: string; action: 'start' | 'stop' | 'restart'; scope: 'project' | 'service'
+  projectName: string; serviceName: string | null; status: OperationStatus; result: Record<string, unknown> | null
+  error: string | null; createdAt: string; updatedAt: string; completedAt: string | null
+}
+export type RuntimeLogRequest = {
+  id: string; agentId: string; projectName: string; serviceName: string; tail: number; since: string | null
+  status: OperationStatus; result: null | { logs?: string; truncated?: boolean }; error: string | null
 }
 
 export type TelemetrySnapshot = {
@@ -212,15 +254,17 @@ export type CreateStackInput = Pick<ManagedStack, 'agentId' | 'name' | 'projectN
 export type UpdateStackInput = Partial<Pick<ManagedStack, 'name' | 'enabled' | 'postgresBackupConfig'>> & { composeYaml?: string }
 export type CreateRouteInput = Pick<ManagedRoute, 'gatewayAgentId' | 'name' | 'hostname' | 'exposure' | 'backends' | 'enabled'>
 export type UpdateRouteInput = Partial<CreateRouteInput>
-export type CreateConnectorInput = Pick<Connector, 'agentId' | 'name' | 'enabled'> & {
-  token: string
-  cloudflareAccountId?: string
-  tunnelId?: string
-}
-export type UpdateConnectorInput = Partial<Pick<Connector, 'agentId' | 'name' | 'enabled' | 'cloudflareAccountId' | 'tunnelId'>> & { token?: string }
+export type CreateConnectorInput = Pick<Connector, 'agentId' | 'name' | 'enabled'> & { token: string }
+export type UpdateConnectorInput = Partial<Pick<Connector, 'agentId' | 'name' | 'enabled'>> & { token?: string }
 export type CreateCloudflareAccountInput = Pick<CloudflareAccount, 'name' | 'accountIdentifier' | 'enabled'> & { apiToken: string }
 export type UpdateCloudflareAccountInput = Partial<Pick<CloudflareAccount, 'name' | 'accountIdentifier' | 'enabled'>> & { apiToken?: string }
-export type CreateCloudflarePublicHostnameInput = Pick<CloudflarePublicHostname, 'connectorId' | 'routeId' | 'proxied'> & { zoneId: string }
+export type CreateCloudflareDomainAccessInput = Pick<CloudflareDomainAccess, 'routeId' | 'accessMethod' | 'proxied'> & {
+  accountId: string
+  zoneId: string
+  connectorId?: string
+  publicIpv4?: string[]
+  publicIpv6?: string[]
+}
 
 export class ApiError extends Error {
   public constructor(public readonly status: number, message: string, public readonly code?: string) {
@@ -284,6 +328,8 @@ export const api = {
       method: 'PATCH',
       body: JSON.stringify(input),
     }),
+  verifyConnector: (id: string) =>
+    request<{ connector: Connector }>(`/connectors/${encodeURIComponent(id)}/verify`, { method: 'POST' }),
   cloudflareAccounts: () => request<{ accounts: CloudflareAccount[] }>('/cloudflare/accounts'),
   createCloudflareAccount: (input: CreateCloudflareAccountInput) =>
     request<{ account: CloudflareAccount }>('/cloudflare/accounts', { method: 'POST', body: JSON.stringify(input) }),
@@ -295,14 +341,16 @@ export const api = {
     request<{ zones: CloudflareZone[] }>(`/cloudflare/accounts/${encodeURIComponent(id)}/sync`, { method: 'POST' }),
   cloudflareZones: (accountId: string) =>
     request<{ zones: CloudflareZone[] }>(`/cloudflare/accounts/${encodeURIComponent(accountId)}/zones`),
-  cloudflarePublicHostnames: () => request<{ publicHostnames: CloudflarePublicHostname[] }>('/cloudflare/public-hostnames'),
-  createCloudflarePublicHostname: (input: CreateCloudflarePublicHostnameInput) =>
-    request<{ publicHostname: CloudflarePublicHostname }>('/cloudflare/public-hostnames', { method: 'POST', body: JSON.stringify(input) }),
-  updateCloudflarePublicHostname: (id: string, enabled: boolean) =>
-    request<{ publicHostname: CloudflarePublicHostname }>(`/cloudflare/public-hostnames/${encodeURIComponent(id)}`, {
+  cloudflareDomainAccess: () => request<{ domainAccess: CloudflareDomainAccess[] }>('/cloudflare/domain-access'),
+  createCloudflareDomainAccess: (input: CreateCloudflareDomainAccessInput) =>
+    request<{ domainAccess: CloudflareDomainAccess }>('/cloudflare/domain-access', { method: 'POST', body: JSON.stringify(input) }),
+  updateCloudflareDomainAccess: (id: string, enabled: boolean) =>
+    request<{ domainAccess: CloudflareDomainAccess }>(`/cloudflare/domain-access/${encodeURIComponent(id)}`, {
       method: 'PATCH',
       body: JSON.stringify({ enabled }),
     }),
+  reconcileCloudflareDomainAccess: (id: string) =>
+    request<{ domainAccess: CloudflareDomainAccess }>(`/cloudflare/domain-access/${encodeURIComponent(id)}/reconcile`, { method: 'POST' }),
   agents: () => request<{ agents: Agent[] }>('/agents'),
   createAgent: (name: string, baseUrl: string, image: string) =>
     request<{
@@ -330,6 +378,13 @@ export const api = {
     }),
   logRequest: (commandId: string) =>
     request<{ command: LogRequest }>(`/log-requests/${encodeURIComponent(commandId)}`),
+  runtimeProjects: () => request<{ projects: RuntimeProject[] }>('/runtime-projects'),
+  runtimeOperations: () => request<{ operations: RuntimeOperation[] }>('/runtime-operations'),
+  runtimeAction: (input: { agentId: string; projectName: string; serviceName?: string; action: RuntimeOperation['action']; scope: RuntimeOperation['scope'] }) =>
+    request<{ operation: RuntimeOperation }>('/runtime-actions', { method: 'POST', body: JSON.stringify(input) }),
+  requestRuntimeLogs: (input: { agentId: string; projectName: string; serviceName: string; tail: number; since?: string }) =>
+    request<{ request: RuntimeLogRequest }>('/runtime-log-requests', { method: 'POST', body: JSON.stringify(input) }),
+  runtimeLogRequest: (id: string) => request<{ request: RuntimeLogRequest }>(`/runtime-log-requests/${encodeURIComponent(id)}`),
   monitoringSummary: () => request<{ agents: TelemetrySnapshot[] }>('/monitoring/summary'),
   monitoringAgent: (id: string) =>
     request<{ agent: Agent; latest: TelemetrySnapshot | null; history: TelemetrySnapshot[] }>(`/monitoring/agents/${encodeURIComponent(id)}`),
@@ -346,7 +401,7 @@ export const api = {
   createSystemBackup: (target: SystemBackup['target'], passphrase: string) =>
     request<{ backup: SystemBackup }>('/system-backups', { method: 'POST', body: JSON.stringify({ target, passphrase }) }),
   stageSystemRestore: (id: string, passphrase: string) =>
-    request<{ restore: SystemRestore; restartRequired: true }>(`/system-backups/${encodeURIComponent(id)}/stage-restore`, { method: 'POST', body: JSON.stringify({ passphrase }) }),
+    request<{ restore: SystemRestore; manualRestoreRequired: true; restoreCommand: string }>(`/system-backups/${encodeURIComponent(id)}/stage-restore`, { method: 'POST', body: JSON.stringify({ passphrase }) }),
   routes: () => request<{ routes: ManagedRoute[] }>('/routes'),
   createRoute: (input: CreateRouteInput) =>
     request<{ route: ManagedRoute }>('/routes', { method: 'POST', body: JSON.stringify(input) }),

@@ -2,9 +2,11 @@ import cookie from '@fastify/cookie';
 import rateLimit from '@fastify/rate-limit';
 import fastifyStatic from '@fastify/static';
 import Fastify, { type FastifyReply, type FastifyRequest } from 'fastify';
-import { parseDocument } from 'yaml';
+import { timingSafeEqual } from 'node:crypto';
+import { isIP } from 'node:net';
 import { SecretBox, hashPassword, hashToken, randomToken, verifyPassword } from './crypto.js';
-import { CloudflareClient, CloudflareClientError, type CloudflareIngressRule } from './cloudflare-client.js';
+import { CloudflareClient, CloudflareClientError, type CloudflareDnsRecord, type CloudflareIngressRule } from './cloudflare-client.js';
+import { CloudflareTunnelTokenError, parseCloudflareTunnelToken, type ParsedCloudflareTunnelToken } from './cloudflare-tunnel-token.js';
 import { NotificationDispatcher } from './notification-dispatcher.js';
 import { SystemRecoveryFailure, type SystemRecoveryService } from './system-recovery.js';
 import { OPERATIONAL_EVENT_TYPES, type Agent, type AgentCommand, type Role, type StackBackup, type StackRestore, type Store, type SystemBackup, type SystemRestore, type User } from './types.js';
@@ -13,11 +15,10 @@ const SESSION_COOKIE = 'gateway_control_session';
 const EMAIL_PATTERN = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
 const UUID_PATTERN = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
 const IMAGE_PATTERN = /^[a-z0-9][a-z0-9._/-]*(?::[a-z0-9][a-z0-9._-]*)?(?:@sha256:[a-f0-9]{64})?$/i;
-const USER_COMMAND_TYPES = new Set(['ping', 'docker.info', 'agent.diagnostics.run', 'compose.ps', 'compose.up', 'compose.stop', 'compose.restart']);
+const USER_COMMAND_TYPES = new Set(['ping', 'docker.info', 'agent.diagnostics.run']);
 const RESOURCE_NAME_PATTERN = /^[A-Za-z0-9][A-Za-z0-9._-]{0,62}$/;
 const PROJECT_NAME_PATTERN = /^[a-z0-9][a-z0-9_-]{0,62}$/;
 const DOCKER_VOLUME_PATTERN = /^[A-Za-z0-9][A-Za-z0-9_.-]{1,127}$/;
-const MAX_COMPOSE_BYTES = 512 * 1024;
 const MAX_TELEMETRY_BYTES = 512 * 1024;
 const SERVICE_NAME_PATTERN = /^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$/;
 const RFC3339_PATTERN = /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d{1,9})?(?:Z|[+-]\d{2}:\d{2})$/;
@@ -55,7 +56,11 @@ export interface BuildAppOptions {
   notificationIntervalMs?: number;
   offlineAfterMs?: number;
   commandStaleAfterMs?: number;
+  connectorIdentityIntervalMs?: number;
   systemRecoveryService?: SystemRecoveryService;
+  readinessCheck?: () => Promise<void>;
+  release?: string;
+  protectedProjects?: string[];
 }
 
 function objectBody(body: unknown): Record<string, unknown> {
@@ -126,7 +131,7 @@ function shellQuote(value: string): string {
   return `'${value.replaceAll("'", `'"'"'`)}'`;
 }
 
-function enrollmentCommand(baseUrl: string, image: string, enrollmentToken: string, agentId: string, agentName: string, traefikDynamicVolume: string, nasRoot: string, nasMarker: string): string {
+function enrollmentCommand(baseUrl: string, image: string, enrollmentToken: string, agentId: string, agentName: string, traefikDynamicVolume: string, nasRoot: string, nasMarker: string, protectedProjects: string[]): string {
   let url: URL;
   try {
     url = new URL(baseUrl);
@@ -186,6 +191,7 @@ function enrollmentCommand(baseUrl: string, image: string, enrollmentToken: stri
     `-e GATEWAY_NAS_BACKUP_ROOT=${shellQuote(nasRoot)}`,
     `-e GATEWAY_HOST_NAS_BACKUP_ROOT=${shellQuote(nasRoot)}`,
     `-e GATEWAY_NAS_MARKER=${shellQuote(nasMarker)}`,
+    `-e GATEWAY_PROTECTED_PROJECTS=${shellQuote(protectedProjects.join(','))}`,
     '-e GATEWAY_TRAEFIK_DYNAMIC_ROOT=/srv/traefik-dynamic',
     `-e GATEWAY_TRAEFIK_DYNAMIC_VOLUME=${shellQuote(traefikDynamicVolume)}`,
     '-v /var/run/docker.sock:/var/run/docker.sock',
@@ -211,36 +217,6 @@ function validateResourceName(value: string, field = 'name'): string {
   return value;
 }
 
-function validateComposeYaml(value: string): string {
-  if (Buffer.byteLength(value, 'utf8') > MAX_COMPOSE_BYTES) throw new ApiError(400, 'composeYaml must not exceed 512 KiB.');
-  const document = parseDocument(value, { prettyErrors: false, uniqueKeys: true });
-  if (document.errors.length > 0) throw new ApiError(400, 'composeYaml is not valid YAML.');
-  let compose: unknown;
-  try {
-    compose = document.toJS({ maxAliasCount: 50 });
-  } catch {
-    throw new ApiError(400, 'composeYaml contains unsafe or excessive aliases.');
-  }
-  if (!compose || typeof compose !== 'object' || Array.isArray(compose)) throw new ApiError(400, 'composeYaml must contain a top-level mapping.');
-  const root = compose as Record<string, unknown>;
-  if (!root.services || typeof root.services !== 'object' || Array.isArray(root.services)) throw new ApiError(400, 'composeYaml must contain a top-level services object.');
-  if ('include' in root) throw new ApiError(400, 'External Compose file references are not allowed.');
-  for (const service of Object.values(root.services as Record<string, unknown>)) {
-    if (!service || typeof service !== 'object' || Array.isArray(service)) continue;
-    const definition = service as Record<string, unknown>;
-    if (definition.privileged === true || definition.use_api_socket === true) throw new ApiError(400, 'Privileged services and Docker API socket access are not allowed.');
-    const extension = definition.extends;
-    if (extension && typeof extension === 'object' && !Array.isArray(extension) && 'file' in extension) throw new ApiError(400, 'External Compose file references are not allowed.');
-    if (Array.isArray(definition.volumes) && definition.volumes.some((mount) => {
-      if (typeof mount === 'string') return /(?:^|:)\/{1,2}(?:var\/run|run)\/docker\.sock(?::|$)/i.test(mount);
-      if (!mount || typeof mount !== 'object' || Array.isArray(mount)) return false;
-      const volume = mount as Record<string, unknown>;
-      return [volume.source, volume.target].some((path) => typeof path === 'string' && /\/(?:var\/run|run)\/docker\.sock$/i.test(path));
-    })) throw new ApiError(400, 'Docker socket mounts are not allowed.');
-  }
-  return value;
-}
-
 function validateHostname(value: string): string {
   const hostname = value.toLowerCase();
   if (hostname.length > 253 || !/^[\x21-\x7e]+$/.test(hostname) || hostname.includes('..')) throw new ApiError(400, 'hostname must be an IDNA-safe ASCII DNS hostname.');
@@ -249,6 +225,66 @@ function validateHostname(value: string): string {
     throw new ApiError(400, 'hostname must be an IDNA-safe ASCII DNS hostname.');
   }
   return hostname;
+}
+
+function canonicalIp(value: unknown, version: 4 | 6): string {
+  if (typeof value !== 'string' || isIP(value.trim()) !== version) throw new ApiError(400, `Each public IPv${version} address must be valid.`, 'invalid_public_ip');
+  const input = value.trim().toLowerCase();
+  if (version === 4) {
+    const octets = input.split('.').map(Number);
+    const numeric = octets.reduce((result, octet) => result * 256 + octet, 0);
+    const inRange = (base: number, prefix: number): boolean => Math.floor(numeric / 2 ** (32 - prefix)) === Math.floor(base / 2 ** (32 - prefix));
+    const reserved = [
+      [0x00000000, 8], [0x0a000000, 8], [0x64400000, 10], [0x7f000000, 8], [0xa9fe0000, 16],
+      [0xac100000, 12], [0xc0000000, 24], [0xc0000200, 24], [0xc01fc400, 24], [0xc034c100, 24],
+      [0xc0586300, 24], [0xc0af3000, 24], [0xc0a80000, 16],
+      [0xc6120000, 15], [0xc6336400, 24], [0xcb007100, 24], [0xe0000000, 4], [0xf0000000, 4],
+    ].some(([base, prefix]) => inRange(base!, prefix!));
+    if (reserved) throw new ApiError(400, 'Public IP addresses must be globally routable unicast addresses.', 'non_global_public_ip');
+    return octets.join('.');
+  }
+  const expanded = expandIpv6(input);
+  const explicitlyExcluded = (expanded[0] === 0x3fff && (expanded[1]! & 0xf000) === 0)
+    || (expanded.slice(0, 5).every((part) => part === 0) && expanded[5] === 0xffff)
+    || (expanded[0] === 0x0064 && expanded[1] === 0xff9b);
+  const specialIpv6 = (expanded[0] === 0x2001 && (
+    expanded[1] === 0 || (expanded[1] === 2 && expanded[2] === 0)
+    || (expanded[1]! & 0xfff0) === 0x0010 || (expanded[1]! & 0xfff0) === 0x0020 || expanded[1] === 0x0db8
+  )) || expanded[0] === 0x2002;
+  // Product policy is intentionally narrower than the full IPv6 global-unicast allocation.
+  if ((expanded[0]! & 0xe000) !== 0x2000 || specialIpv6 || explicitlyExcluded) {
+    throw new ApiError(400, 'Public IP addresses must be globally routable unicast addresses.', 'non_global_public_ip');
+  }
+  let bestStart = -1; let bestLength = 0;
+  for (let index = 0; index < expanded.length;) {
+    if (expanded[index] !== 0) { index += 1; continue; }
+    let end = index; while (end < expanded.length && expanded[end] === 0) end += 1;
+    if (end - index > bestLength && end - index >= 2) { bestStart = index; bestLength = end - index; }
+    index = end;
+  }
+  if (bestStart < 0) return expanded.map((part) => part.toString(16)).join(':');
+  const left = expanded.slice(0, bestStart).map((part) => part.toString(16)).join(':');
+  const right = expanded.slice(bestStart + bestLength).map((part) => part.toString(16)).join(':');
+  return `${left}::${right}`;
+}
+
+function expandIpv6(value: string): number[] {
+  const [leftValue, rightValue = ''] = value.split('::');
+  const parse = (part: string): number[] => part ? part.split(':').flatMap((token) => {
+    if (!token.includes('.')) return [Number.parseInt(token, 16)];
+    const octets = token.split('.').map(Number);
+    return [octets[0]! * 256 + octets[1]!, octets[2]! * 256 + octets[3]!];
+  }) : [];
+  const left = parse(leftValue!); const right = parse(rightValue);
+  return [...left, ...Array(Math.max(0, 8 - left.length - right.length)).fill(0), ...right];
+}
+
+function publicIpArray(body: Record<string, unknown>, field: 'publicIpv4' | 'publicIpv6', version: 4 | 6): string[] {
+  const value = body[field] ?? [];
+  if (!Array.isArray(value) || value.length > 4) throw new ApiError(400, `${field} must contain at most 4 addresses.`, 'invalid_public_ip');
+  const canonical = value.map((address) => canonicalIp(address, version));
+  if (new Set(canonical).size !== canonical.length) throw new ApiError(400, `${field} must not contain duplicate addresses.`, 'duplicate_public_ip');
+  return canonical;
 }
 
 function validateBackends(value: unknown): string[] {
@@ -303,11 +339,17 @@ function validateTelemetry(body: Record<string, unknown>): { observedAt: string;
   if (!Array.isArray(body.services) || body.services.length > 250) throw new ApiError(400, 'services must contain at most 250 entries.');
   const services = body.services.map((service, index) => {
     const validated = validateTelemetryObject(service, `services[${index}]`, 32);
-    if (typeof validated.name !== 'string' || !SERVICE_NAME_PATTERN.test(validated.name)) throw new ApiError(400, `services[${index}].name is invalid.`);
-    if (typeof validated.status !== 'string' || !['healthy', 'unhealthy', 'starting', 'stopped', 'unknown'].includes(validated.status)) throw new ApiError(400, `services[${index}].status is invalid.`);
+    if (typeof validated.projectName !== 'string' || !PROJECT_NAME_PATTERN.test(validated.projectName)) throw new ApiError(400, `services[${index}].projectName is invalid.`);
+    if (typeof validated.serviceName !== 'string' || !SERVICE_NAME_PATTERN.test(validated.serviceName)) throw new ApiError(400, `services[${index}].serviceName is invalid.`);
+    if (typeof validated.name !== 'string' || validated.name !== `${validated.projectName}/${validated.serviceName}`) throw new ApiError(400, `services[${index}].name is invalid.`);
+    if (typeof validated.status !== 'string' || !['healthy', 'unhealthy', 'starting', 'completed', 'stopped', 'unknown'].includes(validated.status)) throw new ApiError(400, `services[${index}].status is invalid.`);
+    for (const count of ['total', 'running', 'healthy', 'unhealthy', 'starting', 'stopped', 'completed']) {
+      if (!Number.isInteger(validated[count]) || Number(validated[count]) < 0 || Number(validated[count]) > 250) throw new ApiError(400, `services[${index}].${count} is invalid.`);
+    }
+    if (Number(validated.total) < 1 || Number(validated.running) + Number(validated.stopped) + Number(validated.completed) !== Number(validated.total)) throw new ApiError(400, `services[${index}] counts are inconsistent.`);
     return validated;
   });
-  if (new Set(services.map((service) => service.name)).size !== services.length) throw new ApiError(400, 'services must have unique names.');
+  if (new Set(services.map((service) => `${service.projectName}\u0000${service.serviceName}`)).size !== services.length) throw new ApiError(400, 'services must have unique project and service identities.');
   return { observedAt: new Date(observedTime).toISOString(), node, services };
 }
 
@@ -356,6 +398,45 @@ function publicSystemRestore(item: SystemRestore): Record<string, unknown> {
   };
 }
 
+function publicRuntimeOperation(item: Awaited<ReturnType<Store['getRuntimeOperation']>> extends infer T ? Exclude<T, null> : never): Record<string, unknown> {
+  return { id: item.id, agentId: item.agentId, action: item.action, scope: item.scope, projectName: item.projectName, serviceName: item.serviceName, status: item.status, result: item.result, error: item.error, createdAt: item.createdAt, updatedAt: item.updatedAt, completedAt: item.completedAt };
+}
+
+function publicRuntimeLogRequest(item: Awaited<ReturnType<Store['getRuntimeLogRequest']>> extends infer T ? Exclude<T, null> : never): Record<string, unknown> {
+  return { id: item.id, agentId: item.agentId, projectName: item.projectName, serviceName: item.serviceName, tail: item.tail, since: item.since, status: item.status, result: item.result, error: item.error, createdAt: item.createdAt, updatedAt: item.updatedAt, completedAt: item.completedAt };
+}
+
+function runtimeProjects(inventory: Awaited<ReturnType<Store['getLatestRuntimeInventory']>>, protectedProjects: ReadonlySet<string>): Record<string, unknown>[] {
+  return inventory.flatMap(({ agent, latest }) => {
+    if (!latest) return [];
+    const stale = Date.now() - Date.parse(latest.receivedAt) > 90_000;
+    const projects = new Map<string, Array<Record<string, unknown>>>();
+    for (const service of latest.services) {
+      if (typeof service.projectName !== 'string' || typeof service.serviceName !== 'string') continue;
+      const list = projects.get(service.projectName) ?? [];
+      list.push({
+        name: service.serviceName, status: service.status, total: service.total, running: service.running,
+        healthy: service.healthy, unhealthy: service.unhealthy, starting: service.starting,
+        stopped: service.stopped, completed: service.completed,
+      });
+      projects.set(service.projectName, list);
+    }
+    return [...projects.entries()].map(([projectName, services]) => {
+      const protectedProject = protectedProjects.has(projectName);
+      const actionable = agent.enabled && agent.healthStatus === 'connected' && !stale && !protectedProject;
+      const statuses = services.map((service) => String(service.status));
+      const status = statuses.includes('unhealthy') ? 'unhealthy' : statuses.includes('starting') ? 'starting'
+        : statuses.every((value) => value === 'completed') ? 'completed' : statuses.includes('stopped') ? 'stopped'
+          : statuses.every((value) => value === 'healthy') ? 'healthy' : 'unknown';
+      return { agentId: agent.id, agentName: agent.name, projectName, observedAt: latest.observedAt, receivedAt: latest.receivedAt, stale, protected: protectedProject, actionable, status, services };
+    });
+  });
+}
+
+function exactKeys(body: Record<string, unknown>, allowed: string[]): void {
+  if (Object.keys(body).some((key) => !allowed.includes(key))) throw new ApiError(400, 'The request contains unsupported fields.', 'invalid_payload');
+}
+
 function safeCloudflareError(error: unknown): string {
   return error instanceof CloudflareClientError ? error.message.slice(0, 500) : 'Cloudflare reconciliation failed.';
 }
@@ -374,6 +455,10 @@ function disabledIngress(ingress: CloudflareIngressRule[], hostname: string): Cl
   return [...namedRules, ...(catchAllRules.length > 0 ? catchAllRules : [{ service: TUNNEL_CATCH_ALL_SERVICE }])];
 }
 
+function hostnameWithinZone(hostname: string, zone: string): boolean {
+  return hostname.toLowerCase() === zone.toLowerCase() || hostname.toLowerCase().endsWith(`.${zone.toLowerCase()}`);
+}
+
 export async function buildApp(options: BuildAppOptions) {
   const app = Fastify({
     trustProxy: options.trustProxy ?? false,
@@ -387,12 +472,129 @@ export async function buildApp(options: BuildAppOptions) {
   const httpFetch = options.fetch ?? globalThis.fetch;
   const secureCookie = options.secureCookie ?? true;
   const sessionTtlHours = options.sessionTtlHours ?? 24;
+  const protectedProjects = new Set(['gateway-control', ...(options.protectedProjects ?? [])]);
   const notificationDispatcher = new NotificationDispatcher({
     store: options.store, secretBox, fetch: httpFetch, logger: app.log,
     ...(options.notificationIntervalMs !== undefined ? { intervalMs: options.notificationIntervalMs } : {}),
     ...(options.offlineAfterMs !== undefined ? { offlineAfterMs: options.offlineAfterMs } : {}),
     ...(options.commandStaleAfterMs !== undefined ? { commandStaleAfterMs: options.commandStaleAfterMs } : {}),
   });
+  let connectorIdentityTimer: NodeJS.Timeout | undefined;
+  let connectorIdentityStartupTimer: NodeJS.Timeout | undefined;
+  let connectorIdentityRunning = false;
+
+  async function verifyParsedConnectorIdentity(parsed: ParsedCloudflareTunnelToken): Promise<{ accountId: string; accountIdentifier: string; tunnelId: string }> {
+    const account = await options.store.getCloudflareAccountSecretByIdentifier(parsed.accountIdentifier);
+    if (!account) throw new ApiError(409, 'No enabled Cloudflare account matches the connector token.', 'connector_account_unlinked');
+    let apiToken: string;
+    try {
+      apiToken = secretBox.decrypt(account.encryptedApiToken);
+    } catch {
+      throw new ApiError(503, 'Cloudflare connector identity verification is temporarily unavailable.', 'connector_identity_verification_failed');
+    }
+    const client = new CloudflareClient(apiToken, httpFetch, parsed.endpoint === 'fed' ? 'fed' : 'standard');
+    let remoteParsed: ParsedCloudflareTunnelToken | null = null;
+    try {
+      const metadata = await client.getTunnelMetadata(parsed.accountIdentifier, parsed.tunnelId);
+      if (metadata.deleted) throw new ApiError(409, 'The Cloudflare tunnel has been deleted.', 'connector_tunnel_deleted');
+      if (metadata.accountIdentifier !== parsed.accountIdentifier || metadata.id !== parsed.tunnelId) {
+        throw new ApiError(409, 'The connector token does not match the Cloudflare tunnel.', 'connector_identity_mismatch');
+      }
+      remoteParsed = parseCloudflareTunnelToken(await client.getTunnelToken(parsed.accountIdentifier, parsed.tunnelId));
+      const identityMatches = remoteParsed.accountIdentifier === parsed.accountIdentifier && remoteParsed.tunnelId === parsed.tunnelId && remoteParsed.endpoint === parsed.endpoint;
+      const secretMatches = remoteParsed.secretMaterial.length === parsed.secretMaterial.length
+        && timingSafeEqual(remoteParsed.secretMaterial, parsed.secretMaterial);
+      if (!identityMatches || !secretMatches) throw new ApiError(409, 'The connector token is not the current Cloudflare tunnel token.', 'connector_token_mismatch');
+      return { accountId: account.id, accountIdentifier: parsed.accountIdentifier, tunnelId: parsed.tunnelId };
+    } catch (error) {
+      if (error instanceof ApiError) throw error;
+      if (error instanceof CloudflareClientError && error.isExplicitNotFound()) {
+        throw new ApiError(409, 'The Cloudflare tunnel was not found.', 'connector_tunnel_not_found');
+      }
+      throw new ApiError(503, 'Cloudflare connector identity verification is temporarily unavailable.', 'connector_identity_verification_failed');
+    } finally {
+      remoteParsed?.secretMaterial.fill(0);
+    }
+  }
+
+  async function verifyConnectorToken(token: string): Promise<{ accountId: string; accountIdentifier: string; tunnelId: string }> {
+    let parsed: ParsedCloudflareTunnelToken;
+    try {
+      parsed = parseCloudflareTunnelToken(token);
+    } catch (error) {
+      if (error instanceof CloudflareTunnelTokenError) throw new ApiError(400, 'The Cloudflare tunnel connector token is invalid.', 'invalid_connector_token');
+      throw error;
+    }
+    try {
+      return await verifyParsedConnectorIdentity(parsed);
+    } finally {
+      parsed.secretMaterial.fill(0);
+    }
+  }
+
+  async function verifyStoredConnector(connectorId: string): Promise<unknown> {
+    const deployment = await options.store.getConnectorDeployment(connectorId);
+    if (!deployment) throw new ApiError(404, 'Connector not found.', 'connector_not_found');
+    const expected = { desiredRevision: deployment.desiredRevision, encryptedToken: deployment.encryptedToken };
+    let token: string;
+    try {
+      token = secretBox.decrypt(deployment.encryptedToken);
+    } catch {
+      return options.store.markConnectorIdentity(connectorId, expected, { status: 'failed', error: 'connector_credentials_unavailable' });
+    }
+    let parsed: ParsedCloudflareTunnelToken;
+    try {
+      parsed = parseCloudflareTunnelToken(token);
+    } catch {
+      const invalid = await options.store.markConnectorIdentity(connectorId, expected, { status: 'invalid', error: 'invalid_connector_token' });
+      if (!invalid) return null;
+      throw new ApiError(400, 'The Cloudflare tunnel connector token is invalid.', 'invalid_connector_token');
+    }
+    const parsedIdentity = { accountIdentifier: parsed.accountIdentifier, tunnelId: parsed.tunnelId };
+    if (!await options.store.markConnectorIdentity(connectorId, expected, { status: 'parsed', ...parsedIdentity })) {
+      parsed.secretMaterial.fill(0);
+      return null;
+    }
+    try {
+      let identity: { accountId: string; accountIdentifier: string; tunnelId: string };
+      try {
+        identity = await verifyParsedConnectorIdentity(parsed);
+      } catch (error) {
+        const apiError = error instanceof ApiError ? error : new ApiError(503, 'Cloudflare connector identity verification is temporarily unavailable.', 'connector_identity_verification_failed');
+        const status = apiError.code === 'connector_account_unlinked' ? 'unmatched'
+          : apiError.code === 'connector_identity_verification_failed' ? 'pending' : 'mismatch';
+        const marked = await options.store.markConnectorIdentity(connectorId, expected, { status, ...parsedIdentity, error: apiError.code ?? 'connector_identity_verification_failed' });
+        if (!marked) return null;
+        throw apiError;
+      }
+      const verified = await options.store.markConnectorIdentity(connectorId, expected, { status: 'verified', ...identity });
+      if (!verified) return null;
+      if (verified.identityStatus === 'mismatch') {
+        throw new ApiError(409, 'The connector token identity does not match its persisted topology.', 'connector_identity_mismatch');
+      }
+      return verified;
+    } finally {
+      parsed.secretMaterial.fill(0);
+    }
+  }
+
+  async function reconcileConnectorIdentities(): Promise<void> {
+    if (connectorIdentityRunning) return;
+    connectorIdentityRunning = true;
+    try {
+      for (const connector of await options.store.listConnectorIdentityDeployments(20)) {
+        try {
+          await verifyStoredConnector(connector.connectorId);
+        } catch {
+          // The persisted identity status is the bounded, non-secret diagnostic.
+        }
+      }
+    } catch {
+      app.log.error('Connector identity reconciliation iteration failed.');
+    } finally {
+      connectorIdentityRunning = false;
+    }
+  }
 
   async function cloudflareClientForAccount(id: string): Promise<{ client: CloudflareClient; accountIdentifier: string }> {
     const account = await options.store.getCloudflareAccountSecret(id);
@@ -406,49 +608,162 @@ export async function buildApp(options: BuildAppOptions) {
     return { client: new CloudflareClient(apiToken, httpFetch), accountIdentifier: account.accountIdentifier };
   }
 
-  async function reconcileCloudflareHostname(id: string): Promise<unknown> {
-    const deployment = await options.store.getCloudflareHostnameDeployment(id);
-    if (!deployment) throw new ApiError(409, 'Cloudflare hostname deployment relationships are no longer valid.');
-    let apiToken: string;
-    try {
-      apiToken = secretBox.decrypt(deployment.encryptedApiToken);
-    } catch {
-      await options.store.markCloudflareHostnameOutcome(id, { status: 'failed', enabled: deployment.enabled, lastError: 'Cloudflare account credentials could not be decrypted.' });
-      throw new ApiError(500, 'Cloudflare account credentials could not be decrypted.');
-    }
-    const client = new CloudflareClient(apiToken, httpFetch);
-    let originalIngress: CloudflareIngressRule[];
-    try {
-      originalIngress = await client.getTunnelConfig(deployment.accountIdentifier, deployment.tunnelId);
+  async function reconcileDomainAccess(id: string): Promise<unknown> {
+    return options.store.withDomainAccessLock(id, async () => {
+      const deployment = await options.store.getCloudflareDomainAccessDeployment(id);
+      if (!deployment) throw new ApiError(404, 'Cloudflare domain access was not found.', 'domain_access_not_found');
+      const revision = deployment.revision;
+      const ownershipMarker = `gateway-control:domain-access:${deployment.id}`;
+      const superseded = (): ApiError => new ApiError(409, 'A newer domain access change superseded this operation.', 'domain_access_superseded');
+      const outcome = async (status: 'active' | 'failed' | 'disabled', lastError: string | null = null): Promise<unknown> => {
+        const saved = await options.store.markDomainAccessOutcome(id, revision, { status, lastError });
+        if (!saved) throw superseded();
+        return saved;
+      };
+
       if (deployment.enabled) {
-        await client.putTunnelConfig(deployment.accountIdentifier, deployment.tunnelId, enabledIngress(originalIngress, deployment.hostname));
-        let dnsRecordId: string;
+        const expectedExposure = deployment.accessMethod === 'tunnel' ? 'tunnel' : 'public';
+        const tunnelTopologyValid = deployment.accessMethod !== 'tunnel' || (
+          deployment.connectorId !== null && deployment.connectorEnabled === true && deployment.tunnelId !== null
+          && deployment.connectorIdentityStatus === 'verified'
+          && deployment.connectorTokenAccountIdentifier?.toLowerCase() === deployment.accountIdentifier.toLowerCase()
+          && deployment.connectorTokenTunnelId?.toLowerCase() === deployment.tunnelId.toLowerCase()
+          && deployment.connectorAccountId === deployment.cloudflareAccountId && deployment.connectorAgentId === deployment.routeAgentId
+        );
+        if (!deployment.accountEnabled || deployment.zoneStatus !== 'active' || deployment.zoneAccountId !== deployment.cloudflareAccountId
+          || deployment.routeExposure !== expectedExposure || !deployment.routeEnabled || deployment.routeStatus !== 'active'
+          || deployment.routeHostname.toLowerCase() !== deployment.hostname.toLowerCase()
+          || !hostnameWithinZone(deployment.hostname, deployment.zoneName) || !tunnelTopologyValid) {
+          const message = 'Cloudflare domain access topology or active route requirements are no longer valid.';
+          await outcome('failed', message);
+          throw new ApiError(409, message, 'domain_access_topology_invalid');
+        }
+      }
+
+      let apiToken: string;
+      try {
+        apiToken = secretBox.decrypt(deployment.encryptedApiToken);
+      } catch {
+        await outcome('failed', 'Cloudflare account credentials could not be decrypted.');
+        throw new ApiError(500, 'Cloudflare account credentials could not be decrypted.');
+      }
+      const client = new CloudflareClient(apiToken, httpFetch);
+      const owned = deployment.ownedDnsRecords.filter((record) => record.status !== 'deleted');
+      const createdThisAttempt: string[] = [];
+      let originalIngress: CloudflareIngressRule[] | null = null;
+      const deleteOwnedRecord = async (recordId: string): Promise<void> => {
         try {
-          dnsRecordId = await client.createDnsCname(deployment.zoneIdentifier, deployment.hostname, deployment.tunnelId, deployment.proxied);
+          await client.deleteDnsRecord(deployment.zoneIdentifier, recordId);
+          if (!(await options.store.markDomainAccessDnsRecordStatus(id, revision, recordId, 'deleted'))) throw superseded();
         } catch (error) {
-          try {
-            await client.putTunnelConfig(deployment.accountIdentifier, deployment.tunnelId, originalIngress);
-          } catch {
-            // Preserve the original DNS failure as the actionable, safely bounded error.
+          if (error instanceof CloudflareClientError && error.isExplicitNotFound()) {
+            if (!(await options.store.markDomainAccessDnsRecordStatus(id, revision, recordId, 'deleted'))) throw superseded();
+            return;
           }
+          const cleanupError = safeCloudflareError(error);
+          await options.store.markDomainAccessDnsRecordStatus(id, revision, recordId, 'cleanup_pending', cleanupError);
           throw error;
         }
-        return await options.store.markCloudflareHostnameOutcome(id, { status: 'active', enabled: true, dnsRecordId, lastError: null });
-      }
-      if (deployment.dnsRecordId) {
-        try {
-          await client.deleteDnsRecord(deployment.zoneIdentifier, deployment.dnsRecordId);
-        } catch (error) {
-          if (!(error instanceof CloudflareClientError && error.isExplicitNotFound())) throw error;
+      };
+
+      try {
+        if (!deployment.enabled) {
+          for (const record of owned) await deleteOwnedRecord(record.cloudflareRecordId);
+          const recoverableDesired: Array<{ type: CloudflareDnsRecord['type']; content: string }> = deployment.accessMethod === 'tunnel'
+            ? deployment.tunnelId ? [{ type: 'CNAME', content: `${deployment.tunnelId}.cfargotunnel.com` }] : []
+            : [...deployment.publicIpv4.map((content) => ({ type: 'A' as const, content })), ...deployment.publicIpv6.map((content) => ({ type: 'AAAA' as const, content }))];
+          const recoverable = (await client.listDnsRecordsExact(deployment.zoneIdentifier, deployment.hostname)).filter((record) =>
+            record.comment === ownershipMarker && record.proxied === deployment.proxied
+            && recoverableDesired.some((item) => item.type === record.type && item.content.toLowerCase() === record.content.toLowerCase()),
+          );
+          for (const record of recoverable) {
+            const expected = recoverableDesired.find((item) => item.type === record.type && item.content.toLowerCase() === record.content.toLowerCase())!;
+            if (!(await options.store.saveDomainAccessDnsRecord(id, revision, { type: expected.type, content: expected.content, cloudflareRecordId: record.id, ownershipMarker }))) throw superseded();
+            await deleteOwnedRecord(record.id);
+          }
+          if (deployment.accessMethod === 'tunnel' && deployment.tunnelId) {
+            originalIngress = await client.getTunnelConfig(deployment.accountIdentifier, deployment.tunnelId);
+            await client.putTunnelConfig(deployment.accountIdentifier, deployment.tunnelId, disabledIngress(originalIngress, deployment.hostname));
+          }
+          return await outcome('disabled');
         }
+
+        const desired: Array<{ type: CloudflareDnsRecord['type']; content: string }> = deployment.accessMethod === 'tunnel'
+          ? [{ type: 'CNAME', content: `${deployment.tunnelId}.cfargotunnel.com` }]
+          : [...deployment.publicIpv4.map((content) => ({ type: 'A' as const, content })), ...deployment.publicIpv6.map((content) => ({ type: 'AAAA' as const, content }))];
+        let remote = await client.listDnsRecordsExact(deployment.zoneIdentifier, deployment.hostname);
+        const ownedIds = new Set(owned.map((record) => record.cloudflareRecordId));
+        for (const record of remote) {
+          const expected = desired.find((item) => item.type === record.type && item.content.toLowerCase() === record.content.toLowerCase());
+          if (!ownedIds.has(record.id) && expected && record.proxied === deployment.proxied && record.comment === ownershipMarker) {
+            const adopted = await options.store.saveDomainAccessDnsRecord(id, revision, { type: expected.type, content: expected.content, cloudflareRecordId: record.id, ownershipMarker });
+            if (!adopted) throw superseded();
+            owned.push({ type: expected.type, content: expected.content, cloudflareRecordId: record.id, ownershipMarker, status: 'active', lastError: null });
+            ownedIds.add(record.id);
+          }
+        }
+        if (remote.some((record) => desired.some((item) => item.type === record.type) && !ownedIds.has(record.id))) {
+          throw new ApiError(409, 'A DNS record with this hostname and type already exists and is not owned by GatewayControl.', 'dns_record_conflict');
+        }
+        for (const record of [...owned]) {
+          const expected = desired.some((item) => item.type === record.type && item.content.toLowerCase() === record.content.toLowerCase());
+          const actual = remote.find((item) => item.id === record.cloudflareRecordId);
+          if (!expected || !actual || actual.content.toLowerCase() !== record.content.toLowerCase() || actual.proxied !== deployment.proxied || actual.comment !== ownershipMarker) {
+            await deleteOwnedRecord(record.cloudflareRecordId);
+            owned.splice(owned.indexOf(record), 1);
+            ownedIds.delete(record.cloudflareRecordId);
+          }
+        }
+        if (deployment.accessMethod === 'tunnel') {
+          originalIngress = await client.getTunnelConfig(deployment.accountIdentifier, deployment.tunnelId!);
+          await client.putTunnelConfig(deployment.accountIdentifier, deployment.tunnelId!, enabledIngress(originalIngress, deployment.hostname));
+        }
+        for (const item of desired) {
+          if (owned.some((record) => record.type === item.type && record.content.toLowerCase() === item.content.toLowerCase()
+            && remote.some((actual) => actual.id === record.cloudflareRecordId && actual.proxied === deployment.proxied && actual.comment === ownershipMarker))) continue;
+          let created: CloudflareDnsRecord;
+          try {
+            created = item.type === 'CNAME'
+              ? await client.createDnsCname(deployment.zoneIdentifier, deployment.hostname, deployment.tunnelId!, deployment.proxied, ownershipMarker)
+              : await client.createDnsAddress(deployment.zoneIdentifier, item.type, deployment.hostname, item.content, deployment.proxied, ownershipMarker);
+          } catch (error) {
+            remote = await client.listDnsRecordsExact(deployment.zoneIdentifier, deployment.hostname);
+            const recovered = remote.find((record) => record.type === item.type && record.content.toLowerCase() === item.content.toLowerCase()
+              && record.proxied === deployment.proxied && record.comment === ownershipMarker);
+            if (!recovered) throw error;
+            created = recovered;
+          }
+          createdThisAttempt.push(created.id);
+          if (!(await options.store.saveDomainAccessDnsRecord(id, revision, { type: item.type, content: item.content, cloudflareRecordId: created.id, ownershipMarker }))) throw superseded();
+          const readBack = await client.getDnsRecord(deployment.zoneIdentifier, created.id, deployment.hostname);
+          if (readBack.type !== item.type || readBack.content.toLowerCase() !== item.content.toLowerCase()
+            || readBack.proxied !== deployment.proxied || readBack.comment !== ownershipMarker) {
+            throw new CloudflareClientError('Cloudflare DNS record read-back did not match the requested ownership metadata.', 502);
+          }
+        }
+        return await outcome('active');
+      } catch (error) {
+        for (const recordId of createdThisAttempt) {
+          try {
+            await client.deleteDnsRecord(deployment.zoneIdentifier, recordId);
+            await options.store.markDomainAccessDnsRecordStatus(id, revision, recordId, 'deleted');
+          } catch (cleanupError) {
+            if (cleanupError instanceof CloudflareClientError && cleanupError.isExplicitNotFound()) {
+              await options.store.markDomainAccessDnsRecordStatus(id, revision, recordId, 'deleted');
+            } else {
+              await options.store.markDomainAccessDnsRecordStatus(id, revision, recordId, 'cleanup_pending', safeCloudflareError(cleanupError));
+            }
+          }
+        }
+        if (originalIngress && deployment.accessMethod === 'tunnel' && deployment.enabled && deployment.tunnelId) {
+          try { await client.putTunnelConfig(deployment.accountIdentifier, deployment.tunnelId, originalIngress); } catch { /* Preserve the primary reconciliation failure. */ }
+        }
+        const safeError = error instanceof ApiError ? error.message.slice(0, 500) : safeCloudflareError(error);
+        if (!(error instanceof ApiError && error.code === 'domain_access_superseded')) await options.store.markDomainAccessOutcome(id, revision, { status: 'failed', lastError: safeError });
+        if (error instanceof ApiError) throw error;
+        throw new ApiError(502, safeError, 'cloudflare_reconciliation_failed');
       }
-      await client.putTunnelConfig(deployment.accountIdentifier, deployment.tunnelId, disabledIngress(originalIngress, deployment.hostname));
-      return await options.store.markCloudflareHostnameOutcome(id, { status: 'active', enabled: false, dnsRecordId: null, lastError: null });
-    } catch (error) {
-      const safeError = safeCloudflareError(error);
-      await options.store.markCloudflareHostnameOutcome(id, { status: 'failed', enabled: deployment.enabled, lastError: safeError });
-      throw new ApiError(502, safeError);
-    }
+    });
   }
 
   await app.register(cookie);
@@ -462,13 +777,19 @@ export async function buildApp(options: BuildAppOptions) {
       immutable: false,
     });
   }
-  app.addHook('onReady', async () => notificationDispatcher.start());
+  app.addHook('onReady', async () => {
+    notificationDispatcher.start();
+    connectorIdentityStartupTimer = setTimeout(() => void reconcileConnectorIdentities(), 0);
+    connectorIdentityStartupTimer.unref();
+    connectorIdentityTimer = setInterval(() => void reconcileConnectorIdentities(), options.connectorIdentityIntervalMs ?? 5 * 60_000);
+    connectorIdentityTimer.unref();
+  });
 
   app.addHook('onSend', async (request, reply) => {
     reply.header('x-content-type-options', 'nosniff');
     reply.header('x-frame-options', 'DENY');
     reply.header('referrer-policy', 'no-referrer');
-    if (request.url.startsWith('/api/') || request.url === '/health') {
+    if (request.url.startsWith('/api/') || request.url === '/health' || request.url === '/ready') {
       reply.header('cache-control', 'no-store');
       reply.header('content-security-policy', "default-src 'none'; frame-ancestors 'none'");
     } else {
@@ -478,6 +799,9 @@ export async function buildApp(options: BuildAppOptions) {
 
   app.setErrorHandler((error, _request, reply) => {
     if (error instanceof ApiError) return reply.code(error.statusCode).send({ error: error.message, ...(error.code ? { code: error.code } : {}) });
+    if ((error as { code?: string; message?: string }).code === 'P0001' && (error as { message?: string }).message === 'domain_access_dependency_enabled') {
+      return reply.code(409).send({ error: 'Disable linked domain access before changing this dependency.', code: 'domain_access_dependency_enabled' });
+    }
     if ((error as { statusCode?: number }).statusCode === 413) return reply.code(413).send({ error: 'Request body is too large.' });
     if ((error as { code?: string }).code === '23505') return reply.code(409).send({ error: 'A record with that value already exists.' });
     if ((error as { statusCode?: number }).statusCode === 429) return reply.code(429).send({ error: 'Too many requests. Try again later.' });
@@ -500,7 +824,16 @@ export async function buildApp(options: BuildAppOptions) {
     (request as AgentRequest).authenticatedAgent = authenticatedAgent;
   }
 
-  app.get('/health', async () => ({ status: 'ok' }));
+  const release = options.release ?? 'unknown';
+  app.get('/health', async () => ({ status: 'ok', release }));
+  app.get('/ready', async (_request, reply) => {
+    try {
+      await (options.readinessCheck ?? (() => options.store.checkReady()))();
+      return { status: 'ready', release };
+    } catch {
+      return reply.code(503).send({ status: 'unavailable', release });
+    }
+  });
 
   app.get('/api/setup/status', { config: { rateLimit: { max: 30, timeWindow: '1 minute' } } }, async () => ({ setupComplete: await options.store.isSetupComplete() }));
 
@@ -555,40 +888,59 @@ export async function buildApp(options: BuildAppOptions) {
   app.get('/api/connectors', { preHandler: (request, reply) => requireUser(request, reply) }, async () => ({ connectors: await options.store.listConnectors() }));
   app.post('/api/connectors', { preHandler: (request, reply) => requireUser(request, reply, 'operator') }, async (request, reply) => {
     const body = objectBody(request.body);
+    exactKeys(body, ['name', 'token', 'enabled', 'agentId', 'cloudflareAccountId', 'tunnelId']);
     const name = stringField(body, 'name', 1, 120);
     const token = opaqueStringField(body, 'token', 20, 4096);
     const enabled = optionalBoolean(body, 'enabled') ?? true;
     const agentId = stringField(body, 'agentId', 36, 36);
     if (!UUID_PATTERN.test(agentId)) throw new ApiError(400, 'agentId must be a valid UUID.');
-    const cloudflareAccountId = optionalUuid(body, 'cloudflareAccountId');
-    const tunnelId = optionalUuid(body, 'tunnelId');
-    if (tunnelId && !cloudflareAccountId) throw new ApiError(400, 'cloudflareAccountId is required when tunnelId is provided.');
-    const connector = await options.store.createConnector(name, secretBox.encrypt(token), enabled, agentId, cloudflareAccountId, tunnelId);
-    if (!connector) throw new ApiError(404, 'Enabled agent not found.');
+    const submittedAccountId = optionalUuid(body, 'cloudflareAccountId');
+    const submittedTunnelId = optionalUuid(body, 'tunnelId');
+    const identity = await verifyConnectorToken(token);
+    if ((submittedAccountId && submittedAccountId !== identity.accountId) || (submittedTunnelId && submittedTunnelId.toLowerCase() !== identity.tunnelId)) {
+      throw new ApiError(409, 'Submitted connector binding does not match the token identity.', 'connector_submitted_identity_mismatch');
+    }
+    const connector = await options.store.createConnector({ name, encryptedToken: secretBox.encrypt(token), enabled, agentId, ...identity });
+    if (!connector) throw new ApiError(409, 'An enabled, enrolled agent and matching Cloudflare account are required.', 'connector_target_unavailable');
     return reply.code(201).send({ connector });
   });
   app.patch('/api/connectors/:id', { preHandler: (request, reply) => requireUser(request, reply, 'operator') }, async (request) => {
     const id = idParameter(request);
     const body = objectBody(request.body);
+    exactKeys(body, ['name', 'token', 'enabled', 'agentId', 'cloudflareAccountId', 'tunnelId']);
     const name = body.name === undefined ? undefined : stringField(body, 'name', 1, 120);
     const token = body.token === undefined ? undefined : opaqueStringField(body, 'token', 20, 4096);
     const enabled = optionalBoolean(body, 'enabled');
     const agentId = body.agentId === undefined ? undefined : stringField(body, 'agentId', 36, 36);
     if (agentId !== undefined && !UUID_PATTERN.test(agentId)) throw new ApiError(400, 'agentId must be a valid UUID.');
-    const cloudflareAccountId = optionalUuid(body, 'cloudflareAccountId');
-    const tunnelId = optionalUuid(body, 'tunnelId');
-    if (name === undefined && token === undefined && enabled === undefined && agentId === undefined && cloudflareAccountId === undefined && tunnelId === undefined) throw new ApiError(400, 'At least one editable field is required.');
+    const submittedAccountId = optionalUuid(body, 'cloudflareAccountId');
+    const submittedTunnelId = optionalUuid(body, 'tunnelId');
+    if (name === undefined && token === undefined && enabled === undefined && agentId === undefined && submittedAccountId === undefined && submittedTunnelId === undefined) throw new ApiError(400, 'At least one editable field is required.');
+    const current = (await options.store.listConnectors()).find((connector) => connector.id === id);
+    if (!current) throw new ApiError(404, 'Connector not found.');
+    if ((enabled === false || agentId !== undefined || token !== undefined || submittedAccountId !== undefined || submittedTunnelId !== undefined)
+      && await options.store.hasEnabledDomainAccessDependency('connector', id)) {
+      throw new ApiError(409, 'Disable linked domain access before changing this connector.', 'domain_access_dependency_enabled');
+    }
+    const identity = token === undefined ? undefined : await verifyConnectorToken(token);
+    if ((submittedAccountId && submittedAccountId !== (identity?.accountId ?? current.cloudflareAccountId))
+      || (submittedTunnelId && submittedTunnelId.toLowerCase() !== (identity?.tunnelId ?? current.tokenTunnelId))) {
+      throw new ApiError(409, 'Submitted connector binding does not match the token identity.', 'connector_submitted_identity_mismatch');
+    }
+    if (enabled === true && !identity && current.identityStatus !== 'verified') {
+      throw new ApiError(409, 'The connector identity must be verified before it can be enabled.', 'connector_identity_unverified');
+    }
     const connector = await options.store.updateConnector(id, {
       ...(name !== undefined ? { name } : {}),
       ...(token !== undefined ? { encryptedToken: secretBox.encrypt(token) } : {}),
       ...(enabled !== undefined ? { enabled } : {}),
       ...(agentId !== undefined ? { agentId } : {}),
-      ...(cloudflareAccountId !== undefined ? { cloudflareAccountId } : {}),
-      ...(tunnelId !== undefined ? { tunnelId } : {}),
+      ...(identity ?? {}),
     });
     if (!connector) throw new ApiError(404, 'Connector not found.');
     return { connector };
   });
+  app.post('/api/connectors/:id/verify', { preHandler: (request, reply) => requireUser(request, reply, 'operator') }, async (request) => ({ connector: await verifyStoredConnector(idParameter(request)) }));
 
   app.get('/api/cloudflare/accounts', { preHandler: (request, reply) => requireUser(request, reply) }, async () => ({ accounts: await options.store.listCloudflareAccounts() }));
   app.post('/api/cloudflare/accounts', { preHandler: (request, reply) => requireUser(request, reply, 'operator') }, async (request, reply) => {
@@ -602,13 +954,18 @@ export async function buildApp(options: BuildAppOptions) {
     return reply.code(201).send({ account });
   });
   app.patch('/api/cloudflare/accounts/:id', { preHandler: (request, reply) => requireUser(request, reply, 'operator') }, async (request) => {
+    const id = idParameter(request);
     const body = objectBody(request.body);
     const name = body.name === undefined ? undefined : stringField(body, 'name', 1, 120);
     const accountIdentifier = body.accountIdentifier === undefined ? undefined : cloudflareIdentifier(body, 'accountIdentifier');
     const apiToken = body.apiToken === undefined ? undefined : opaqueStringField(body, 'apiToken', 20, 4096);
     const enabled = optionalBoolean(body, 'enabled');
     if (name === undefined && accountIdentifier === undefined && apiToken === undefined && enabled === undefined) throw new ApiError(400, 'At least one editable field is required.');
-    const account = await options.store.updateCloudflareAccount(idParameter(request), {
+    if ((enabled === false || accountIdentifier !== undefined || apiToken !== undefined)
+      && await options.store.hasEnabledDomainAccessDependency('account', id)) {
+      throw new ApiError(409, 'Disable linked domain access before changing this Cloudflare account.', 'domain_access_dependency_enabled');
+    }
+    const account = await options.store.updateCloudflareAccount(id, {
       ...(name !== undefined ? { name } : {}), ...(accountIdentifier !== undefined ? { accountIdentifier } : {}),
       ...(apiToken !== undefined ? { encryptedApiToken: secretBox.encrypt(apiToken) } : {}), ...(enabled !== undefined ? { enabled } : {}),
     });
@@ -645,91 +1002,113 @@ export async function buildApp(options: BuildAppOptions) {
     if (!zones) throw new ApiError(404, 'Cloudflare account not found.');
     return { zones };
   });
-  app.get('/api/cloudflare/public-hostnames', { preHandler: (request, reply) => requireUser(request, reply) }, async () => ({ publicHostnames: await options.store.listCloudflarePublicHostnames() }));
-  app.post('/api/cloudflare/public-hostnames', { preHandler: (request, reply) => requireUser(request, reply, 'operator') }, async (request, reply) => {
+  const createDomainAccess = async (request: FastifyRequest, reply: FastifyReply, legacy = false): Promise<unknown> => {
     const body = objectBody(request.body);
-    const created = await options.store.createPendingCloudflarePublicHostname({
-      zoneId: optionalUuid(body, 'zoneId') ?? (() => { throw new ApiError(400, 'zoneId is required.'); })(),
-      connectorId: optionalUuid(body, 'connectorId') ?? (() => { throw new ApiError(400, 'connectorId is required.'); })(),
-      routeId: optionalUuid(body, 'routeId') ?? (() => { throw new ApiError(400, 'routeId is required.'); })(),
-      proxied: optionalBoolean(body, 'proxied') ?? true,
-    });
-    if (!created) throw new ApiError(409, 'Zone, account, connector, tunnel, or enabled tunnel route relationships are invalid or already managed.');
-    const reconciled = await reconcileCloudflareHostname(created.id);
-    return reply.code(201).send({ publicHostname: reconciled });
-  });
-  app.patch('/api/cloudflare/public-hostnames/:id', { preHandler: (request, reply) => requireUser(request, reply, 'operator') }, async (request) => {
+    exactKeys(body, legacy ? ['zoneId', 'connectorId', 'routeId', 'proxied'] : ['accountId', 'zoneId', 'routeId', 'accessMethod', 'connectorId', 'publicIpv4', 'publicIpv6', 'proxied']);
+    const zoneId = optionalUuid(body, 'zoneId') ?? (() => { throw new ApiError(400, 'zoneId is required.', 'invalid_payload'); })();
+    const routeId = optionalUuid(body, 'routeId') ?? (() => { throw new ApiError(400, 'routeId is required.', 'invalid_payload'); })();
+    const connectorId = optionalUuid(body, 'connectorId');
+    const accessMethod = legacy ? 'tunnel' : stringField(body, 'accessMethod') as 'tunnel' | 'public_ip';
+    if (!['tunnel', 'public_ip'].includes(accessMethod)) throw new ApiError(400, 'accessMethod must be tunnel or public_ip.', 'invalid_access_method');
+    const connectors = await options.store.listConnectors();
+    const connector = connectorId ? connectors.find((item) => item.id === connectorId) : undefined;
+    const accountId = legacy ? connector?.cloudflareAccountId ?? undefined : optionalUuid(body, 'accountId');
+    if (!accountId) throw new ApiError(400, 'accountId is required.', 'invalid_payload');
+    const publicIpv4 = legacy ? [] : publicIpArray(body, 'publicIpv4', 4);
+    const publicIpv6 = legacy ? [] : publicIpArray(body, 'publicIpv6', 6);
+    if (accessMethod === 'tunnel' && (!connectorId || body.publicIpv4 !== undefined || body.publicIpv6 !== undefined)) throw new ApiError(400, 'Tunnel access requires connectorId and does not accept public IP addresses.', 'invalid_access_configuration');
+    if (accessMethod === 'public_ip' && (connectorId || publicIpv4.length + publicIpv6.length === 0)) throw new ApiError(400, 'Public IP access requires at least one IP address and does not accept connectorId.', 'invalid_access_configuration');
+    const account = (await options.store.listCloudflareAccounts()).find((item) => item.id === accountId);
+    if (!account?.enabled) throw new ApiError(409, 'The Cloudflare account is missing or disabled.', 'cloudflare_account_unavailable');
+    const zone = (await options.store.listCloudflareZones(accountId))?.find((item) => item.id === zoneId);
+    if (!zone || zone.status !== 'active') throw new ApiError(409, 'The Cloudflare zone is not active or does not belong to the selected account.', 'cloudflare_zone_invalid');
+    const route = (await options.store.listRoutes()).find((item) => item.id === routeId);
+    const expectedExposure = accessMethod === 'tunnel' ? 'tunnel' : 'public';
+    if (!route?.enabled || route.status !== 'active' || route.exposure !== expectedExposure || !hostnameWithinZone(route.hostname, zone.name)) throw new ApiError(409, 'The route must be active, enabled, match the access method, and have a hostname in the selected zone.', 'domain_access_route_invalid');
+    if (accessMethod === 'tunnel' && (!connector?.enabled || connector.identityStatus !== 'verified' || !connector.tokenTunnelId
+      || connector.tokenAccountIdentifier?.toLowerCase() !== account.accountIdentifier.toLowerCase()
+      || connector.tunnelId?.toLowerCase() !== connector.tokenTunnelId.toLowerCase()
+      || connector.cloudflareAccountId !== accountId || connector.agentId !== route.gatewayAgentId)) {
+      throw new ApiError(409, 'The tunnel connector must have a verified identity, use the same account, and be assigned to the route agent.', 'tunnel_topology_mismatch');
+    }
+    if ((await options.store.listCloudflareDomainAccess()).some((item) => item.routeId === routeId || item.hostname.toLowerCase() === route.hostname.toLowerCase())) throw new ApiError(409, 'This route or hostname is already managed.', 'domain_access_duplicate');
+    const created = await options.store.createPendingDomainAccess({ accountId, zoneId, routeId, accessMethod, ...(connectorId ? { connectorId } : {}), publicIpv4, publicIpv6, proxied: optionalBoolean(body, 'proxied') ?? true });
+    if (!created) throw new ApiError(409, 'Domain access relationships changed or are already managed.', 'domain_access_invalid');
+    const reconciled = await reconcileDomainAccess(created.id);
+    return reply.code(201).send(legacy ? { publicHostname: reconciled } : { domainAccess: reconciled });
+  };
+  const updateDomainAccess = async (request: FastifyRequest, legacy = false): Promise<unknown> => {
     const body = objectBody(request.body);
     const enabled = optionalBoolean(body, 'enabled');
     if (enabled === undefined || Object.keys(body).some((key) => key !== 'enabled')) throw new ApiError(400, 'Only enabled may be updated.');
-    const pending = await options.store.setCloudflarePublicHostnamePending(idParameter(request), enabled);
-    if (!pending) throw new ApiError(404, 'Cloudflare public hostname not found.');
-    if (pending.status === 'active') return { publicHostname: pending };
-    return { publicHostname: await reconcileCloudflareHostname(pending.id) };
+    const current = (await options.store.listCloudflareDomainAccess()).find((item) => item.id === idParameter(request));
+    if (!current) throw new ApiError(404, 'Cloudflare domain access was not found.', 'domain_access_not_found');
+    if (current.enabled === enabled && ((enabled && current.status === 'active') || (!enabled && current.status === 'disabled'))) return legacy ? { publicHostname: current } : { domainAccess: current };
+    const pending = await options.store.setDomainAccessPending(current.id, enabled);
+    const reconciled = await reconcileDomainAccess(pending!.id);
+    return legacy ? { publicHostname: reconciled } : { domainAccess: reconciled };
+  };
+  app.get('/api/cloudflare/domain-access', { preHandler: (request, reply) => requireUser(request, reply) }, async () => ({ domainAccess: await options.store.listCloudflareDomainAccess() }));
+  app.post('/api/cloudflare/domain-access', { preHandler: (request, reply) => requireUser(request, reply, 'operator') }, async (request, reply) => createDomainAccess(request, reply));
+  app.patch('/api/cloudflare/domain-access/:id', { preHandler: (request, reply) => requireUser(request, reply, 'operator') }, async (request) => updateDomainAccess(request));
+  app.post('/api/cloudflare/domain-access/:id/reconcile', { preHandler: (request, reply) => requireUser(request, reply, 'operator') }, async (request) => {
+    const pending = await options.store.setDomainAccessPending(idParameter(request));
+    if (!pending) throw new ApiError(404, 'Cloudflare domain access was not found.', 'domain_access_not_found');
+    return { domainAccess: await reconcileDomainAccess(pending.id) };
+  });
+  app.get('/api/cloudflare/public-hostnames', { preHandler: (request, reply) => requireUser(request, reply) }, async () => ({ publicHostnames: await options.store.listCloudflareDomainAccess() }));
+  app.post('/api/cloudflare/public-hostnames', { preHandler: (request, reply) => requireUser(request, reply, 'operator') }, async (request, reply) => createDomainAccess(request, reply, true));
+  app.patch('/api/cloudflare/public-hostnames/:id', { preHandler: (request, reply) => requireUser(request, reply, 'operator') }, async (request) => updateDomainAccess(request, true));
+
+  app.get('/api/runtime-projects', { preHandler: (request, reply) => requireUser(request, reply) }, async () => ({ projects: runtimeProjects(await options.store.getLatestRuntimeInventory(), protectedProjects) }));
+  app.get('/api/runtime-operations', { preHandler: (request, reply) => requireUser(request, reply) }, async () => ({ operations: (await options.store.listRuntimeOperations()).map(publicRuntimeOperation) }));
+  app.post('/api/runtime-actions', { preHandler: (request, reply) => requireUser(request, reply, 'operator'), config: { rateLimit: { max: 20, timeWindow: '1 minute' } } }, async (request, reply) => {
+    const body = objectBody(request.body); exactKeys(body, ['agentId', 'projectName', 'serviceName', 'action', 'scope']);
+    const agentId = stringField(body, 'agentId', 36, 36); const projectName = stringField(body, 'projectName', 1, 63);
+    const scope = stringField(body, 'scope') as 'project' | 'service'; const action = stringField(body, 'action') as 'start' | 'stop' | 'restart';
+    if (!UUID_PATTERN.test(agentId) || !PROJECT_NAME_PATTERN.test(projectName) || !['project', 'service'].includes(scope) || !['start', 'stop', 'restart'].includes(action)) throw new ApiError(400, 'Runtime action fields are invalid.', 'invalid_target');
+    const serviceName = scope === 'service' ? stringField(body, 'serviceName', 1, 128) : undefined;
+    if ((scope === 'service' && !SERVICE_NAME_PATTERN.test(serviceName!)) || (scope === 'project' && body.serviceName !== undefined)) throw new ApiError(400, 'serviceName must match the selected scope.', 'invalid_target');
+    const inventory = await options.store.getLatestRuntimeInventory(); const target = inventory.find((item) => item.agent.id === agentId);
+    if (!target) throw new ApiError(404, 'Agent not found.', 'agent_not_found');
+    if (!target.agent.enabled || !target.agent.enrolledAt || target.agent.healthStatus !== 'connected') throw new ApiError(409, 'The assigned agent is offline or disabled.', 'agent_unavailable');
+    if (!target.latest || Date.now() - Date.parse(target.latest.receivedAt) > 90_000) throw new ApiError(409, 'Runtime discovery is stale.', 'telemetry_stale');
+    const service = target.latest.services.find((item) => item.projectName === projectName && (scope === 'project' || item.serviceName === serviceName));
+    if (!service) throw new ApiError(404, 'Runtime project or service was not discovered.', 'target_not_found');
+    if (protectedProjects.has(projectName)) throw new ApiError(403, 'This runtime project is protected.', 'project_protected');
+    const operation = await options.store.createRuntimeOperation({ requestedByUserId: (request as AuthenticatedRequest).authenticatedUser.id, agentId, projectName, action, scope, ...(serviceName ? { serviceName } : {}) });
+    if (operation === 'active') throw new ApiError(409, 'An action is already active for this target.', 'operation_active');
+    if (!operation) throw new ApiError(409, 'The assigned agent is unavailable.', 'agent_unavailable');
+    return reply.code(202).send({ operation: publicRuntimeOperation(operation) });
+  });
+  app.post('/api/runtime-log-requests', { preHandler: (request, reply) => requireUser(request, reply, 'operator'), config: { rateLimit: { max: 30, timeWindow: '1 minute' } } }, async (request, reply) => {
+    const body = objectBody(request.body); exactKeys(body, ['agentId', 'projectName', 'serviceName', 'tail', 'since']);
+    const agentId = stringField(body, 'agentId', 36, 36); const projectName = stringField(body, 'projectName', 1, 63); const serviceName = stringField(body, 'serviceName', 1, 128);
+    const tail = body.tail; if (!UUID_PATTERN.test(agentId) || !PROJECT_NAME_PATTERN.test(projectName) || !SERVICE_NAME_PATTERN.test(serviceName) || !Number.isInteger(tail) || Number(tail) < 1 || Number(tail) > 1000) throw new ApiError(400, 'Runtime log request fields are invalid.', 'invalid_target');
+    let since: string | undefined; if (body.since !== undefined) { since = stringField(body, 'since', 20, 40); const time = Date.parse(since); if (!RFC3339_PATTERN.test(since) || !Number.isFinite(time) || time > Date.now() || time < Date.now() - 86_400_000) throw new ApiError(400, 'since must be within the last 24 hours.', 'invalid_since'); since = new Date(time).toISOString(); }
+    const inventory = await options.store.getLatestRuntimeInventory(); const target = inventory.find((item) => item.agent.id === agentId);
+    if (!target || !target.agent.enabled || !target.agent.enrolledAt || target.agent.healthStatus !== 'connected') throw new ApiError(409, 'The assigned agent is offline or disabled.', 'agent_unavailable');
+    if (!target.latest || Date.now() - Date.parse(target.latest.receivedAt) > 90_000) throw new ApiError(409, 'Runtime discovery is stale.', 'telemetry_stale');
+    if (!target.latest.services.some((item) => item.projectName === projectName && item.serviceName === serviceName)) throw new ApiError(404, 'Runtime service was not discovered.', 'target_not_found');
+    if (protectedProjects.has(projectName) && (request as AuthenticatedRequest).authenticatedUser.role !== 'owner') throw new ApiError(403, 'Only an Owner may request logs for a protected runtime project.', 'protected_logs_owner_required');
+    const created = await options.store.createRuntimeLogRequest({ requestedByUserId: (request as AuthenticatedRequest).authenticatedUser.id, agentId, projectName, serviceName, tail: Number(tail), ...(since ? { since } : {}) });
+    if (!created) throw new ApiError(409, 'The assigned agent is unavailable.', 'agent_unavailable');
+    return reply.code(202).send({ request: publicRuntimeLogRequest(created) });
+  });
+  app.get('/api/runtime-log-requests/:id', { preHandler: (request, reply) => requireUser(request, reply, 'operator') }, async (request) => {
+    const item = await options.store.getRuntimeLogRequest(idParameter(request), (request as AuthenticatedRequest).authenticatedUser.id);
+    if (!item) throw new ApiError(404, 'Runtime log request not found.', 'log_request_not_found');
+    if (protectedProjects.has(item.projectName) && (request as AuthenticatedRequest).authenticatedUser.role !== 'owner') throw new ApiError(403, 'Only an Owner may view logs for a protected runtime project.', 'protected_logs_owner_required');
+    return { request: publicRuntimeLogRequest(item) };
   });
 
   app.get('/api/stacks', { preHandler: (request, reply) => requireUser(request, reply) }, async () => ({ stacks: await options.store.listStacks() }));
-  app.post('/api/stacks', { preHandler: (request, reply) => requireUser(request, reply, 'operator') }, async (request, reply) => {
-    const body = objectBody(request.body);
-    const agentId = stringField(body, 'agentId', 36, 36);
-    if (!UUID_PATTERN.test(agentId)) throw new ApiError(400, 'agentId must be a valid UUID.');
-    const name = validateResourceName(stringField(body, 'name', 1, 63));
-    const projectName = stringField(body, 'projectName', 1, 63);
-    if (!PROJECT_NAME_PATTERN.test(projectName)) throw new ApiError(400, 'projectName must use lowercase letters, numbers, underscores, or hyphens.');
-    const composeYaml = validateComposeYaml(opaqueStringField(body, 'composeYaml', 1, MAX_COMPOSE_BYTES));
-    const postgresBackupConfig = optionalPostgresBackupConfig(body);
-    const stack = await options.store.createStack({
-      agentId,
-      name,
-      projectName,
-      encryptedComposeYaml: secretBox.encrypt(composeYaml),
-      enabled: optionalBoolean(body, 'enabled') ?? true,
-      ...(postgresBackupConfig ? { postgresBackupConfig } : {}),
-    });
-    if (!stack) throw new ApiError(404, 'Enabled agent not found.');
-    return reply.code(201).send({ stack });
-  });
-  app.patch('/api/stacks/:id', { preHandler: (request, reply) => requireUser(request, reply, 'operator') }, async (request) => {
-    const body = objectBody(request.body);
-    const name = body.name === undefined ? undefined : validateResourceName(stringField(body, 'name', 1, 63));
-    const composeYaml = body.composeYaml === undefined ? undefined : validateComposeYaml(opaqueStringField(body, 'composeYaml', 1, MAX_COMPOSE_BYTES));
-    const enabled = optionalBoolean(body, 'enabled');
-    const postgresBackupConfig = optionalPostgresBackupConfig(body);
-    if (name === undefined && composeYaml === undefined && enabled === undefined && postgresBackupConfig === undefined) throw new ApiError(400, 'At least one editable field is required.');
-    const stack = await options.store.updateStack(idParameter(request), {
-      ...(name !== undefined ? { name } : {}),
-      ...(composeYaml !== undefined ? { encryptedComposeYaml: secretBox.encrypt(composeYaml) } : {}),
-      ...(enabled !== undefined ? { enabled } : {}),
-      ...(postgresBackupConfig !== undefined ? { postgresBackupConfig } : {}),
-    });
-    if (!stack) throw new ApiError(404, 'Stack or enabled agent not found.');
-    return { stack };
-  });
-  for (const action of ['restart', 'stop'] as const) {
-    app.post(`/api/stacks/:id/${action}`, { preHandler: (request, reply) => requireUser(request, reply, 'operator') }, async (request, reply) => {
-      const command = await options.store.queueStackAction(idParameter(request), `compose.${action}`);
-      if (!command) throw new ApiError(404, 'Enabled stack or agent not found.');
-      return reply.code(202).send({ command });
-    });
-  }
-  app.post('/api/stacks/:id/logs', { preHandler: (request, reply) => requireUser(request, reply, 'operator') }, async (request, reply) => {
-    const body = objectBody(request.body);
-    const service = stringField(body, 'service', 1, 128);
-    if (!SERVICE_NAME_PATTERN.test(service)) throw new ApiError(400, 'service must be a valid Compose service identifier.');
-    const tail = body.tail;
-    if (!Number.isInteger(tail) || (tail as number) < 1 || (tail as number) > 1000) throw new ApiError(400, 'tail must be an integer between 1 and 1000.');
-    let since: string | undefined;
-    if (body.since !== undefined) {
-      since = stringField(body, 'since', 20, 40);
-      const sinceTime = Date.parse(since);
-      if (!RFC3339_PATTERN.test(since) || !Number.isFinite(sinceTime) || sinceTime > Date.now() || sinceTime < Date.now() - 24 * 3_600_000) throw new ApiError(400, 'since must be an RFC3339 timestamp within the last 24 hours.');
-      since = new Date(sinceTime).toISOString();
-    }
-    const user = (request as AuthenticatedRequest).authenticatedUser;
-    const command = await options.store.queueLogRequest(idParameter(request), user.id, service, tail as number, since);
-    if (!command) throw new ApiError(404, 'Enabled stack or agent not found.');
-    return reply.code(202).send({ commandId: command.id, status: command.status });
-  });
+  const legacyStackMutation = async (): Promise<never> => { throw new ApiError(410, 'Managed stack deployment is no longer available.', 'legacy_stack_mutation_disabled'); };
+  app.post('/api/stacks', { preHandler: (request, reply) => requireUser(request, reply, 'operator') }, legacyStackMutation);
+  app.patch('/api/stacks/:id', { preHandler: (request, reply) => requireUser(request, reply, 'operator') }, legacyStackMutation);
+  app.post('/api/stacks/:id/restart', { preHandler: (request, reply) => requireUser(request, reply, 'operator') }, legacyStackMutation);
+  app.post('/api/stacks/:id/stop', { preHandler: (request, reply) => requireUser(request, reply, 'operator') }, legacyStackMutation);
+  app.post('/api/stacks/:id/logs', { preHandler: (request, reply) => requireUser(request, reply, 'operator') }, legacyStackMutation);
   app.post('/api/stacks/:id/backups', { preHandler: (request, reply) => requireUser(request, reply, 'operator') }, async (request, reply) => {
     const body = objectBody(request.body);
     const target = stringField(body, 'target') as 'local' | 'nas';
@@ -759,6 +1138,7 @@ export async function buildApp(options: BuildAppOptions) {
     return reply.code(201).send({ route });
   });
   app.patch('/api/routes/:id', { preHandler: (request, reply) => requireUser(request, reply, 'operator') }, async (request) => {
+    const id = idParameter(request);
     const body = objectBody(request.body);
     const gatewayAgentId = body.gatewayAgentId === undefined ? undefined : stringField(body, 'gatewayAgentId', 36, 36);
     if (gatewayAgentId !== undefined && !UUID_PATTERN.test(gatewayAgentId)) throw new ApiError(400, 'gatewayAgentId must be a valid UUID.');
@@ -769,7 +1149,11 @@ export async function buildApp(options: BuildAppOptions) {
     const backends = body.backends === undefined ? undefined : validateBackends(body.backends);
     const enabled = optionalBoolean(body, 'enabled');
     if (gatewayAgentId === undefined && name === undefined && hostname === undefined && exposure === undefined && backends === undefined && enabled === undefined) throw new ApiError(400, 'At least one editable field is required.');
-    const route = await options.store.updateRoute(idParameter(request), {
+    if ((enabled === false || gatewayAgentId !== undefined || hostname !== undefined || exposure !== undefined)
+      && await options.store.hasEnabledDomainAccessDependency('route', id)) {
+      throw new ApiError(409, 'Disable linked domain access before changing this route.', 'domain_access_dependency_enabled');
+    }
+    const route = await options.store.updateRoute(id, {
       ...(gatewayAgentId !== undefined ? { gatewayAgentId } : {}),
       ...(name !== undefined ? { name } : {}),
       ...(hostname !== undefined ? { hostname } : {}),
@@ -840,6 +1224,7 @@ export async function buildApp(options: BuildAppOptions) {
         options.traefikDynamicVolume ?? 'gateway-traefik-dynamic',
         options.systemBackupNasRoot ?? '/mnt/gateway-control-backups',
         options.systemBackupNasMarker ?? '.gateway-control-nas',
+        [...protectedProjects],
       );
     }
     return reply.code(201).send(response);
@@ -865,6 +1250,7 @@ export async function buildApp(options: BuildAppOptions) {
         options.traefikDynamicVolume ?? 'gateway-traefik-dynamic',
         options.systemBackupNasRoot ?? '/mnt/gateway-control-backups',
         options.systemBackupNasMarker ?? '.gateway-control-nas',
+        [...protectedProjects],
       ),
     };
   });
@@ -894,30 +1280,27 @@ export async function buildApp(options: BuildAppOptions) {
     const commands: AgentCommand[] = [];
     for (const command of claimedCommands) {
       if (command.type === 'compose.stack.sync') {
-        const stackId = command.payload.stackId;
-        const deployment = typeof stackId === 'string' && UUID_PATTERN.test(stackId) ? await options.store.getStackDeployment(stackId) : null;
-        if (!deployment || deployment.agentId !== agent.id) {
-          await options.store.completeCommand(agent.id, command.id, 'failed', { error: 'Stack deployment is unavailable for this agent.' });
+        await options.store.completeCommand(agent.id, command.id, 'failed', { error: 'Legacy managed stack deployment is disabled.' });
+        continue;
+      }
+      if (command.type === 'compose.runtime.action') {
+        const operationId = command.payload.operationId;
+        const operation = typeof operationId === 'string' ? await options.store.getRuntimeOperation(operationId) : null;
+        if (!operation || operation.agentId !== agent.id || operation.commandId !== command.id) {
+          await options.store.completeCommand(agent.id, command.id, 'failed', { error: 'Runtime action is unavailable for this agent.' });
           continue;
         }
-        let composeYaml: string;
-        try {
-          composeYaml = secretBox.decrypt(deployment.encryptedComposeYaml);
-        } catch {
-          await options.store.completeCommand(agent.id, command.id, 'failed', { error: 'Stack configuration could not be decrypted.' });
+        commands.push({ ...command, payload: { operationId, projectName: operation.projectName, ...(operation.serviceName ? { serviceName: operation.serviceName } : {}), action: operation.action, scope: operation.scope } });
+        continue;
+      }
+      if (command.type === 'compose.runtime.logs') {
+        const requestId = command.payload.requestId;
+        const logRequest = typeof requestId === 'string' ? await options.store.getRuntimeLogRequest(requestId) : null;
+        if (!logRequest || logRequest.agentId !== agent.id || logRequest.commandId !== command.id) {
+          await options.store.completeCommand(agent.id, command.id, 'failed', { error: 'Runtime log request is unavailable for this agent.' });
           continue;
         }
-        commands.push({
-          ...command,
-          payload: {
-            stackId: deployment.id,
-            name: deployment.name,
-            projectName: deployment.projectName,
-            composeYaml,
-            enabled: deployment.enabled,
-            revision: deployment.revision,
-          },
-        });
+        commands.push({ ...command, payload: { requestId, projectName: logRequest.projectName, serviceName: logRequest.serviceName, tail: logRequest.tail, ...(logRequest.since ? { since: logRequest.since } : {}) } });
         continue;
       }
       if (command.type === 'traefik.route.sync') {
@@ -983,6 +1366,16 @@ export async function buildApp(options: BuildAppOptions) {
         } });
         continue;
       }
+      if (command.type === 'cloudflare.connector.remove') {
+        const connectorId = command.payload.connectorId;
+        const revision = command.payload.revision;
+        if (typeof connectorId !== 'string' || !UUID_PATTERN.test(connectorId) || typeof revision !== 'number') {
+          await options.store.completeCommand(agent.id, command.id, 'failed', { error: 'Connector cleanup payload is invalid.' });
+          continue;
+        }
+        commands.push({ ...command, payload: { connectorId, revision } });
+        continue;
+      }
       if (command.type !== 'cloudflare.connector.sync') {
         commands.push(command);
         continue;
@@ -991,8 +1384,17 @@ export async function buildApp(options: BuildAppOptions) {
       const deployment = typeof connectorId === 'string' && UUID_PATTERN.test(connectorId)
         ? await options.store.getConnectorDeployment(connectorId)
         : null;
-      if (!deployment || deployment.agentId !== agent.id) {
+      const revision = command.payload.revision;
+      if (!deployment || deployment.agentId !== agent.id || typeof revision !== 'number' || deployment.desiredRevision !== revision) {
         await options.store.completeCommand(agent.id, command.id, 'failed', { error: 'Connector deployment is unavailable for this agent.' });
+        continue;
+      }
+      if (!deployment.enabled) {
+        commands.push({ ...command, payload: { connectorId: deployment.connectorId, revision, enabled: false } });
+        continue;
+      }
+      if (deployment.identityStatus !== 'verified') {
+        await options.store.completeCommand(agent.id, command.id, 'failed', { error: 'Connector identity is not verified.' });
         continue;
       }
       let token: string;
@@ -1004,7 +1406,7 @@ export async function buildApp(options: BuildAppOptions) {
       }
       commands.push({
         ...command,
-        payload: { connectorId: deployment.connectorId, name: deployment.name, enabled: deployment.enabled, token },
+        payload: { connectorId: deployment.connectorId, revision, name: deployment.name, enabled: true, token },
       });
     }
     return { commands };
@@ -1027,7 +1429,7 @@ export async function buildApp(options: BuildAppOptions) {
     const commands = await options.store.listCommands(agentId as string | undefined);
     return {
       commands: commands.map((command) => {
-        if (!['cloudflare.connector.sync', 'compose.stack.sync', 'traefik.route.sync'].includes(command.type)) return command;
+        if (!['cloudflare.connector.sync', 'compose.stack.sync', 'compose.runtime.logs', 'traefik.route.sync'].includes(command.type)) return command;
         const { result: _sensitiveResult, ...publicCommand } = command;
         return publicCommand;
       }),
@@ -1087,7 +1489,11 @@ export async function buildApp(options: BuildAppOptions) {
     const passphrase = opaqueStringField(objectBody(request.body), 'passphrase', 16, 1024);
     try {
       const result = await options.systemRecoveryService.stageRestore({ backupId: idParameter(request), requestedByUserId: (request as AuthenticatedRequest).authenticatedUser.id, passphrase });
-      return reply.code(202).send({ restore: publicSystemRestore(result.restore), restartRequired: result.restartRequired });
+      return reply.code(202).send({
+        restore: publicSystemRestore(result.restore),
+        manualRestoreRequired: result.manualRestoreRequired,
+        restoreCommand: result.restoreCommand,
+      });
     } catch (error) {
       if (error instanceof SystemRecoveryFailure) throw new ApiError(error.statusCode, error.message, error.code);
       throw error;
@@ -1117,6 +1523,8 @@ export async function buildApp(options: BuildAppOptions) {
 
   app.addHook('onClose', async () => {
     notificationDispatcher.stop();
+    if (connectorIdentityStartupTimer) clearTimeout(connectorIdentityStartupTimer);
+    if (connectorIdentityTimer) clearInterval(connectorIdentityTimer);
     await options.store.close();
   });
   return app;

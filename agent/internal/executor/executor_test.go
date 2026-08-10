@@ -108,6 +108,21 @@ func TestRedactMasksKnownAndPatternSecrets(t *testing.T) {
 	}
 }
 
+func TestRedactMasksStructuredCredentialCorpusWithoutMaskingHarmlessOutput(t *testing.T) {
+	executor := newTestExecutor(t)
+	privateKey := "-----BEGIN PRIVATE KEY-----\nprivate-material\n-----END PRIVATE KEY-----"
+	input := `{"token":"json-token","password":"quoted password","api_key":"api-value"} DATABASE_URL=postgresql://user:pass@example.com/db CLOUDFLARE_API_TOKEN=` + strings.Repeat("A", 45) + ` TELEGRAM_BOT_TOKEN=123456789:ABCDEFGHIJKLMNOPQRSTUVWXYZabcdef Authorization: Bearer abc.def eyJhbGciOiJIUzI1NiJ9.cGF5bG9hZA.signature` + "\n" + privateKey + "\nstatus=healthy secret_count=0"
+	redacted := executor.redact(input)
+	for _, secret := range []string{"json-token", "quoted password", "api-value", "pass@example", "abc.def", "eyJhbGci", "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdef", strings.Repeat("A", 45), "private-material"} {
+		if strings.Contains(redacted, secret) {
+			t.Fatalf("redacted output still contains %q: %s", secret, redacted)
+		}
+	}
+	if !strings.Contains(redacted, "status=healthy") || !strings.Contains(redacted, "secret_count=0") {
+		t.Fatalf("harmless output was over-redacted: %s", redacted)
+	}
+}
+
 func TestLimitedBufferCapsOutput(t *testing.T) {
 	buffer := newLimitedBuffer(4)
 	written, err := buffer.Write([]byte("123456"))
@@ -132,7 +147,7 @@ func testOptions(t *testing.T, stacksRoot string) Options {
 		HostStacksRoot: t.TempDir(), CloudflaredImage: "cloudflare/cloudflared:2026.7.3",
 		LocalBackupRoot: t.TempDir(), HostLocalBackupRoot: t.TempDir(), NASBackupRoot: t.TempDir(), HostNASBackupRoot: t.TempDir(),
 		NASMarker: ".gateway-control-nas", AgentImage: "example/gateway-agent:test", BackupTimeout: time.Second,
-		EdgeNetwork: "gateway-control-edge", TraefikDynamicRoot: t.TempDir(),
+		EdgeNetwork: "gateway-control-edge", TraefikDynamicRoot: t.TempDir(), HostProcRoot: "/proc",
 		TraefikDynamicVolume: "gateway-traefik-dynamic",
 		Timeout:              time.Second, InfoTimeout: time.Second, MaxOutput: 1024,
 	}

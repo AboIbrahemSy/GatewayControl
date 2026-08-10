@@ -78,7 +78,7 @@ func decodeServiceLogsPayload(raw json.RawMessage, now time.Time) (serviceLogsPa
 	if !connectorUUIDPattern.MatchString(payload.StackID) || payload.StackPath != payload.StackID || payload.ComposePath != payload.StackID+"/compose.yaml" {
 		return payload, errors.New("stack paths do not match stackId")
 	}
-	if !composeServicePattern.MatchString(payload.Service) || !projectPattern.MatchString(payload.ProjectName) || payload.Tail < 1 || payload.Tail > 1000 {
+	if !composeServicePattern.MatchString(payload.Service) || !composeProjectPattern.MatchString(payload.ProjectName) || payload.Tail < 1 || payload.Tail > 1000 {
 		return payload, errors.New("invalid service log request fields")
 	}
 	if payload.Since != "" {

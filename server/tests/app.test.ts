@@ -6,14 +6,29 @@ import { FakeStore } from './fake-store.js';
 import { SystemRecoveryFailure, type SystemRecoveryService } from '../src/system-recovery.js';
 
 const apps: Array<Awaited<ReturnType<typeof buildApp>>> = [];
+const connectorAccountIdentifier = 'a'.repeat(32);
+const connectorTunnelId = '123e4567-e89b-12d3-a456-426614174000';
+
+function tunnelToken(accountIdentifier = connectorAccountIdentifier, tunnelId = connectorTunnelId, secret = Buffer.alloc(32, 7)): string {
+  return Buffer.from(JSON.stringify({ a: accountIdentifier, t: tunnelId, s: secret.toString('base64') })).toString('base64');
+}
+
+function connectorVerificationFetch(token = tunnelToken()): typeof globalThis.fetch {
+  return vi.fn<typeof globalThis.fetch>(async (input) => {
+    const url = String(input);
+    if (url.endsWith('/token')) return cloudflareResponse(token);
+    if (url.includes('/cfd_tunnel/')) return cloudflareResponse({ id: connectorTunnelId, account_tag: connectorAccountIdentifier, deleted_at: null });
+    throw new Error(`Unexpected request: ${url}`);
+  });
+}
 
 afterEach(async () => {
   await Promise.all(apps.splice(0).map((app) => app.close()));
 });
 
-async function appWithOwner(options: { fetch?: typeof globalThis.fetch; notificationIntervalMs?: number; systemRecoveryService?: SystemRecoveryService } = {}) {
+async function appWithOwner(options: { fetch?: typeof globalThis.fetch; notificationIntervalMs?: number; systemRecoveryService?: SystemRecoveryService; protectedProjects?: string[] } = {}) {
   const store = new FakeStore();
-  const app = await buildApp({ store, masterKey: randomBytes(32), secureCookie: false, ...options });
+  const app = await buildApp({ store, masterKey: randomBytes(32), secureCookie: false, fetch: options.fetch ?? connectorVerificationFetch(), ...options });
   apps.push(app);
   await app.inject({ method: 'POST', url: '/api/setup', payload: { email: 'owner@example.com', password: 'correct horse battery staple' } });
   const login = await app.inject({ method: 'POST', url: '/api/auth/login', payload: { email: 'owner@example.com', password: 'correct horse battery staple' } });
@@ -30,6 +45,22 @@ function cloudflareResponse(result: unknown = {}, options: { status?: number; su
 }
 
 describe('control-plane API', () => {
+  it('keeps liveness independent and reports bounded database readiness without leaking errors', async () => {
+    const readinessCheck = vi.fn().mockResolvedValueOnce(undefined).mockRejectedValueOnce(new Error('postgresql://secret@database/private'));
+    const store = new FakeStore();
+    const app = await buildApp({ store, masterKey: randomBytes(32), secureCookie: false, readinessCheck, release: '2026.08.10' });
+    apps.push(app);
+
+    expect((await app.inject({ method: 'GET', url: '/health' })).json()).toEqual({ status: 'ok', release: '2026.08.10' });
+    const ready = await app.inject({ method: 'GET', url: '/ready' });
+    expect(ready.statusCode).toBe(200);
+    expect(ready.json()).toEqual({ status: 'ready', release: '2026.08.10' });
+    const unavailable = await app.inject({ method: 'GET', url: '/ready' });
+    expect(unavailable.statusCode).toBe(503);
+    expect(unavailable.json()).toEqual({ status: 'unavailable', release: '2026.08.10' });
+    expect(unavailable.body).not.toContain('secret');
+  });
+
   it('allows bundled data fonts in the application content security policy', async () => {
     const store = new FakeStore();
     const app = await buildApp({ store, masterKey: randomBytes(32), secureCookie: false });
@@ -54,36 +85,40 @@ describe('control-plane API', () => {
   it('enforces roles and never returns connector tokens', async () => {
     const { app, store, cookie } = await appWithOwner();
     const agent = await store.createAgent('connector-gateway', hashToken('pending-enrollment-token-that-is-long'));
-    const created = await app.inject({ method: 'POST', url: '/api/connectors', headers: { cookie }, payload: { name: 'primary', token: 'a-very-long-cloudflare-connector-token', agentId: agent.id } });
+    store.agents[0]!.enrolledAt = new Date().toISOString();
+    await app.inject({ method: 'POST', url: '/api/cloudflare/accounts', headers: { cookie }, payload: { name: 'Connector account', accountIdentifier: connectorAccountIdentifier, apiToken: 'cloudflare-api-token-that-is-long-enough' } });
+    const token = tunnelToken();
+    const created = await app.inject({ method: 'POST', url: '/api/connectors', headers: { cookie }, payload: { name: 'primary', token, agentId: agent.id } });
     expect(created.statusCode).toBe(201);
-    expect(created.body).not.toContain('cloudflare-connector-token');
-    expect(store.connectors[0]?.encryptedToken).not.toContain('cloudflare-connector-token');
+    expect(created.body).not.toContain(token);
+    expect(store.connectors[0]?.encryptedToken).not.toContain(token);
     expect(created.json().connector.agentId).toBe(agent.id);
     expect(store.commands).toHaveLength(1);
     expect(store.commands[0]).toMatchObject({ agentId: agent.id, type: 'cloudflare.connector.sync', payload: { connectorId: created.json().connector.id }, status: 'pending' });
-    expect(JSON.stringify(store.commands)).not.toContain('cloudflare-connector-token');
+    expect(JSON.stringify(store.commands)).not.toContain(token);
     const browserCommands = await app.inject({ method: 'GET', url: '/api/commands', headers: { cookie } });
-    expect(browserCommands.body).not.toContain('cloudflare-connector-token');
+    expect(browserCommands.body).not.toContain(token);
 
     const patched = await app.inject({ method: 'PATCH', url: `/api/connectors/${created.json().connector.id}`, headers: { cookie }, payload: { enabled: false } });
     expect(patched.statusCode).toBe(200);
     expect(store.commands).toHaveLength(1);
     expect(store.commands[0]).toMatchObject({ type: 'cloudflare.connector.sync', payload: { connectorId: created.json().connector.id } });
     const replacementAgent = await store.createAgent('replacement-gateway', hashToken('replacement-enrollment-token-that-is-long'));
+    store.agents.find((item) => item.id === replacementAgent.id)!.enrolledAt = new Date().toISOString();
     const reassigned = await app.inject({
       method: 'PATCH', url: `/api/connectors/${created.json().connector.id}`, headers: { cookie },
-      payload: { name: 'renamed', token: 'a-replacement-cloudflare-connector-token', agentId: replacementAgent.id },
+      payload: { name: 'renamed', token, agentId: replacementAgent.id },
     });
     expect(reassigned.statusCode).toBe(200);
-    expect(reassigned.body).not.toContain('replacement-cloudflare-connector-token');
-    expect(store.commands[1]).toMatchObject({ agentId: replacementAgent.id, type: 'cloudflare.connector.sync', payload: { connectorId: created.json().connector.id } });
-    expect(JSON.stringify(store.commands)).not.toContain('replacement-cloudflare-connector-token');
+    expect(reassigned.body).not.toContain(token);
+    expect(store.commands).toEqual(expect.arrayContaining([expect.objectContaining({ agentId: replacementAgent.id, type: 'cloudflare.connector.sync', payload: { connectorId: created.json().connector.id, revision: 3 } })]));
+    expect(JSON.stringify(store.commands)).not.toContain(token);
 
     const viewer = await store.createUser('viewer@example.com', store.users[0]!.passwordHash, 'viewer');
     store.sessions.set(hashToken('viewer-session-token-that-is-long-enough'), viewer.id);
     const forbidden = await app.inject({
       method: 'POST', url: '/api/connectors', headers: { cookie: 'gateway_control_session=viewer-session-token-that-is-long-enough' },
-      payload: { name: 'forbidden', token: 'a-very-long-cloudflare-connector-token', agentId: agent.id },
+      payload: { name: 'forbidden', token, agentId: agent.id },
     });
     expect(forbidden.statusCode).toBe(403);
   });
@@ -150,6 +185,7 @@ describe('control-plane API', () => {
       secureCookie: false,
       systemBackupNasRoot: '/srv/shared-gateway-nas',
       systemBackupNasMarker: '.trusted-gateway-nas',
+      protectedProjects: ['gateway-control', 'critical_api'],
     });
     apps.push(app);
     await app.inject({ method: 'POST', url: '/api/setup', payload: { email: 'owner@example.com', password: 'correct horse battery staple' } });
@@ -167,6 +203,7 @@ describe('control-plane API', () => {
     expect(response.json().enrollmentCommand).toContain("GATEWAY_NAS_BACKUP_ROOT='/srv/shared-gateway-nas'");
     expect(response.json().enrollmentCommand).toContain("GATEWAY_HOST_NAS_BACKUP_ROOT='/srv/shared-gateway-nas'");
     expect(response.json().enrollmentCommand).toContain("GATEWAY_NAS_MARKER='.trusted-gateway-nas'");
+    expect(response.json().enrollmentCommand).toContain("GATEWAY_PROTECTED_PROJECTS='gateway-control,critical_api'");
     expect(response.json().enrollmentCommand).toContain("'/srv/shared-gateway-nas:/srv/shared-gateway-nas'");
     expect(response.json().enrollmentCommand).not.toContain('/mnt/gateway-control-backups');
   });
@@ -240,26 +277,28 @@ describe('control-plane API', () => {
     const storedAgent = store.agents.find((item) => item.id === agent.id)!;
     storedAgent.credentialHash = hashToken(credential);
     storedAgent.enrolledAt = new Date().toISOString();
+    await app.inject({ method: 'POST', url: '/api/cloudflare/accounts', headers: { cookie }, payload: { name: 'Command account', accountIdentifier: connectorAccountIdentifier, apiToken: 'cloudflare-api-token-that-is-long-enough' } });
+    const token = tunnelToken();
     const created = await app.inject({
       method: 'POST', url: '/api/connectors', headers: { cookie },
-      payload: { name: 'primary-tunnel', token: 'a-very-long-cloudflare-connector-token', agentId: agent.id },
+      payload: { name: 'primary-tunnel', token, agentId: agent.id },
     });
     const connectorId = created.json().connector.id;
-    expect(store.commands[0]?.payload).toEqual({ connectorId });
+    expect(store.commands[0]?.payload).toEqual({ connectorId, revision: 1 });
     const polled = await app.inject({ method: 'GET', url: '/api/agent/commands', headers: { authorization: `Bearer ${credential}` } });
     expect(polled.statusCode).toBe(200);
     expect(polled.json().commands[0]).toMatchObject({
       type: 'cloudflare.connector.sync',
-      payload: { connectorId, name: 'primary-tunnel', enabled: true, token: 'a-very-long-cloudflare-connector-token' },
+      payload: { connectorId, revision: 1, name: 'primary-tunnel', enabled: true, token },
     });
-    expect(store.commands[0]?.payload).toEqual({ connectorId });
+    expect(store.commands[0]?.payload).toEqual({ connectorId, revision: 1 });
 
     const otherAgent = await store.createAgent('other-gateway', hashToken('other-enrollment-token-that-is-long'));
     const otherCredential = 'other-persistent-credential-that-is-long-enough';
     const storedOtherAgent = store.agents.find((item) => item.id === otherAgent.id)!;
     storedOtherAgent.credentialHash = hashToken(otherCredential);
     storedOtherAgent.enrolledAt = new Date().toISOString();
-    const mismatched = await store.createCommand(otherAgent.id, 'cloudflare.connector.sync', { connectorId });
+    const mismatched = await store.createCommand(otherAgent.id, 'cloudflare.connector.sync', { connectorId, revision: 1 });
     const rejectedPoll = await app.inject({ method: 'GET', url: '/api/agent/commands', headers: { authorization: `Bearer ${otherCredential}` } });
     expect(rejectedPoll.json().commands).toEqual([]);
     expect(mismatched?.status).toBe('failed');
@@ -282,71 +321,24 @@ describe('control-plane API', () => {
     expect(arbitrary.statusCode).toBe(400);
   });
 
-  it('encrypts managed stacks, deduplicates syncs, decorates assigned deployment, and updates status', async () => {
+  it('disables legacy stack mutations while preserving legacy history', async () => {
     const { app, store, cookie } = await appWithOwner();
     const agent = await store.createAgent('stack-gateway', hashToken('stack-enrollment-token-that-is-long-enough'));
-    const credential = 'stack-agent-credential-that-is-long-enough';
-    const storedAgent = store.agents.find((item) => item.id === agent.id)!;
-    storedAgent.credentialHash = hashToken(credential);
-    storedAgent.enrolledAt = new Date().toISOString();
-    const composeYaml = 'services:\n  web:\n    image: nginx:1.27\n';
-    const created = await app.inject({
-      method: 'POST', url: '/api/stacks', headers: { cookie },
-      payload: { agentId: agent.id, name: 'web-stack', projectName: 'web_stack', composeYaml, enabled: true },
-    });
-    expect(created.statusCode).toBe(201);
-    expect(created.body).not.toContain(composeYaml);
-    expect(created.json().stack).toMatchObject({ agentId: agent.id, name: 'web-stack', projectName: 'web_stack', configured: true, revision: 1, status: 'pending' });
-    const stackId = created.json().stack.id;
-    expect(store.stacks[0]?.encryptedComposeYaml).not.toContain('nginx');
-    expect(store.commands).toHaveLength(1);
-    expect(store.commands[0]).toMatchObject({ type: 'compose.stack.sync', payload: { stackId } });
-    expect(JSON.stringify(store.commands)).not.toContain('nginx');
-    expect((await app.inject({ method: 'GET', url: '/api/commands', headers: { cookie } })).body).not.toContain('nginx');
-
-    const patched = await app.inject({ method: 'PATCH', url: `/api/stacks/${stackId}`, headers: { cookie }, payload: { name: 'renamed-stack' } });
-    expect(patched.json().stack.revision).toBe(2);
-    expect(store.commands).toHaveLength(1);
-    const listed = await app.inject({ method: 'GET', url: '/api/stacks', headers: { cookie } });
-    expect(listed.body).not.toContain('composeYaml');
-    expect(listed.body).not.toContain('nginx');
-
-    const polled = await app.inject({ method: 'GET', url: '/api/agent/commands', headers: { authorization: `Bearer ${credential}` } });
-    expect(polled.json().commands[0]).toMatchObject({
-      type: 'compose.stack.sync',
-      payload: { stackId, name: 'renamed-stack', projectName: 'web_stack', composeYaml, enabled: true, revision: 2 },
-    });
-    expect(store.commands[0]?.payload).toEqual({ stackId });
-    const result = await app.inject({
-      method: 'POST', url: `/api/agent/commands/${store.commands[0]!.id}/result`, headers: { authorization: `Bearer ${credential}` },
-      payload: { status: 'succeeded', result: {} },
-    });
-    expect(result.statusCode).toBe(200);
-    expect(store.stacks[0]?.status).toBe('active');
-    const restart = await app.inject({ method: 'POST', url: `/api/stacks/${stackId}/restart`, headers: { cookie } });
-    expect(restart.statusCode).toBe(202);
-    expect(restart.json().command.payload).toEqual({ composePath: `${stackId}/compose.yaml`, stack: 'renamed-stack', project: 'web_stack' });
-  });
-
-  it('rejects unsafe or invalid managed stack YAML', async () => {
-    const { app, store, cookie } = await appWithOwner();
-    const agent = await store.createAgent('validation-gateway', hashToken('validation-enrollment-token-that-is-long'));
-    const invalidDocuments = [
-      'not: [valid',
-      'networks:\n  default: {}\n',
-      'include: other.yaml\nservices: {}\n',
-      'services:\n  bad:\n    image: test\n    privileged: true\n',
-      'services:\n  bad:\n    image: test\n    volumes:\n      - /var/run/docker.sock:/var/run/docker.sock\n',
-      'services:\n  bad:\n    extends:\n      file: other.yaml\n      service: base\n',
-    ];
-    for (const composeYaml of invalidDocuments) {
-      const response = await app.inject({
-        method: 'POST', url: '/api/stacks', headers: { cookie },
-        payload: { agentId: agent.id, name: 'invalid-stack', projectName: 'invalid', composeYaml },
-      });
-      expect(response.statusCode).toBe(400);
+    const legacy = await store.createStack({ agentId: agent.id, name: 'legacy', projectName: 'legacy', encryptedComposeYaml: 'encrypted', enabled: true });
+    for (const request of [
+      { method: 'POST' as const, url: '/api/stacks', payload: {} },
+      { method: 'PATCH' as const, url: `/api/stacks/${legacy!.id}`, payload: {} },
+      { method: 'POST' as const, url: `/api/stacks/${legacy!.id}/restart`, payload: {} },
+      { method: 'POST' as const, url: `/api/stacks/${legacy!.id}/logs`, payload: {} },
+    ]) {
+      const response = await app.inject({ ...request, headers: { cookie } });
+      expect(response.statusCode).toBe(410);
+      expect(response.json().code).toBe('legacy_stack_mutation_disabled');
     }
-    expect(store.stacks).toHaveLength(0);
+    expect((await app.inject({ method: 'GET', url: '/api/stacks', headers: { cookie } })).json().stacks).toHaveLength(1);
+    for (const type of ['compose.ps', 'compose.up', 'compose.stop', 'compose.restart']) {
+      expect((await app.inject({ method: 'POST', url: '/api/commands', headers: { cookie }, payload: { agentId: agent.id, type, payload: {} } })).statusCode).toBe(400);
+    }
   });
 
   it('validates and decorates Traefik routes only for their gateway', async () => {
@@ -410,6 +402,13 @@ describe('control-plane API', () => {
     const request = { method: 'POST' as const, url: `/api/agent/commands/${command!.id}/result`, headers: { authorization: `Bearer ${credential}` }, payload: { status: 'succeeded', result: { applied: true } } };
     expect((await app.inject(request)).json()).toEqual({ accepted: true, idempotent: false });
     expect((await app.inject(request)).json()).toEqual({ accepted: true, idempotent: true });
+
+    const reordered = await store.createCommand(agent.id, 'reload', {});
+    await store.claimCommands(agent.id, 1);
+    const first = { method: 'POST' as const, url: `/api/agent/commands/${reordered!.id}/result`, headers: { authorization: `Bearer ${credential}` }, payload: { status: 'succeeded', result: { first: 1, second: 2 } } };
+    const duplicate = { ...first, payload: { status: 'succeeded', result: { second: 2, first: 1 } } };
+    expect((await app.inject(first)).json().idempotent).toBe(false);
+    expect((await app.inject(duplicate)).json().idempotent).toBe(true);
   });
 
   it('accepts bounded telemetry only from agents and exposes monitoring to viewers', async () => {
@@ -418,10 +417,13 @@ describe('control-plane API', () => {
     const credential = 'telemetry-agent-credential-long-enough';
     store.agents[0]!.credentialHash = hashToken(credential);
     store.agents[0]!.enrolledAt = new Date().toISOString();
-    const snapshot = { observedAt: new Date().toISOString(), node: { hostname: 'nas-one', cpuPercent: 12.5 }, services: [{ name: 'web', status: 'healthy', cpuPercent: 2 }] };
+    const snapshot = { observedAt: new Date().toISOString(), node: { hostname: 'nas-one', cpuPercent: 12.5 }, services: [
+      { name: 'site/web', projectName: 'site', serviceName: 'web', status: 'healthy', total: 1, running: 1, healthy: 1, unhealthy: 0, starting: 0, stopped: 0, completed: 0 },
+      { name: 'site/bootstrap', projectName: 'site', serviceName: 'bootstrap', status: 'completed', total: 1, running: 0, healthy: 0, unhealthy: 0, starting: 0, stopped: 0, completed: 1 },
+    ] };
     expect((await app.inject({ method: 'POST', url: '/api/agent/telemetry', payload: snapshot })).statusCode).toBe(401);
     expect((await app.inject({ method: 'POST', url: '/api/agent/telemetry', headers: { authorization: `Bearer ${credential}` }, payload: snapshot })).statusCode).toBe(200);
-    const invalid = { ...snapshot, services: Array.from({ length: 251 }, (_, index) => ({ name: `service-${index}`, status: 'healthy' })) };
+    const invalid = { ...snapshot, services: Array.from({ length: 251 }, (_, index) => ({ ...snapshot.services[0], name: `site/service-${index}`, serviceName: `service-${index}` })) };
     expect((await app.inject({ method: 'POST', url: '/api/agent/telemetry', headers: { authorization: `Bearer ${credential}` }, payload: invalid })).statusCode).toBe(400);
     const viewer = await store.createUser('monitor@example.com', store.users[0]!.passwordHash, 'viewer');
     store.sessions.set(hashToken('monitor-viewer-session-token-long-enough'), viewer.id);
@@ -430,30 +432,111 @@ describe('control-plane API', () => {
     expect(summary.statusCode).toBe(200);
     expect(summary.json().agents[0]).toMatchObject({ agentId: agent.id, node: { hostname: 'nas-one' } });
     expect((await app.inject({ method: 'GET', url: `/api/monitoring/agents/${agent.id}`, headers: { cookie } })).json().history).toHaveLength(1);
+
+    const futureClock = { ...snapshot, observedAt: new Date(Date.now() + 4 * 60_000).toISOString(), node: { source: 'future-clock' } };
+    const newerReceived = { ...snapshot, observedAt: new Date(Date.now() - 60_000).toISOString(), node: { source: 'newer-received' } };
+    await app.inject({ method: 'POST', url: '/api/agent/telemetry', headers: { authorization: `Bearer ${credential}` }, payload: futureClock });
+    await app.inject({ method: 'POST', url: '/api/agent/telemetry', headers: { authorization: `Bearer ${credential}` }, payload: newerReceived });
+    const latest = await app.inject({ method: 'GET', url: '/api/monitoring/summary', headers: { cookie: viewerCookie } });
+    expect(latest.json().agents[0].node).toEqual({ source: 'newer-received' });
   });
 
-  it('restricts service logs and decorates one claimed request with authoritative stack paths', async () => {
+  it('rejects stale, offline, protected, unknown, and malformed runtime action targets with stable codes', async () => {
+    const { app, store, cookie } = await appWithOwner();
+    const agent = await store.createAgent('runtime-guard-agent', hashToken('runtime-guard-enrollment-token-long'));
+    const storedAgent = store.agents[0]!; storedAgent.enrolledAt = new Date().toISOString(); storedAgent.credentialHash = hashToken('runtime-guard-credential-long-enough');
+    const service = { name: 'gateway-control/server', projectName: 'gateway-control', serviceName: 'server', status: 'healthy', total: 1, running: 1, healthy: 1, unhealthy: 0, starting: 0, stopped: 0, completed: 0 };
+    const payload = { agentId: agent.id, projectName: 'gateway-control', scope: 'project', action: 'restart' };
+    expect((await app.inject({ method: 'POST', url: '/api/runtime-actions', headers: { cookie }, payload })).json().code).toBe('agent_unavailable');
+    await store.recordTelemetry(agent.id, { observedAt: new Date().toISOString(), node: {}, services: [service] });
+    expect((await app.inject({ method: 'POST', url: '/api/runtime-actions', headers: { cookie }, payload })).json().code).toBe('project_protected');
+    expect((await app.inject({ method: 'POST', url: '/api/runtime-actions', headers: { cookie }, payload: { ...payload, projectName: 'missing' } })).json().code).toBe('target_not_found');
+    store.telemetry[0]!.receivedAt = new Date(Date.now() - 91_000).toISOString();
+    expect((await app.inject({ method: 'POST', url: '/api/runtime-actions', headers: { cookie }, payload })).json().code).toBe('telemetry_stale');
+    expect((await app.inject({ method: 'POST', url: '/api/runtime-actions', headers: { cookie }, payload: { ...payload, arbitrary: true } })).json().code).toBe('invalid_payload');
+  });
+
+  it('authorizes discovered runtime actions and logs with minimal stored commands and owned results', async () => {
     const { app, store, cookie } = await appWithOwner();
     const agent = await store.createAgent('logs-agent', hashToken('logs-enrollment-token-long-enough'));
     const credential = 'logs-agent-credential-long-enough';
     store.agents[0]!.credentialHash = hashToken(credential);
     store.agents[0]!.enrolledAt = new Date().toISOString();
-    const stack = await store.createStack({ agentId: agent.id, name: 'logs', projectName: 'authoritative', encryptedComposeYaml: 'encrypted', enabled: true });
-    store.commands.length = 0;
+    await store.recordTelemetry(agent.id, { observedAt: new Date().toISOString(), node: {}, services: [{ name: 'authoritative/web', projectName: 'authoritative', serviceName: 'web', status: 'healthy', total: 1, running: 1, healthy: 1, unhealthy: 0, starting: 0, stopped: 0, completed: 0 }] });
     const viewer = await store.createUser('logs-viewer@example.com', store.users[0]!.passwordHash, 'viewer');
     store.sessions.set(hashToken('logs-viewer-session-token-long-enough'), viewer.id);
     const viewerCookie = 'gateway_control_session=logs-viewer-session-token-long-enough';
-    expect((await app.inject({ method: 'POST', url: `/api/stacks/${stack!.id}/logs`, headers: { cookie: viewerCookie }, payload: { service: 'web', tail: 100 } })).statusCode).toBe(403);
-    const queued = await app.inject({ method: 'POST', url: `/api/stacks/${stack!.id}/logs`, headers: { cookie }, payload: { service: 'web', tail: 100, since: new Date(Date.now() - 60_000).toISOString() } });
+    expect((await app.inject({ method: 'GET', url: '/api/runtime-projects', headers: { cookie: viewerCookie } })).statusCode).toBe(200);
+    const actionPayload = { agentId: agent.id, projectName: 'authoritative', serviceName: 'web', scope: 'service', action: 'restart' };
+    expect((await app.inject({ method: 'POST', url: '/api/runtime-actions', headers: { cookie: viewerCookie }, payload: actionPayload })).statusCode).toBe(403);
+    const action = await app.inject({ method: 'POST', url: '/api/runtime-actions', headers: { cookie }, payload: actionPayload });
+    expect(action.statusCode).toBe(202);
+    expect(store.commands[0]!.payload).toEqual({ operationId: action.json().operation.id });
+    expect((await app.inject({ method: 'POST', url: '/api/runtime-actions', headers: { cookie }, payload: actionPayload })).json().code).toBe('operation_active');
+    const actionPoll = await app.inject({ method: 'GET', url: '/api/agent/commands', headers: { authorization: `Bearer ${credential}` } });
+    expect(actionPoll.json().commands[0].payload).toEqual({ operationId: action.json().operation.id, projectName: 'authoritative', serviceName: 'web', action: 'restart', scope: 'service' });
+    const completion = { method: 'POST' as const, url: `/api/agent/commands/${store.commands[0]!.id}/result`, headers: { authorization: `Bearer ${credential}` }, payload: { status: 'succeeded', result: { matched: 1, succeeded: 1, internalId: 'hidden' } } };
+    expect((await app.inject(completion)).json().idempotent).toBe(false);
+    expect((await app.inject(completion)).json().idempotent).toBe(true);
+    expect(store.events.filter((event) => event.type === 'runtime.action.succeeded')).toHaveLength(1);
+
+    const crashWindowAction = await app.inject({ method: 'POST', url: '/api/runtime-actions', headers: { cookie }, payload: { ...actionPayload, action: 'stop' } });
+    const crashWindowCommand = store.commands.at(-1)!;
+    const crashWindowOperation = store.runtimeOperations.find((item) => item.id === crashWindowAction.json().operation.id)!;
+    crashWindowCommand.status = 'claimed';
+    crashWindowOperation.status = 'pending';
+    expect(await store.completeCommand(agent.id, crashWindowCommand.id, 'succeeded', { matched: 1 })).toBe('updated');
+    expect(crashWindowOperation.status).toBe('succeeded');
+    expect(await store.completeCommand(agent.id, crashWindowCommand.id, 'succeeded', { matched: 1 })).toBe('idempotent');
+
+    const queued = await app.inject({ method: 'POST', url: '/api/runtime-log-requests', headers: { cookie }, payload: { agentId: agent.id, projectName: 'authoritative', serviceName: 'web', tail: 100, since: new Date(Date.now() - 60_000).toISOString() } });
     expect(queued.statusCode).toBe(202);
-    expect(store.commands[0]!.payload).toMatchObject({ stackId: stack!.id, service: 'web', tail: 100 });
-    expect(store.commands[0]!.payload).not.toHaveProperty('projectName');
+    const logCommand = store.commands.find((command) => command.payload.requestId === queued.json().request.id)!;
+    expect(logCommand.payload).toEqual({ requestId: queued.json().request.id });
     const polled = await app.inject({ method: 'GET', url: '/api/agent/commands', headers: { authorization: `Bearer ${credential}` } });
     expect(polled.json().commands).toHaveLength(1);
-    expect(polled.json().commands[0].payload).toMatchObject({ projectName: 'authoritative', stackPath: stack!.id, composePath: `${stack!.id}/compose.yaml` });
+    expect(polled.json().commands[0].payload).toMatchObject({ projectName: 'authoritative', serviceName: 'web', tail: 100 });
     expect(polled.json().commands[0].payload).not.toHaveProperty('requestedByUserId');
-    expect((await app.inject({ method: 'GET', url: `/api/log-requests/${queued.json().commandId}`, headers: { cookie } })).statusCode).toBe(200);
-    expect((await app.inject({ method: 'GET', url: `/api/log-requests/${queued.json().commandId}`, headers: { cookie: viewerCookie } })).statusCode).toBe(403);
+    expect((await app.inject({ method: 'GET', url: `/api/runtime-log-requests/${queued.json().request.id}`, headers: { cookie } })).statusCode).toBe(200);
+    const other = await store.createUser('other@example.com', store.users[0]!.passwordHash, 'operator'); store.sessions.set(hashToken('other-operator-session-token-long-enough'), other.id);
+    expect((await app.inject({ method: 'GET', url: `/api/runtime-log-requests/${queued.json().request.id}`, headers: { cookie: 'gateway_control_session=other-operator-session-token-long-enough' } })).statusCode).toBe(404);
+  });
+
+  it('restricts configured protected-project logs to owners with a stable code', async () => {
+    const { app, store, cookie } = await appWithOwner({ protectedProjects: ['gateway-control', 'critical_api'] });
+    const agent = await store.createAgent('protected-logs-agent', hashToken('protected-logs-enrollment-token-long'));
+    store.agents[0]!.enrolledAt = new Date().toISOString();
+    await store.recordTelemetry(agent.id, { observedAt: new Date().toISOString(), node: {}, services: [{ name: 'critical_api/Web.Service', projectName: 'critical_api', serviceName: 'Web.Service', status: 'healthy', total: 1, running: 1, healthy: 1, unhealthy: 0, starting: 0, stopped: 0, completed: 0 }] });
+    const operator = await store.createUser('protected-operator@example.com', store.users[0]!.passwordHash, 'operator');
+    store.sessions.set(hashToken('protected-operator-session-token-long'), operator.id);
+    const payload = { agentId: agent.id, projectName: 'critical_api', serviceName: 'Web.Service', tail: 100 };
+    const denied = await app.inject({ method: 'POST', url: '/api/runtime-log-requests', headers: { cookie: 'gateway_control_session=protected-operator-session-token-long' }, payload });
+    expect(denied.statusCode).toBe(403);
+    expect(denied.json().code).toBe('protected_logs_owner_required');
+    expect((await app.inject({ method: 'POST', url: '/api/runtime-log-requests', headers: { cookie }, payload })).statusCode).toBe(202);
+    expect((await app.inject({ method: 'GET', url: '/api/runtime-projects', headers: { cookie } })).json().projects[0].protected).toBe(true);
+
+    const historical = await store.createRuntimeLogRequest({ requestedByUserId: operator.id, agentId: agent.id, projectName: 'critical_api', serviceName: 'Web.Service', tail: 100 });
+    const historicalRead = await app.inject({ method: 'GET', url: `/api/runtime-log-requests/${historical!.id}`, headers: { cookie: 'gateway_control_session=protected-operator-session-token-long' } });
+    expect(historicalRead.statusCode).toBe(403);
+    expect(historicalRead.json().code).toBe('protected_logs_owner_required');
+  });
+
+  it('expires runtime log content while retaining terminal audit metadata', async () => {
+    const store = new FakeStore();
+    const owner = await store.createOwner('owner@example.com', 'password-hash');
+    const agent = await store.createAgent('retention-agent', hashToken('retention-enrollment-token-long'));
+    agent.enrolledAt = new Date().toISOString();
+    const request = await store.createRuntimeLogRequest({ requestedByUserId: owner!.id, agentId: agent.id, projectName: 'project', serviceName: 'web', tail: 100 });
+    const command = store.commands.at(-1)!;
+    await store.claimCommands(agent.id, 1);
+    await store.completeCommand(agent.id, command.id, 'succeeded', { logs: 'token=private', truncated: false });
+    request!.completedAt = new Date(Date.now() - 25 * 60 * 60_000).toISOString();
+
+    expect(await store.purgeRuntimeLogResults(new Date(Date.now() - 24 * 60 * 60_000))).toBe(1);
+    expect(request).toMatchObject({ status: 'succeeded', result: null });
+    expect(command).toMatchObject({ status: 'succeeded', result: { truncated: false } });
+    expect(JSON.stringify(command)).not.toContain('private');
   });
 
   it('orchestrates backup completion and owner-only restore using metadata-only responses', async () => {
@@ -496,7 +579,8 @@ describe('control-plane API', () => {
     }));
     const stageRestore = vi.fn(async (input: { backupId: string }) => ({
       restore: { id: randomUUID(), backupId: input.backupId, requestedByUserId: 'private-user', status: 'staged' as const, error: null, createdAt: now, completedAt: now },
-      restartRequired: true as const,
+      manualRestoreRequired: true as const,
+      restoreCommand: 'sh docker/recover.sh',
     }));
     const { app, store, cookie } = await appWithOwner({ systemRecoveryService: { createBackup, stageRestore } });
     const operator = await store.createUser('system-operator@example.com', store.users[0]!.passwordHash, 'operator');
@@ -521,7 +605,11 @@ describe('control-plane API', () => {
     expect(stageRestore).not.toHaveBeenCalled();
     const staged = await app.inject({ method: 'POST', url: `/api/system-backups/${backupId}/stage-restore`, headers: { cookie }, payload: { passphrase: 'valid-system-passphrase' } });
     expect(staged.statusCode).toBe(202);
-    expect(staged.json()).toMatchObject({ restartRequired: true, restore: { backupId, status: 'staged' } });
+    expect(staged.json()).toMatchObject({
+      manualRestoreRequired: true,
+      restoreCommand: 'sh docker/recover.sh',
+      restore: { backupId, status: 'staged' },
+    });
     expect(staged.body).not.toMatch(/requestedByUserId|masterKey|passphrase|artifactPath/);
     expect(stageRestore).toHaveBeenCalledWith(expect.objectContaining({ backupId, passphrase: 'valid-system-passphrase' }));
   });
@@ -582,6 +670,9 @@ describe('control-plane API', () => {
     await app.inject({ method: 'POST', url: `/api/agent/commands/${store.commands[0]!.id}/result`, headers: { authorization: `Bearer ${credential}` }, payload: { status: 'succeeded', result: {} } });
     await vi.waitFor(() => expect(fetchMock).toHaveBeenCalledTimes(1));
     expect(store.deliveries[0]?.status).toBe('succeeded');
+    const telegramBody = JSON.parse(String(fetchMock.mock.calls[0]?.[1]?.body));
+    expect(telegramBody.text).toContain(`Event ID: ${store.deliveries[0]?.eventId}`);
+    expect(telegramBody.text).toContain(`Delivery ID: ${store.deliveries[0]?.id}`);
   });
 
   it('manages Cloudflare accounts without exposing tokens and syncs paginated zones for operators', async () => {
@@ -630,34 +721,56 @@ describe('control-plane API', () => {
 
   it('reconciles and disables a public hostname while preserving unrelated tunnel ingress', async () => {
     const tunnelId = randomUUID();
+    const accountIdentifier = '2'.repeat(32);
+    const connectorToken = tunnelToken(accountIdentifier, tunnelId);
     const originalIngress = [
       { hostname: 'existing.example.test', service: 'http://existing:8080', originRequest: { noTLSVerify: true } },
     ];
     const catchAll = { service: 'http_status:404' };
     let configReads = 0;
+    let dnsComment: string | undefined;
     const fetchMock = vi.fn<typeof globalThis.fetch>(async (input, init) => {
       const url = String(input);
+      if (init?.method === 'GET' && url.endsWith(`/cfd_tunnel/${tunnelId}/token`)) return cloudflareResponse(connectorToken);
+      if (init?.method === 'GET' && url.endsWith(`/cfd_tunnel/${tunnelId}`)) return cloudflareResponse({ id: tunnelId, account_tag: accountIdentifier, deleted_at: null });
       if (init?.method === 'GET' && url.endsWith('/configurations')) {
         configReads += 1;
         return cloudflareResponse({ config: { ingress: configReads === 1 ? originalIngress : [originalIngress[0], { hostname: 'app.example.test', service: 'http://traefik:80' }, catchAll] } });
       }
+      if (init?.method === 'GET' && url.includes('/dns_records?')) return cloudflareResponse([]);
       if (init?.method === 'PUT' && url.endsWith('/configurations')) return cloudflareResponse({});
-      if (init?.method === 'POST' && url.endsWith('/dns_records')) return cloudflareResponse({ id: 'dns-record-123' });
+      if (init?.method === 'POST' && url.endsWith('/dns_records')) {
+        const body = JSON.parse(String(init.body));
+        dnsComment = body.comment;
+        return cloudflareResponse({ id: 'dns-record-123', ...body });
+      }
+      if (init?.method === 'GET' && url.endsWith('/dns_records/dns-record-123')) return cloudflareResponse({ id: 'dns-record-123', type: 'CNAME', name: 'app.example.test', content: `${tunnelId}.cfargotunnel.com`, proxied: true, comment: dnsComment });
       if (init?.method === 'DELETE' && url.endsWith('/dns_records/dns-record-123')) return cloudflareResponse({ id: 'dns-record-123' });
       throw new Error(`Unexpected request: ${init?.method} ${url}`);
     });
     const { app, store, cookie } = await appWithOwner({ fetch: fetchMock });
-    const accountResponse = await app.inject({ method: 'POST', url: '/api/cloudflare/accounts', headers: { cookie }, payload: { name: 'Edge', accountIdentifier: '2'.repeat(32), apiToken: 'safe-cloudflare-api-token-for-reconciliation' } });
+    const accountResponse = await app.inject({ method: 'POST', url: '/api/cloudflare/accounts', headers: { cookie }, payload: { name: 'Edge', accountIdentifier, apiToken: 'safe-cloudflare-api-token-for-reconciliation' } });
     const accountId = accountResponse.json().account.id;
     await store.syncCloudflareZones(accountId, [{ zoneIdentifier: '3'.repeat(32), name: 'example.test', status: 'active' }]);
     const zoneId = store.cloudflareZones[0]!.id;
     const agent = await store.createAgent('cloudflare-public-agent', hashToken('cloudflare-public-enrollment-long-enough'));
-    const connectorResponse = await app.inject({ method: 'POST', url: '/api/connectors', headers: { cookie }, payload: { name: 'public-tunnel', token: 'connector-token-that-remains-agent-compatible', agentId: agent.id, cloudflareAccountId: accountId, tunnelId } });
+    store.agents.find((item) => item.id === agent.id)!.enrolledAt = new Date().toISOString();
+    const connectorResponse = await app.inject({ method: 'POST', url: '/api/connectors', headers: { cookie }, payload: { name: 'public-tunnel', token: connectorToken, agentId: agent.id } });
     expect(connectorResponse.json().connector).toMatchObject({ cloudflareAccountId: accountId, tunnelId });
     const route = await store.createRoute({ gatewayAgentId: agent.id, name: 'app', hostname: 'app.example.test', exposure: 'tunnel', backends: ['http://app:8080'], enabled: true });
+    route!.status = 'active';
     const created = await app.inject({ method: 'POST', url: '/api/cloudflare/public-hostnames', headers: { cookie }, payload: { zoneId, connectorId: connectorResponse.json().connector.id, routeId: route!.id } });
     expect(created.statusCode).toBe(201);
     expect(created.json().publicHostname).toMatchObject({ hostname: 'app.example.test', dnsRecordId: 'dns-record-123', enabled: true, status: 'active' });
+    for (const mutation of [
+      { url: `/api/cloudflare/accounts/${accountId}`, payload: { enabled: false } },
+      { url: `/api/connectors/${connectorResponse.json().connector.id}`, payload: { enabled: false } },
+      { url: `/api/routes/${route!.id}`, payload: { enabled: false } },
+    ]) {
+      const blocked = await app.inject({ method: 'PATCH', headers: { cookie }, ...mutation });
+      expect(blocked.statusCode).toBe(409);
+      expect(blocked.json().code).toBe('domain_access_dependency_enabled');
+    }
 
     const createPut = fetchMock.mock.calls.find(([, init]) => init?.method === 'PUT')!;
     expect(JSON.parse(String(createPut[1]?.body))).toEqual({ config: { ingress: [
@@ -669,7 +782,7 @@ describe('control-plane API', () => {
     const hostnameId = created.json().publicHostname.id;
     const disabled = await app.inject({ method: 'PATCH', url: `/api/cloudflare/public-hostnames/${hostnameId}`, headers: { cookie }, payload: { enabled: false } });
     expect(disabled.statusCode).toBe(200);
-    expect(disabled.json().publicHostname).toMatchObject({ enabled: false, status: 'active', dnsRecordId: null });
+    expect(disabled.json().publicHostname).toMatchObject({ enabled: false, status: 'disabled', dnsRecordId: null });
     const putCalls = fetchMock.mock.calls.filter(([, init]) => init?.method === 'PUT');
     expect(JSON.parse(String(putCalls[1]![1]?.body))).toEqual({ config: { ingress: [...originalIngress, catchAll] } });
     const deleteIndex = fetchMock.mock.calls.findIndex(([, init]) => init?.method === 'DELETE');
@@ -683,11 +796,14 @@ describe('control-plane API', () => {
   it('rejects mismatched public-hostname relationships and safely rolls back DNS failures', async () => {
     const apiToken = 'rollback-secret-token-that-must-be-redacted';
     const originalIngress = [{ hostname: 'other.example.test', service: 'http://other:80' }, { service: 'http_status:404' }];
-    const fetchMock = vi.fn<typeof globalThis.fetch>()
-      .mockResolvedValueOnce(cloudflareResponse({ config: { ingress: originalIngress } }))
-      .mockResolvedValueOnce(cloudflareResponse({}))
-      .mockResolvedValueOnce(cloudflareResponse({}, { status: 409, success: false, errors: [{ code: 81057, message: `conflict ${apiToken}` }] }))
-      .mockResolvedValueOnce(cloudflareResponse({}));
+    const fetchMock = vi.fn<typeof globalThis.fetch>(async (input, init) => {
+      const url = String(input);
+      if (init?.method === 'GET' && url.includes('/dns_records?')) return cloudflareResponse([]);
+      if (init?.method === 'GET' && url.endsWith('/configurations')) return cloudflareResponse({ config: { ingress: originalIngress } });
+      if (init?.method === 'PUT' && url.endsWith('/configurations')) return cloudflareResponse({});
+      if (init?.method === 'POST' && url.endsWith('/dns_records')) return cloudflareResponse({}, { status: 409, success: false, errors: [{ code: 81057, message: `conflict ${apiToken}` }] });
+      throw new Error(`Unexpected request: ${init?.method} ${url}`);
+    });
     const { app, store, cookie } = await appWithOwner({ fetch: fetchMock });
     const firstAccount = await app.inject({ method: 'POST', url: '/api/cloudflare/accounts', headers: { cookie }, payload: { name: 'First', accountIdentifier: '4'.repeat(32), apiToken } });
     const secondAccount = await app.inject({ method: 'POST', url: '/api/cloudflare/accounts', headers: { cookie }, payload: { name: 'Second', accountIdentifier: '5'.repeat(32), apiToken: 'another-safe-cloudflare-api-token-value' } });
@@ -695,13 +811,16 @@ describe('control-plane API', () => {
     const secondId = secondAccount.json().account.id;
     await store.syncCloudflareZones(firstId, [{ zoneIdentifier: '6'.repeat(32), name: 'example.test', status: 'active' }]);
     const agent = await store.createAgent('rollback-agent', hashToken('rollback-agent-enrollment-token-long-enough'));
-    const connector = await store.createConnector('rollback-tunnel', 'encrypted-agent-token', true, agent.id, secondId, randomUUID());
+    store.agents.find((item) => item.id === agent.id)!.enrolledAt = new Date().toISOString();
+    const rollbackTunnelId = randomUUID();
+    const connector = await store.createConnector({ name: 'rollback-tunnel', encryptedToken: 'encrypted-agent-token', enabled: true, agentId: agent.id, accountId: secondId, accountIdentifier: '5'.repeat(32), tunnelId: rollbackTunnelId });
     const route = await store.createRoute({ gatewayAgentId: agent.id, name: 'rollback', hostname: 'rollback.example.test', exposure: 'tunnel', backends: ['http://rollback:80'], enabled: true });
+    route!.status = 'active';
     const mismatch = await app.inject({ method: 'POST', url: '/api/cloudflare/public-hostnames', headers: { cookie }, payload: { zoneId: store.cloudflareZones[0]!.id, connectorId: connector!.id, routeId: route!.id } });
     expect(mismatch.statusCode).toBe(409);
     expect(fetchMock).not.toHaveBeenCalled();
 
-    await store.updateConnector(connector!.id, { cloudflareAccountId: firstId });
+    await store.updateConnector(connector!.id, { encryptedToken: 'replacement-encrypted-token', accountId: firstId, accountIdentifier: '4'.repeat(32), tunnelId: rollbackTunnelId });
     const failed = await app.inject({ method: 'POST', url: '/api/cloudflare/public-hostnames', headers: { cookie }, payload: { zoneId: store.cloudflareZones[0]!.id, connectorId: connector!.id, routeId: route!.id, proxied: false } });
     expect(failed.statusCode).toBe(502);
     expect(failed.body).toContain('code 81057');

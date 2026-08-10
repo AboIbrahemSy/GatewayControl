@@ -86,6 +86,10 @@ func (e *recordingExecutor) DockerStatus(context.Context) types.DockerStatus {
 	return types.DockerStatus{}
 }
 
+func (e *recordingExecutor) Diagnostics(context.Context) types.Diagnostics {
+	return types.Diagnostics{}
+}
+
 type recordingClient struct {
 	submitted []string
 }

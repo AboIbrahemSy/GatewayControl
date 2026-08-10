@@ -1,8 +1,11 @@
 package config
 
 import (
+	"fmt"
 	"os"
 	"path/filepath"
+	"reflect"
+	"strings"
 	"testing"
 )
 
@@ -149,6 +152,29 @@ func TestLoadEnforcesMinimumMetricsInterval(t *testing.T) {
 	}
 }
 
+func TestLoadBuildsCanonicalBoundedProtectedProjects(t *testing.T) {
+	setRequiredEnvironment(t)
+	t.Setenv("GATEWAY_CONTROL_URL", "https://control.example.test")
+	t.Setenv("GATEWAY_PROTECTED_PROJECTS", "critical_api,gateway-control,critical_api")
+
+	config, err := Load()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !reflect.DeepEqual(config.ProtectedProjects, []string{"gateway-control", "critical_api"}) {
+		t.Fatalf("ProtectedProjects = %#v", config.ProtectedProjects)
+	}
+
+	projects := make([]string, 20)
+	for index := range projects {
+		projects[index] = fmt.Sprintf("project_%d", index)
+	}
+	t.Setenv("GATEWAY_PROTECTED_PROJECTS", strings.Join(projects, ","))
+	if _, err := Load(); err == nil {
+		t.Fatal("expected more than 20 total protected projects to be rejected")
+	}
+}
+
 func setRequiredEnvironment(t *testing.T) {
 	t.Helper()
 	for _, key := range []string{
@@ -165,6 +191,7 @@ func setRequiredEnvironment(t *testing.T) {
 		"GATEWAY_NAS_BACKUP_ROOT", "GATEWAY_NAS_BACKUP_ROOT_FILE", "GATEWAY_HOST_NAS_BACKUP_ROOT", "GATEWAY_HOST_NAS_BACKUP_ROOT_FILE",
 		"GATEWAY_NAS_MARKER", "GATEWAY_NAS_MARKER_FILE", "GATEWAY_METRICS_INTERVAL", "GATEWAY_METRICS_INTERVAL_FILE",
 		"GATEWAY_BACKUP_TIMEOUT", "GATEWAY_BACKUP_TIMEOUT_FILE",
+		"GATEWAY_PROTECTED_PROJECTS", "GATEWAY_PROTECTED_PROJECTS_FILE",
 	} {
 		t.Setenv(key, "")
 		if len(key) > 5 && key[len(key)-5:] == "_FILE" {

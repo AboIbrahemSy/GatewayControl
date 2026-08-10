@@ -12,7 +12,7 @@ It is designed for a single infrastructure owner and supports the `Owner`, `Oper
 - Cloudflare accounts, zone discovery, tunnel connectors, DNS records, and public hostnames.
 - Node telemetry and Compose service health monitoring.
 - Bounded, redacted service-log retrieval.
-- Durable Telegram operational notifications with retries.
+- Durable, at-least-once Telegram operational notifications with retries and stable event/delivery IDs for deduplication and audit.
 - Offline Local and pre-mounted NAS backups for Compose-owned named volumes.
 - Owner-only restore with manifest and SHA-256 verification.
 - PostgreSQL persistence and encrypted server-side secrets.
@@ -64,24 +64,24 @@ Create the local configuration file:
 cp .env.example .env
 ```
 
-Build the agent image and start the control plane:
+Build the Agent and control-plane images for development, then start the stack with the development override:
 
 ```bash
 docker build -t gateway-control-agent:local ./agent
-docker compose up -d --build
+docker compose -f compose.yaml -f compose.dev.yaml up -d --build
 ```
 
 Check container health:
 
 ```bash
 docker compose ps
-curl http://localhost:8080/health
+curl http://localhost:8080/ready
 ```
 
 The health endpoint should return:
 
 ```json
-{"status":"ok"}
+{"status":"ready","release":"development"}
 ```
 
 Open `http://localhost:8080` and complete the first-run wizard to create the initial Owner account.
@@ -101,12 +101,13 @@ Terminate HTTPS at a trusted reverse proxy, forward requests to the control-plan
 
 ## Configuration
 
-The root `.env.example` contains safe local defaults:
+The root `.env.example` contains safe placeholders. Replace registry placeholders before production deployment; `compose.dev.yaml` overrides the control-plane and Agent references with local images for development.
 
 | Variable | Purpose | Default example |
 | --- | --- | --- |
-| `GATEWAY_CONTROL_IMAGE` | Control-plane image | `gateway-control:local` |
-| `GATEWAY_AGENT_IMAGE` | Image placed in generated Agent commands | `gateway-control-agent:local` |
+| `GATEWAY_CONTROL_IMAGE` | Required immutable production control-plane image digest | GHCR placeholder in `.env.example` |
+| `GATEWAY_CONTROL_RELEASE` | Human-readable release returned by liveness and readiness endpoints | Release placeholder |
+| `GATEWAY_AGENT_IMAGE` | Explicit version or digest placed in generated Agent commands | GHCR version placeholder |
 | `CONTROL_HTTP_PORT` | Host port for the control plane | `8080` |
 | `POSTGRES_IMAGE` | PostgreSQL image | `postgres:17-alpine` |
 | `TRAEFIK_IMAGE` | Digest-pinned Traefik image | See `.env.example` |
@@ -114,10 +115,12 @@ The root `.env.example` contains safe local defaults:
 | `SESSION_COOKIE_SECURE` | Restrict session cookies to HTTPS | `false` for local setup |
 | `TRUST_PROXY` | Trust forwarded proxy information | `false` |
 | `GATEWAY_TRAEFIK_DYNAMIC_VOLUME` | Shared Agent and Traefik route volume | `gateway-traefik-dynamic` |
+| `GATEWAY_PROTECTED_PROJECTS` | Bounded comma-separated Compose projects protected by both control plane and generated Agents | `gateway-control` |
 | `GATEWAY_SYSTEM_BACKUP_LOCAL_ROOT` | Control-plane system backup and restore-staging root | `/opt/gateway-control/backups/system` |
 | `GATEWAY_SYSTEM_BACKUP_NAS_ROOT` | Canonical pre-mounted NAS path passed to the control plane and generated Agents | `/mnt/gateway-control-backups` |
 | `GATEWAY_SYSTEM_BACKUP_NAS_MARKER` | Required regular marker file name passed to the control plane and generated Agents | `.gateway-control-nas` |
 | `GATEWAY_SYSTEM_RESTORE_STAGE_ROOT` | Private startup restore staging directory | `/opt/gateway-control/backups/system/.restore-stage` |
+| `UPDATE_BACKUP_ROOT` | Host directory for verified pre-update database dumps | `/opt/gateway-control/backups/pre-update` |
 
 Do not commit `.env`. Database credentials and the control-plane encryption key are generated into a Docker volume during bootstrap.
 
@@ -145,13 +148,18 @@ When the browser opens GatewayControl through `localhost` or `127.0.0.1`, the en
 
 Copy the generated one-time command and run it on the target Linux host with Docker permissions. The command contains a short-lived enrollment secret and must be treated as sensitive until it has been used or expires.
 
-For remote hosts, publish the Agent image to a registry and configure an immutable tag or digest:
+For remote hosts, publish the Agent image to a registry and configure an explicit version or immutable digest:
 
 ```env
 GATEWAY_AGENT_IMAGE=registry.example.com/gateway-control-agent:1.0.0
 ```
 
 Build and publish an image using your registry workflow before generating remote enrollment commands. Avoid mutable `latest` tags.
+
+Agent rollout is independent from control-plane rollout. Updating `GATEWAY_AGENT_IMAGE` changes newly generated enrollment commands; it does not replace already enrolled Agent containers. Review and roll out Agent releases separately on each trusted host.
+
+> [!WARNING]
+> Releases that retire an Agent command have an unavoidable rollout window: an older Agent may already have received that command before the control plane marks queued copies terminal. Update Agents first, or stop them during the control-plane upgrade, then restart only the updated Agents. In particular, updated Agents permanently reject the retired `compose.stack.sync` command and cannot deploy legacy stack YAML.
 
 After enrollment, confirm that the Agent reports both a heartbeat and telemetry in **Agents** and **Monitoring**.
 
@@ -201,6 +209,9 @@ The log viewer accepts only:
 - An optional time within the previous 24 hours.
 
 Log output is size-limited, terminal control sequences are removed, and known credential patterns are redacted. Application logs can still contain sensitive business data, so log access is restricted to Operators and Owners.
+Protected-project logs are Owner-only. Runtime log content is removed after 24 hours while its request audit row and terminal status are retained.
+
+Telegram delivery is explicitly at least once: a timeout can cause Telegram to accept a message before GatewayControl records success, so a retry may duplicate it. Every message includes stable event and delivery IDs that recipients can use for deduplication and audit; GatewayControl does not claim exactly-once delivery.
 
 ## Local Backups
 
@@ -210,15 +221,18 @@ Local backups are stored under this host path by default:
 /opt/gateway-control/backups/local
 ```
 
-Backups are offline-consistent:
+Backups are offline-consistent for application-managed writes:
 
 1. GatewayControl records the services that are currently running.
-2. The Agent stops the stack.
-3. Compose-owned named volumes are archived by the restricted backup helper.
-4. A manifest and SHA-256 checksums are written atomically.
-5. Previously running services are started again.
+2. The Agent stops the entire stack so application writers cannot change PostgreSQL or volume data.
+3. When PostgreSQL logical backup is configured, the Agent starts only the existing database container, waits for readiness, creates the custom dump, and stops PostgreSQL again.
+4. Compose-owned named volumes are archived by the restricted backup helper while the stack remains stopped.
+5. A manifest and SHA-256 checksums are written atomically.
+6. Only services that were running before the backup are started again.
 
 External or ambiguously owned volumes are rejected. Backup archives preserve regular file content, numeric ownership, permissions, and modification times. Filesystem-specific ACLs and extended attributes are not preserved.
+
+This sequence prevents configured Compose application writers, but it cannot coordinate external clients that connect directly to the database or files. Quiesce external writers separately before requesting a backup.
 
 Backup and restore commands retain their Agent lease and may be reclaimed after an interrupted attempt. If an operation remains incomplete for 24 hours, the control plane marks its command and operation as failed, emits a `backup.failed` event, and releases the stack for a new operation.
 
@@ -252,6 +266,16 @@ Only an Owner can request a restore. A restore:
 - Writes a durable restore journal before destructive work.
 
 If a restore is interrupted after destructive work begins, the journal is retained and future restores fail closed. An administrator must inspect the host and reconcile the journal rather than allowing an unsafe automatic replay.
+
+### Explicit System Recovery
+
+Staging an Owner system restore does not change the live database. Normal control-plane startup and `docker compose restart` never apply a staged restore. After reviewing the selected backup and stopping normal operational changes, apply the staged restore explicitly:
+
+```bash
+sh docker/recover.sh
+```
+
+The wrapper requires an immutable control-plane image digest, stops the live control plane, verifies that no application writer remains running, and only then runs the one-shot recovery service. The service waits for PostgreSQL readiness, runs only the staged recovery operation, and exits. After a successful restore, the wrapper recreates the normal control plane and waits for bounded readiness. A failed restore keeps the writer stopped and retains its durable recovery state for safe investigation or retry; it is never replayed by an ordinary restart.
 
 ## Telegram Notifications
 
@@ -309,18 +333,46 @@ docker compose logs -f postgres
 docker compose logs -f traefik
 ```
 
-Restart services:
+Restart services without applying staged recovery:
 
 ```bash
 docker compose restart
 ```
 
-Rebuild and apply source updates:
+### Development Build
+
+Local source development uses the explicit override and local image:
 
 ```bash
 docker build -t gateway-control-agent:local ./agent
-docker compose up -d --build
+docker compose -f compose.yaml -f compose.dev.yaml up -d --build
 ```
+
+### Production GHCR Deployment and Update
+
+Publish the control-plane image to your GHCR namespace, resolve its immutable digest, and set both the digest and release label explicitly. Do not use the placeholder organization or a mutable tag:
+
+```bash
+export GATEWAY_CONTROL_IMAGE='ghcr.io/your-org/gateway-control@sha256:<64-hex-digest>'
+export GATEWAY_CONTROL_RELEASE='1.2.3'
+sh docker/deploy.sh
+```
+
+For an existing production installation, use the update helper from the repository root:
+
+```bash
+GATEWAY_CONTROL_IMAGE='ghcr.io/your-org/gateway-control@sha256:<64-hex-digest>' \
+GATEWAY_CONTROL_RELEASE='1.2.3' \
+sh docker/update.sh
+```
+
+The helper refuses mutable images, unsafe restore paths, and staged restores. It pulls the target image while the old writer remains available, then stops and verifies the control plane before writing a mode `0600` PostgreSQL custom dump under the mode `0700` `UPDATE_BACKUP_ROOT`. It validates the dump with `pg_restore --list`, publishes and synchronizes a SHA-256 manifest, and recreates only `control-plane`; PostgreSQL, Traefik, bootstrap, and volumes are not recreated. Failures before recreation restart only the existing stopped container. Readiness uses bounded host requests and reports `GATEWAY_CONTROL_RELEASE`.
+
+Database migrations are forward-only, checksum-protected, and run under a PostgreSQL advisory lock. Use expand/contract changes across releases: add compatible schema first, deploy readers and writers that tolerate both forms, and remove obsolete schema only in a later reviewed release. Never edit an applied SQL migration.
+
+An image rollback is not a database rollback. If readiness fails, the helper retains the pre-update backup and prints the previous image reference, but performs no automatic restore or destructive rollback. Prefer a forward fix. Restore a database only through a separately reviewed manual recovery plan that accounts for changes made after the backup.
+
+Keep the PostgreSQL client used for dumps and restores compatible with the server major version. Before changing `POSTGRES_IMAGE` across major versions, follow PostgreSQL's supported upgrade procedure and verify dump/restore compatibility separately; changing the image value is not a major-version upgrade procedure.
 
 Stop the control plane while retaining data:
 

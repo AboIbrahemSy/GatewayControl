@@ -17,7 +17,7 @@ function message(delivery: NotificationDelivery): string {
     .filter(([, value]) => ['string', 'number', 'boolean'].includes(typeof value))
     .slice(0, 10)
     .map(([key, value]) => `${key}: ${String(value).slice(0, 300)}`);
-  return [`Gateway Control: ${delivery.eventType}`, `Occurred: ${delivery.occurredAt}`, ...details].join('\n');
+  return [`Gateway Control: ${delivery.eventType}`, `Event ID: ${delivery.eventId}`, `Delivery ID: ${delivery.id}`, `Occurred: ${delivery.occurredAt}`, ...details].join('\n');
 }
 
 export class NotificationDispatcher {
@@ -43,6 +43,7 @@ export class NotificationDispatcher {
     try {
       await this.options.store.sweepOfflineAgents(new Date(Date.now() - (this.options.offlineAfterMs ?? 3 * 60_000)));
       await this.options.store.failStaleCommands(new Date(Date.now() - (this.options.commandStaleAfterMs ?? 24 * 60 * 60_000)));
+      await this.options.store.purgeRuntimeLogResults(new Date(Date.now() - 24 * 60 * 60_000));
       const delivery = await this.options.store.claimNotificationDelivery();
       if (!delivery) return;
       await this.dispatch(delivery);

@@ -11,18 +11,19 @@ import {
   TriangleAlert,
   type LucideIcon,
 } from "lucide-react";
-import { useEffect, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import {
   api,
   ApiError,
   type CloudflareAccount,
-  type CloudflarePublicHostname,
+  type CloudflareDomainAccess,
   type CloudflareZone,
   type Connector,
   type ManagedRoute,
   type Role,
 } from "./api";
 import type { Locale, MessageKey, Translate } from "./App";
+import { HelpPopover } from "./HelpPopover";
 import { Modal } from "./Modal";
 
 type Tab = "accounts" | "zones" | "hostnames";
@@ -52,13 +53,13 @@ export function CloudflareManagementPage({
   >({});
   const [connectors, setConnectors] = useState<Connector[]>([]);
   const [routes, setRoutes] = useState<ManagedRoute[]>([]);
-  const [publicHostnames, setPublicHostnames] = useState<
-    CloudflarePublicHostname[]
-  >([]);
+  const [domainAccess, setDomainAccess] = useState<CloudflareDomainAccess[]>([]);
   const [selectedAccountId, setSelectedAccountId] = useState("");
   const [loading, setLoading] = useState(true);
   const [busy, setBusy] = useState("");
   const [error, setError] = useState("");
+  const [accountModalError, setAccountModalError] = useState("");
+  const [domainModalError, setDomainModalError] = useState("");
   const [success, setSuccess] = useState("");
   const [createModal, setCreateModal] = useState<"account" | "hostname" | null>(
     null,
@@ -70,7 +71,12 @@ export function CloudflareManagementPage({
   const [zoneId, setZoneId] = useState("");
   const [connectorId, setConnectorId] = useState("");
   const [routeId, setRouteId] = useState("");
+  const [accessMethod, setAccessMethod] = useState<"tunnel" | "public_ip">("tunnel");
+  const [publicIpv4, setPublicIpv4] = useState("");
+  const [publicIpv6, setPublicIpv6] = useState("");
   const [proxied, setProxied] = useState(true);
+  const [wizardStep, setWizardStep] = useState(1);
+  const accountSelectionGeneration = useRef(0);
 
   async function load() {
     setLoading(true);
@@ -81,12 +87,12 @@ export function CloudflareManagementPage({
           api.cloudflareAccounts(),
           api.connectors(),
           api.routes(),
-          api.cloudflarePublicHostnames(),
+          api.cloudflareDomainAccess(),
         ]);
       setAccounts(accountResult.accounts);
       setConnectors(connectorResult.connectors);
       setRoutes(routeResult.routes);
-      setPublicHostnames(hostnameResult.publicHostnames);
+      setDomainAccess(hostnameResult.domainAccess);
       const selected =
         selectedAccountId &&
         accountResult.accounts.some(
@@ -125,28 +131,38 @@ export function CloudflareManagementPage({
   }, []);
 
   async function selectAccount(id: string, openZones = false) {
+    const generation = ++accountSelectionGeneration.current;
     setSelectedAccountId(id);
+    setZoneId("");
+    setConnectorId("");
+    setRouteId("");
     setError("");
     setSuccess("");
     if (openZones) setTab("zones");
+    if (!id) {
+      setBusy("");
+      return;
+    }
     setBusy(`zones:${id}`);
     try {
       const result = await api.cloudflareZones(id);
+      if (generation !== accountSelectionGeneration.current) return;
       setZonesByAccount((current) => ({ ...current, [id]: result.zones }));
       setZoneId(result.zones[0]?.id || "");
     } catch (caught) {
+      if (generation !== accountSelectionGeneration.current) return;
       setError(friendlyError(caught, t));
     } finally {
-      setBusy("");
+      if (generation === accountSelectionGeneration.current) setBusy("");
     }
   }
 
   async function createAccount(event: React.FormEvent) {
     event.preventDefault();
-    setError("");
+    setAccountModalError("");
     setSuccess("");
     if (!/^[a-fA-F0-9]{32}$/.test(accountIdentifier) || apiToken.length < 20) {
-      setError(t("validationError"));
+      setAccountModalError(t("validationError"));
       return;
     }
     setBusy("create-account");
@@ -167,7 +183,7 @@ export function CloudflareManagementPage({
       setCreateModal(null);
       setSuccess(t("cloudflareAccountCreated"));
     } catch (caught) {
-      setError(friendlyError(caught, t));
+      setAccountModalError(friendlyError(caught, t));
     } finally {
       setBusy("");
     }
@@ -225,72 +241,84 @@ export function CloudflareManagementPage({
   const selectedZone = Object.values(zonesByAccount)
     .flat()
     .find((zone) => zone.id === zoneId);
+  const selectedRoute = routes.find((route) => route.id === routeId);
   const eligibleConnectors = connectors.filter(
     (connector) =>
       connector.enabled &&
-      connector.tunnelId &&
-      connector.cloudflareAccountId === selectedZone?.cloudflareAccountId,
+      connector.identityStatus === "verified" &&
+      connector.tokenTunnelId && connector.tunnelId === connector.tokenTunnelId &&
+      connector.cloudflareAccountId === selectedZone?.cloudflareAccountId &&
+      (!selectedRoute || connector.agentId === selectedRoute.gatewayAgentId),
   );
   const eligibleRoutes = routes.filter(
     (route) =>
       route.enabled &&
-      route.exposure === "tunnel" &&
+      route.status === "active" &&
       selectedZone &&
       hostnameWithinZone(route.hostname, selectedZone.name),
   );
 
-  async function createPublicHostname(event: React.FormEvent) {
+  const parsedIpv4 = parseIpList(publicIpv4);
+  const parsedIpv6 = parseIpList(publicIpv6);
+
+  function advanceWizard() {
+    setDomainModalError("");
+    if (wizardStep === 1 && (!selectedAccountId || !zoneId || !routeId)) return setDomainModalError(t("validationError"));
+    if (wizardStep === 2 && selectedRoute?.exposure !== (accessMethod === "tunnel" ? "tunnel" : "public")) return setDomainModalError(t("domainAccessRouteMethodMismatch"));
+    if (wizardStep === 3 && ((accessMethod === "tunnel" && !connectorId) || (accessMethod === "public_ip" && (parsedIpv4.length + parsedIpv6.length === 0 || parsedIpv4.length > 4 || parsedIpv6.length > 4)))) return setDomainModalError(t("validationError"));
+    setWizardStep((current) => Math.min(4, current + 1));
+  }
+
+  async function createDomainAccess(event: React.FormEvent) {
     event.preventDefault();
-    setError("");
+    setDomainModalError("");
     setSuccess("");
-    if (!zoneId || !connectorId || !routeId) {
-      setError(t("validationError"));
+    if (!selectedAccountId || !zoneId || !routeId || (accessMethod === "tunnel" && !connectorId) || (accessMethod === "public_ip" && parsedIpv4.length + parsedIpv6.length === 0)) {
+      setDomainModalError(t("validationError"));
       return;
     }
     setBusy("create-hostname");
     try {
-      const result = await api.createCloudflarePublicHostname({
+      const result = await api.createCloudflareDomainAccess({
+        accountId: selectedAccountId,
         zoneId,
-        connectorId,
         routeId,
+        accessMethod,
+        ...(accessMethod === "tunnel" ? { connectorId } : { publicIpv4: parsedIpv4, publicIpv6: parsedIpv6 }),
         proxied,
       });
-      setPublicHostnames((current) => [result.publicHostname, ...current]);
+      setDomainAccess((current) => [result.domainAccess, ...current]);
       setConnectorId("");
       setRouteId("");
+      setAccessMethod("tunnel");
+      setPublicIpv4("");
+      setPublicIpv6("");
       setProxied(true);
+      setWizardStep(1);
       setCreateModal(null);
-      setSuccess(t("publicHostnameCreated"));
+      setSuccess(t("domainAccessCreated"));
     } catch (caught) {
-      setError(friendlyError(caught, t));
+      setDomainModalError(friendlyError(caught, t));
     } finally {
       setBusy("");
     }
   }
 
-  async function togglePublicHostname(item: CloudflarePublicHostname) {
-    setBusy(`hostname:${item.id}`);
+  async function domainAccessAction(item: CloudflareDomainAccess, action: "toggle" | "reconcile") {
+    setBusy(`access:${item.id}`);
     setError("");
     setSuccess("");
     try {
-      const result = await api.updateCloudflarePublicHostname(
-        item.id,
-        item.status === "failed" ? true : !item.enabled,
+      const result = action === "reconcile"
+        ? await api.reconcileCloudflareDomainAccess(item.id)
+        : await api.updateCloudflareDomainAccess(item.id, !item.enabled);
+      setDomainAccess((current) =>
+        current.map((access) => access.id === item.id ? result.domainAccess : access),
       );
-      setPublicHostnames((current) =>
-        current.map((hostname) =>
-          hostname.id === item.id ? result.publicHostname : hostname,
-        ),
-      );
-      setSuccess(
-        t(
-          item.status === "failed"
-            ? "publicHostnameRetryQueued"
-            : "publicHostnameUpdated",
-        ),
-      );
+      setSuccess(t(action === "reconcile" ? "domainAccessReconciled" : "domainAccessUpdated"));
     } catch (caught) {
       setError(friendlyError(caught, t));
+      try { setDomainAccess((await api.cloudflareDomainAccess()).domainAccess); } catch { /* Keep the primary error visible. */ }
     } finally {
       setBusy("");
     }
@@ -306,21 +334,21 @@ export function CloudflareManagementPage({
               Cloudflare
             </p>
             <h1 className="pt-3 text-3xl font-black tracking-[-0.045em] sm:text-4xl">
-              {t("cloudflareManagementTitle")}
+              {t("domainAccessTitle")}
             </h1>
             <p className="max-w-2xl pt-3 text-sm font-medium leading-7 text-stone-400 sm:text-base">
-              {t("cloudflareManagementDescription")}
+              {t("domainAccessDescription")}
             </p>
           </div>
           <div className="grid grid-cols-3 gap-2 rounded-2xl border border-white/10 bg-white/[0.04] p-2 text-center">
-            <HeroStat value={accounts.length} label={t("cloudflareAccounts")} />
+            <HeroStat value={new Intl.NumberFormat(locale).format(accounts.length)} label={t("cloudflareAccounts")} />
             <HeroStat
-              value={Object.values(zonesByAccount).flat().length}
+              value={new Intl.NumberFormat(locale).format(Object.values(zonesByAccount).flat().length)}
               label={t("cloudflareZones")}
             />
             <HeroStat
-              value={publicHostnames.length}
-              label={t("publicHostnames")}
+              value={new Intl.NumberFormat(locale).format(domainAccess.length)}
+              label={t("domainAccess")}
             />
           </div>
         </div>
@@ -328,14 +356,14 @@ export function CloudflareManagementPage({
       <div className="max-w-full overflow-hidden rounded-2xl border border-stone-200/80 bg-white/70 p-1.5 dark:border-white/[0.07] dark:bg-white/[0.025]">
         <div
           role="tablist"
-          aria-label={t("cloudflareManagementTitle")}
+          aria-label={t("domainAccessTitle")}
           className="flex max-w-full gap-1 overflow-x-auto overscroll-x-contain"
         >
           {(
             [
               ["accounts", "cloudflareAccounts", KeyRound],
               ["zones", "cloudflareZones", Globe2],
-              ["hostnames", "publicHostnames", Link2],
+               ["hostnames", "domainAccess", Link2],
             ] as Array<[Tab, MessageKey, LucideIcon]>
           ).map(([value, label, Icon]) => (
             <button
@@ -365,14 +393,15 @@ export function CloudflareManagementPage({
           accounts={accounts}
           selectedAccountId={selectedAccountId}
           busy={busy}
+          modalError={accountModalError}
           createOpen={createModal === "account"}
-          openCreate={() => setCreateModal("account")}
+           openCreate={() => { setAccountModalError(""); setError(""); setSuccess(""); setCreateModal("account") }}
           closeCreate={() => {
             setAccountName("");
             setAccountIdentifier("");
             setApiToken("");
             setAccountEnabled(true);
-            setError("");
+             setAccountModalError("");
             setCreateModal(null);
           }}
           form={{
@@ -404,31 +433,41 @@ export function CloudflareManagementPage({
         />
       ) : (
         <HostnamesArea
+           modalError={domainModalError}
           t={t}
           role={role}
           zones={Object.values(zonesByAccount).flat()}
           connectors={connectors}
           routes={routes}
-          publicHostnames={publicHostnames}
+           domainAccess={domainAccess}
           selectedAccountId={selectedAccountId}
           zoneId={zoneId}
           connectorId={connectorId}
-          routeId={routeId}
-          proxied={proxied}
+           routeId={routeId}
+           accessMethod={accessMethod}
+           publicIpv4={publicIpv4}
+           publicIpv6={publicIpv6}
+           proxied={proxied}
+           wizardStep={wizardStep}
           eligibleConnectors={eligibleConnectors}
           eligibleRoutes={eligibleRoutes}
           busy={busy}
           createOpen={createModal === "hostname"}
-          openCreate={() => setCreateModal("hostname")}
+           openCreate={() => { setDomainModalError(""); setError(""); setSuccess(""); setCreateModal("hostname") }}
           closeCreate={() => {
-            setConnectorId("");
-            setRouteId("");
-            setProxied(true);
-            setError("");
+             setConnectorId("");
+             setRouteId("");
+             setAccessMethod("tunnel");
+             setPublicIpv4("");
+             setPublicIpv6("");
+             setProxied(true);
+             setWizardStep(1);
+             setDomainModalError("");
             setCreateModal(null);
           }}
-          setSelectedAccountId={(id) => {
-            setSelectedAccountId(id);
+           setSelectedAccountId={(id) => {
+             accountSelectionGeneration.current += 1;
+             setSelectedAccountId(id);
             setZoneId(zonesByAccount[id]?.[0]?.id || "");
             setConnectorId("");
             setRouteId("");
@@ -438,11 +477,16 @@ export function CloudflareManagementPage({
             setConnectorId("");
             setRouteId("");
           }}
-          setConnectorId={setConnectorId}
-          setRouteId={setRouteId}
-          setProxied={setProxied}
-          submit={createPublicHostname}
-          toggle={(item) => void togglePublicHostname(item)}
+           setConnectorId={setConnectorId}
+           setRouteId={setRouteId}
+           setAccessMethod={(method) => { setAccessMethod(method); setConnectorId(""); setRouteId(""); setPublicIpv4(""); setPublicIpv6("") }}
+           setPublicIpv4={setPublicIpv4}
+           setPublicIpv6={setPublicIpv6}
+           setProxied={setProxied}
+           setWizardStep={setWizardStep}
+           next={advanceWizard}
+           submit={createDomainAccess}
+           action={(item, action) => void domainAccessAction(item, action)}
           accounts={accounts}
         />
       )}
@@ -469,6 +513,7 @@ function AccountsArea({
   accounts,
   selectedAccountId,
   busy,
+  modalError,
   createOpen,
   openCreate,
   closeCreate,
@@ -483,6 +528,7 @@ function AccountsArea({
   accounts: CloudflareAccount[];
   selectedAccountId: string;
   busy: string;
+  modalError: string;
   createOpen: boolean;
   openCreate: () => void;
   closeCreate: () => void;
@@ -508,14 +554,21 @@ function AccountsArea({
           description={t("cloudflareCredentialsHint")}
           closeLabel={t("cancel")}
           busy={busy === "create-account"}
-          maxWidthClass="max-w-5xl"
+          maxWidthClass="max-w-3xl"
           onClose={closeCreate}
         >
-          <form onSubmit={form.submit}>
-          <div className="grid grid-cols-1 gap-5 p-5 sm:p-6 lg:grid-cols-2 2xl:grid-cols-12 items-start">
-            <div className="2xl:col-span-3">
+          <form onSubmit={form.submit} className="flex min-h-0 flex-col">
+            {modalError && <div className="px-5 pt-5 sm:px-6"><Alert>{modalError}</Alert></div>}
+            <div className="flex items-start justify-between gap-3 border-b border-stone-200/80 px-5 py-4 dark:border-white/[0.06] sm:px-6">
+              <p className="max-w-xl text-xs font-semibold leading-5 text-stone-500 dark:text-stone-400">
+                {t("cloudflareCredentialsHelpSummary")}
+              </p>
+              <CloudflareCredentialsHelp t={t} />
+            </div>
+            <div className="grid grid-cols-1 items-start gap-4 p-5 sm:grid-cols-2 sm:p-6">
               <Field label={t("accountName")}>
                 <input
+                  autoFocus
                   required
                   maxLength={120}
                   value={form.accountName}
@@ -523,8 +576,6 @@ function AccountsArea({
                   className={inputClass}
                 />
               </Field>
-            </div>
-            <div className="2xl:col-span-3">
               <Field
                 label={t("accountIdentifier")}
                 hint={t("accountIdentifierHint")}
@@ -542,46 +593,37 @@ function AccountsArea({
                   className={`${inputClass} text-left font-mono`}
                 />
               </Field>
-            </div>
-            <div className="2xl:col-span-3">
+              <div className="sm:col-span-2">
               <Field
                 label={t("cloudflareApiToken")}
                 hint={t("apiTokenNeverShown")}
               >
                 <input
                   required
+                  dir="ltr"
                   type="password"
                   minLength={20}
                   autoComplete="new-password"
                   value={form.apiToken}
                   onChange={(event) => form.setApiToken(event.target.value)}
-                  className={inputClass}
+                  className={`${inputClass} text-left font-mono`}
                 />
               </Field>
+              </div>
             </div>
-            <div className="flex flex-col gap-2 2xl:col-span-1">
-              <span
-                className="hidden text-xs font-extrabold text-transparent select-none 2xl:block"
-                aria-hidden="true"
-              >
-                &nbsp;
-              </span>
-              <div className="flex h-12 items-center gap-3">
+            <footer className="flex flex-col gap-4 border-t border-stone-200/80 p-5 dark:border-white/[0.06] sm:flex-row sm:items-center sm:justify-between sm:px-6 sm:py-4">
+              <div className="flex min-h-11 items-center gap-3">
                 <Toggle
                   enabled={form.accountEnabled}
                   setEnabled={form.setAccountEnabled}
-                  label={t("enabled")}
+                  label={t(form.accountEnabled ? "enabled" : "disabled")}
                 />
-                <span className="text-xs font-extrabold">{t("enabled")}</span>
+                <span className="text-xs font-extrabold">{t(form.accountEnabled ? "enabled" : "disabled")}</span>
               </div>
-            </div>
-            <div className="flex flex-col gap-2 2xl:col-span-2">
-              <span
-                className="hidden text-xs font-extrabold text-transparent select-none 2xl:block"
-                aria-hidden="true"
-              >
-                &nbsp;
-              </span>
+              <div className="grid grid-cols-2 gap-2 sm:flex">
+                <button type="button" disabled={busy === "create-account"} className={secondaryButton} onClick={closeCreate}>
+                  {t("cancel")}
+                </button>
               <button
                 disabled={busy === "create-account"}
                 className={primaryButton}
@@ -589,8 +631,8 @@ function AccountsArea({
                 <Plus size={17} />
                 {t("addAccount")}
               </button>
-            </div>
-          </div>
+              </div>
+            </footer>
           </form>
         </Modal>
       )}
@@ -703,6 +745,27 @@ function AccountsArea({
   );
 }
 
+function CloudflareCredentialsHelp({ t }: { t: Translate }) {
+  return (
+    <HelpPopover label={t("credentialsHelp")} title={t("cloudflareCredentialsHelpTitle")} closeLabel={t("close")}>
+      <p>{t("cloudflareAccountIdSteps")}</p>
+      <p>{t("cloudflareApiTokenSteps")}</p>
+      <div>
+        <p className="font-extrabold text-ink-900 dark:text-white">{t("cloudflareRequiredScopes")}</p>
+        <ul className="list-disc space-y-1 pt-1 ps-4">
+          <li><bdi dir="ltr">Account / Cloudflare Tunnel / Edit</bdi></li>
+          <li><bdi dir="ltr">Zone / Zone / Read</bdi></li>
+          <li><bdi dir="ltr">Zone / DNS / Edit</bdi></li>
+        </ul>
+      </div>
+      <div className="flex flex-wrap gap-x-4 gap-y-2">
+        <a href="https://dash.cloudflare.com/" target="_blank" rel="noreferrer" className="font-extrabold text-mint-600 underline underline-offset-4 dark:text-mint-300">{t("openCloudflareDashboard")}</a>
+        <a href="https://dash.cloudflare.com/profile/api-tokens" target="_blank" rel="noreferrer" className="font-extrabold text-mint-600 underline underline-offset-4 dark:text-mint-300">{t("openCloudflareApiTokens")}</a>
+      </div>
+    </HelpPopover>
+  );
+}
+
 function ZonesArea({
   t,
   accounts,
@@ -790,18 +853,23 @@ function ZonesArea({
 }
 
 type HostnamesAreaProps = {
+  modalError: string;
   t: Translate;
   role: Role;
   accounts: CloudflareAccount[];
   zones: CloudflareZone[];
   connectors: Connector[];
   routes: ManagedRoute[];
-  publicHostnames: CloudflarePublicHostname[];
+  domainAccess: CloudflareDomainAccess[];
   selectedAccountId: string;
   zoneId: string;
   connectorId: string;
   routeId: string;
+  accessMethod: "tunnel" | "public_ip";
+  publicIpv4: string;
+  publicIpv6: string;
   proxied: boolean;
+  wizardStep: number;
   eligibleConnectors: Connector[];
   eligibleRoutes: ManagedRoute[];
   busy: string;
@@ -812,9 +880,14 @@ type HostnamesAreaProps = {
   setZoneId: (value: string) => void;
   setConnectorId: (value: string) => void;
   setRouteId: (value: string) => void;
+  setAccessMethod: (value: "tunnel" | "public_ip") => void;
+  setPublicIpv4: (value: string) => void;
+  setPublicIpv6: (value: string) => void;
   setProxied: (value: boolean) => void;
+  setWizardStep: (value: number) => void;
+  next: () => void;
   submit: (event: React.FormEvent) => void;
-  toggle: (item: CloudflarePublicHostname) => void;
+  action: (item: CloudflareDomainAccess, action: "toggle" | "reconcile") => void;
 };
 
 function HostnamesArea(props: HostnamesAreaProps) {
@@ -825,22 +898,32 @@ function HostnamesArea(props: HostnamesAreaProps) {
         <div className="flex justify-end">
           <button type="button" className={primaryButton} onClick={props.openCreate}>
             <Plus size={17} />
-            {t("publishHostname")}
+            {t("createDomainAccess")}
           </button>
         </div>
       )}
       {props.role !== "viewer" && (
         <Modal
           open={props.createOpen}
-          title={t("publishHostname")}
-          description={t("publicHostnameRelationshipHint")}
+          title={t("createDomainAccess")}
+          description={t("domainAccessWizardHint")}
           closeLabel={t("cancel")}
           busy={props.busy === "create-hostname"}
           maxWidthClass="max-w-6xl"
           onClose={props.closeCreate}
         >
-          <form onSubmit={props.submit}>
-          <div className="grid grid-cols-1 gap-5 p-5 sm:p-6 lg:grid-cols-2 2xl:grid-cols-4">
+          <form onSubmit={props.submit} className="min-w-0">
+          {props.modalError && <div className="px-5 pt-5 sm:px-6"><Alert>{props.modalError}</Alert></div>}
+          <div className="grid grid-cols-4 gap-1 border-b border-stone-200/80 p-4 dark:border-white/[0.06] sm:gap-2 sm:p-6">
+            {["domainAccessScope", "accessMethod", "domainAccessTarget", "review"].map((label, index) => (
+              <div key={label} className={`min-w-0 rounded-xl px-2 py-2 text-center text-[0.62rem] font-extrabold sm:px-3 sm:text-xs ${props.wizardStep === index + 1 ? "bg-ink-900 text-white dark:bg-mint-400 dark:text-ink-950" : "bg-stone-100 text-stone-400 dark:bg-white/5"}`}>
+                <span dir="ltr" className="block text-[0.56rem] opacity-70">{index + 1}/4</span>
+                <span className="block truncate pt-1">{t(label as MessageKey)}</span>
+              </div>
+            ))}
+          </div>
+          <div className="min-h-[18rem] p-5 sm:p-6">
+          {props.wizardStep === 1 && <div className="grid grid-cols-1 gap-5 lg:grid-cols-3">
             <RelationshipField number="01" label={t("cloudflareAccount")}>
               <select
                 value={props.selectedAccountId}
@@ -868,9 +951,9 @@ function HostnamesArea(props: HostnamesAreaProps) {
               >
                 <option value="">{t("chooseZone")}</option>
                 {props.zones
-                  .filter(
-                    (zone) =>
-                      zone.cloudflareAccountId === props.selectedAccountId,
+                   .filter(
+                     (zone) =>
+                       zone.cloudflareAccountId === props.selectedAccountId && zone.status === "active",
                   )
                   .map((zone) => (
                     <option key={zone.id} value={zone.id}>
@@ -879,73 +962,83 @@ function HostnamesArea(props: HostnamesAreaProps) {
                   ))}
               </select>
             </RelationshipField>
-            <RelationshipField number="03" label={t("cloudflareConnector")}>
-              <select
-                required
-                disabled={!props.zoneId}
-                value={props.connectorId}
-                onChange={(event) => props.setConnectorId(event.target.value)}
-                className={inputClass}
-              >
-                <option value="">{t("chooseTunnelConnector")}</option>
-                {props.eligibleConnectors.map((connector) => (
-                  <option key={connector.id} value={connector.id}>
-                    {connector.name}
-                  </option>
-                ))}
-              </select>
-            </RelationshipField>
-            <RelationshipField number="04" label={t("tunnelRoute")}>
+            <RelationshipField number="03" label={t("domainRoute")}>
               <select
                 required
                 disabled={!props.zoneId}
                 value={props.routeId}
-                onChange={(event) => props.setRouteId(event.target.value)}
+                onChange={(event) => { props.setRouteId(event.target.value); props.setConnectorId(""); }}
                 className={inputClass}
               >
-                <option value="">{t("chooseEligibleRoute")}</option>
+                <option value="">{t("chooseActiveDomainRoute")}</option>
                 {props.eligibleRoutes.map((route) => (
                   <option key={route.id} value={route.id}>
-                    {route.hostname}
+                    {route.hostname} - {t(route.exposure === "tunnel" ? "tunnel" : "publicIp")}
                   </option>
                 ))}
               </select>
             </RelationshipField>
-          </div>
-          <div className="flex flex-col gap-4 border-t border-stone-200/80 p-5 dark:border-white/[0.06] sm:flex-row sm:items-center sm:justify-between sm:p-6">
-            <div className="flex items-center gap-3">
+          </div>}
+          {props.wizardStep === 2 && <div role="radiogroup" aria-label={t("accessMethod")} className="grid grid-cols-1 gap-4 md:grid-cols-2">
+            {(["tunnel", "public_ip"] as const).map((method) => (
+              <button key={method} type="button" role="radio" aria-checked={props.accessMethod === method} onClick={() => { props.setAccessMethod(method); props.setConnectorId(""); }} className={`min-h-40 rounded-2xl border p-5 text-start transition ${props.accessMethod === method ? "border-mint-400 bg-mint-400/10 ring-4 ring-mint-400/10" : "border-stone-200 bg-white/50 dark:border-white/10 dark:bg-white/[0.02]"}`}>
+                <span className="text-base font-black text-ink-900 dark:text-white">{t(method === "tunnel" ? "tunnel" : "publicIp")}</span>
+                <span className="block pt-3 text-xs font-medium leading-6 text-stone-500 dark:text-stone-400">{t(method === "tunnel" ? "domainAccessTunnelPath" : "domainAccessPublicPath")}</span>
+              </button>
+            ))}
+          </div>}
+          {props.wizardStep === 3 && <div className="flex flex-col gap-5">
+            {props.accessMethod === "tunnel" ? <Field label={t("cloudflareConnector")} hint={t("sameAgentConnectorHint")}>
+              <select required value={props.connectorId} onChange={(event) => props.setConnectorId(event.target.value)} className={inputClass}>
+                <option value="">{t("chooseTunnelConnector")}</option>
+                {props.eligibleConnectors.map((connector) => <option key={connector.id} value={connector.id}>{connector.name}</option>)}
+              </select>
+            </Field> : <div className="grid grid-cols-1 gap-5 md:grid-cols-2">
+              <Field label={t("publicIpv4")} hint={t("publicIpListPerFamilyHint")}><textarea dir="ltr" rows={4} value={props.publicIpv4} onChange={(event) => props.setPublicIpv4(event.target.value)} className={`${inputClass} h-auto py-3 font-mono`} placeholder="198.41.0.4" /></Field>
+              <Field label={t("publicIpv6")} hint={t("publicIpListPerFamilyHint")}><textarea dir="ltr" rows={4} value={props.publicIpv6} onChange={(event) => props.setPublicIpv6(event.target.value)} className={`${inputClass} h-auto py-3 font-mono`} placeholder="2606:4700:4700::1111" /></Field>
+            </div>}
+            <div className="flex items-center gap-3 rounded-2xl border border-stone-200/80 p-4 dark:border-white/10">
               <Toggle
                 enabled={props.proxied}
                 setEnabled={props.setProxied}
-                label={t("proxied")}
+                label={t(props.proxied ? "proxied" : "dnsOnly")}
               />
               <div>
                 <p className="text-xs font-extrabold text-ink-900 dark:text-white">
-                  {t("proxied")}
+                  {t(props.proxied ? "proxied" : "dnsOnly")}
                 </p>
                 <p className="pt-1 text-[0.66rem] font-medium text-stone-400">
                   {t("proxiedHint")}
                 </p>
               </div>
             </div>
-            <button
-              disabled={
-                props.busy === "create-hostname" ||
-                !props.zoneId ||
-                !props.connectorId ||
-                !props.routeId
-              }
-              className={primaryButton}
-            >
-              <Plus size={17} />
-              {t("publishHostname")}
-            </button>
+          </div>}
+          {props.wizardStep === 4 && <div className="grid grid-cols-1 gap-5 lg:grid-cols-[1fr_1fr]">
+            <div className="rounded-2xl bg-ink-900 p-5 text-white">
+              <p className="text-xs font-extrabold text-orange-300">{t("trafficPath")}</p>
+              <bdi dir="ltr" className="block break-all pt-4 font-mono text-sm">{props.routes.find((route) => route.id === props.routeId)?.hostname || t("unknown")}</bdi>
+              <p className="pt-4 text-sm font-bold">{t(props.accessMethod === "tunnel" ? "domainAccessTunnelReview" : "domainAccessPublicReview")}</p>
+            </div>
+            <div className="grid grid-cols-1 gap-3 sm:grid-cols-2">
+              <Meta label={t("cloudflareAccount")} value={props.accounts.find((account) => account.id === props.selectedAccountId)?.name || t("unknown")} />
+              <Meta label={t("cloudflareZone")} value={props.zones.find((zone) => zone.id === props.zoneId)?.name || t("unknown")} technical />
+              <Meta label={t("domainRoute")} value={props.routes.find((route) => route.id === props.routeId)?.name || t("unknown")} />
+              <Meta label={t("accessMethod")} value={t(props.accessMethod === "tunnel" ? "tunnel" : "publicIp")} />
+              {props.accessMethod === "tunnel" ? <Meta label={t("cloudflareConnector")} value={props.connectors.find((connector) => connector.id === props.connectorId)?.name || t("unknown")} /> : <Meta label={t("publicIp")} value={[...parseIpList(props.publicIpv4), ...parseIpList(props.publicIpv6)].join(", ")} technical />}
+              <Meta label={t("proxyMode")} value={t(props.proxied ? "proxied" : "dnsOnly")} />
+            </div>
+            <div className="lg:col-span-2"><Notice>{t("domainAccessOwnershipWarning")}</Notice></div>
+          </div>}
+          </div>
+          <div className="flex flex-col-reverse gap-3 border-t border-stone-200/80 p-5 dark:border-white/[0.06] sm:flex-row sm:justify-between sm:p-6">
+            <button type="button" disabled={props.wizardStep === 1 || props.busy === "create-hostname"} onClick={() => props.setWizardStep(Math.max(1, props.wizardStep - 1))} className={secondaryButton}>{t("back")}</button>
+            {props.wizardStep < 4 ? <button type="button" onClick={props.next} className={primaryButton}>{t("continue")}</button> : <button disabled={props.busy === "create-hostname"} className={primaryButton}><Plus size={17} />{t("createDomainAccess")}</button>}
           </div>
           </form>
         </Modal>
       )}
       <section className="grid grid-cols-1 gap-4 lg:grid-cols-2 2xl:grid-cols-3">
-        {props.publicHostnames.map((item) => {
+        {props.domainAccess.map((item) => {
           const zone = props.zones.find(
             (candidate) => candidate.id === item.cloudflareZoneId,
           );
@@ -958,7 +1051,7 @@ function HostnamesArea(props: HostnamesAreaProps) {
           return (
             <article
               key={item.id}
-              aria-busy={props.busy === `hostname:${item.id}`}
+               aria-busy={props.busy === `access:${item.id}`}
               className={`${panelClass} min-w-0 p-5 sm:p-6`}
             >
               <div className="flex items-start justify-between gap-4">
@@ -977,11 +1070,11 @@ function HostnamesArea(props: HostnamesAreaProps) {
                   technical
                 />
                 <Meta
-                  label={t("cloudflareConnector")}
-                  value={connector?.name || t("unknown")}
+                  label={t("accessMethod")}
+                  value={t(item.accessMethod === "tunnel" ? "tunnel" : "publicIp")}
                 />
                 <Meta
-                  label={t("tunnelRoute")}
+                  label={t("domainRoute")}
                   value={route?.name || route?.hostname || t("unknown")}
                 />
                 <Meta
@@ -989,10 +1082,13 @@ function HostnamesArea(props: HostnamesAreaProps) {
                   value={t(item.proxied ? "proxied" : "dnsOnly")}
                 />
               </div>
+              <div className="flex flex-wrap gap-2 pt-4" dir="ltr">
+                {item.ownedDnsRecords.map((record) => <span key={record.cloudflareRecordId} className={`max-w-full truncate rounded-lg bg-stone-100 px-2.5 py-1 font-mono text-[0.65rem] text-stone-600 dark:bg-white/5 dark:text-stone-300 ${record.status === "deleted" ? "line-through opacity-50" : ""}`}>{record.type} {record.content}</span>)}
+              </div>
               {item.lastError && (
                 <p className="flex items-start gap-2 pt-4 text-xs font-bold leading-5 text-rose-600 dark:text-rose-300">
                   <TriangleAlert className="mt-0.5 shrink-0" size={14} />
-                  {t("publicHostnameDeploymentFailed")}
+                   {t("domainAccessDeploymentFailed")}
                 </p>
               )}
               <div className="flex items-center justify-between gap-3 pt-5">
@@ -1000,38 +1096,28 @@ function HostnamesArea(props: HostnamesAreaProps) {
                   active={item.enabled}
                   label={t(item.enabled ? "enabled" : "disabled")}
                 />
-                {props.role !== "viewer" && (
-                  <div className="flex items-center gap-2">
-                    <span className="text-[0.66rem] font-bold text-stone-400">
-                      {item.status === "failed"
-                        ? t("retryDeployment")
-                        : t(
-                            item.enabled ? "disableHostname" : "enableHostname",
-                          )}
-                    </span>
-                    <Toggle
-                      enabled={item.enabled}
-                      setEnabled={() => props.toggle(item)}
-                      disabled={props.busy === `hostname:${item.id}`}
-                      label={t(
-                        item.enabled ? "disableHostname" : "enableHostname",
-                      )}
-                    />
-                  </div>
-                )}
+                 {props.role !== "viewer" && <div className="flex flex-wrap items-center justify-end gap-2">
+                     <button type="button" onClick={() => props.action(item, "reconcile")} disabled={props.busy === `access:${item.id}`} className={secondaryButton}><RefreshCw size={14} />{t("reconcile")}</button>
+                     <Toggle
+                       enabled={item.enabled}
+                       setEnabled={() => props.action(item, "toggle")}
+                       disabled={props.busy === `access:${item.id}`}
+                       label={t(item.enabled ? "disableDomainAccess" : "enableDomainAccess")}
+                     />
+                   </div>}
               </div>
             </article>
           );
         })}
-        {props.publicHostnames.length === 0 && (
-          <Empty icon={Link2} text={t("noPublicHostnames")} />
+        {props.domainAccess.length === 0 && (
+          <Empty icon={Link2} text={t("noDomainAccess")} />
         )}
       </section>
     </div>
   );
 }
 
-function HeroStat({ value, label }: { value: number; label: string }) {
+function HeroStat({ value, label }: { value: string; label: string }) {
   return (
     <div className="min-w-[5rem] rounded-xl px-2 py-2">
       <strong className="block text-xl font-black text-orange-300">
@@ -1144,7 +1230,7 @@ function DeploymentStatus({
   status,
   t,
 }: {
-  status: CloudflarePublicHostname["status"];
+  status: CloudflareDomainAccess["status"];
   t: Translate;
 }) {
   const styles =
@@ -1267,8 +1353,24 @@ function hostnameWithinZone(hostname: string, zone: string) {
     normalizedHostname.endsWith(`.${normalizedZone}`)
   );
 }
+function parseIpList(value: string) {
+  return value.split(/[\s,]+/).map((item) => item.trim()).filter(Boolean);
+}
 function friendlyError(error: unknown, t: Translate) {
   if (error instanceof ApiError) {
+    const codeMessages: Partial<Record<string, MessageKey>> = {
+      cloudflare_account_unavailable: "cloudflareAccountUnavailable",
+      cloudflare_zone_invalid: "cloudflareZoneInvalid",
+      domain_access_route_invalid: "domainAccessRouteInvalid",
+      tunnel_topology_mismatch: "tunnelTopologyMismatch",
+      domain_access_duplicate: "domainAccessDuplicate",
+      domain_access_invalid: "cloudflareRelationshipConflict",
+      dns_record_conflict: "dnsRecordConflict",
+      cloudflare_reconciliation_failed: "cloudflareReconciliationFailed",
+      domain_access_dependency_enabled: "linkedDomainAccessEnabled",
+    };
+    const mappedCode = error.code ? codeMessages[error.code] : undefined;
+    if (mappedCode) return t(mappedCode);
     if (error.status === 403) return t("forbidden");
     if (error.status === 409) return t("cloudflareRelationshipConflict");
     if (error.status === 400) return t("validationError");

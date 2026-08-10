@@ -36,6 +36,16 @@ database_host="${DATABASE_HOST:-postgres}"
 database_port="${DATABASE_PORT:-5432}"
 export DATABASE_URL="postgresql://${database_user}:${database_password}@${database_host}:${database_port}/${database_name}"
 
-node dist/src/restore-system.js
-node dist/src/migrate.js
-exec node dist/src/server.js
+case "${GATEWAY_CONTROL_MODE:-server}" in
+    server)
+        node dist/src/migrate.js
+        exec node dist/src/server.js
+        ;;
+    restore)
+        exec node dist/src/restore-system.js
+        ;;
+    *)
+        echo "GATEWAY_CONTROL_MODE must be server or restore." >&2
+        exit 1
+        ;;
+esac

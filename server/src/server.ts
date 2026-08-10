@@ -25,6 +25,8 @@ const app = await buildApp({
   systemBackupNasRoot: config.systemBackupNasRoot,
   systemBackupNasMarker: config.systemBackupNasMarker,
   systemRecoveryService,
+  release: config.release,
+  protectedProjects: config.protectedProjects,
   ...(config.webRoot ? { webRoot: config.webRoot } : {}),
 });
 

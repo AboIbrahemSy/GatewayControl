@@ -14,6 +14,7 @@ const AUTH_TAG_SIZE = 16;
 const MAX_TOOL_OUTPUT_BYTES = 8_192;
 const UUID_PATTERN = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
 const EXPECTED_ARCHIVE_FILES = ['manifest.json', 'database.dump', 'master.key'] as const;
+export const SYSTEM_RESTORE_COMMAND = 'sh docker/recover.sh';
 
 export type SystemRecoveryCode = 'incorrect_passphrase' | 'nas_unavailable' | 'restore_already_staged' | 'backup_mismatch' | 'invalid_backup';
 
@@ -32,7 +33,7 @@ export interface ToolRunner {
 
 export interface SystemRecoveryService {
   createBackup(input: { requestedByUserId: string; target: BackupTarget; passphrase: string }): Promise<SystemBackup>;
-  stageRestore(input: { backupId: string; requestedByUserId: string; passphrase: string }): Promise<{ restore: SystemRestore; restartRequired: true }>;
+  stageRestore(input: { backupId: string; requestedByUserId: string; passphrase: string }): Promise<{ restore: SystemRestore; manualRestoreRequired: true; restoreCommand: string }>;
 }
 
 export class SystemRecoveryFailure extends Error {
@@ -103,7 +104,7 @@ export class FileSystemRecoveryService implements SystemRecoveryService {
     }
   }
 
-  public async stageRestore(input: { backupId: string; requestedByUserId: string; passphrase: string }): Promise<{ restore: SystemRestore; restartRequired: true }> {
+  public async stageRestore(input: { backupId: string; requestedByUserId: string; passphrase: string }): Promise<{ restore: SystemRestore; manualRestoreRequired: true; restoreCommand: string }> {
     const backup = await this.options.store.getSystemBackup(input.backupId);
     if (!backup) throw new SystemRecoveryFailure(404, 'invalid_backup', 'The selected system backup is unavailable.');
     const temporaryDirectory = await mkdtemp(join(tmpdir(), 'gateway-control-restore-'));
@@ -135,7 +136,7 @@ export class FileSystemRecoveryService implements SystemRecoveryService {
       await publication.publish(restore.id);
       restore = await this.options.store.updateSystemRestore(restore.id, 'staged');
       publication = undefined;
-      return { restore, restartRequired: true };
+      return { restore, manualRestoreRequired: true, restoreCommand: SYSTEM_RESTORE_COMMAND };
     } catch (error) {
       const failure = recoveryFailure(error);
       if (publication) {
@@ -217,7 +218,8 @@ export class FileSystemRecoveryService implements SystemRecoveryService {
       if (dumpCreated) await rm(dumpPath, { force: true });
     };
     try {
-      if (await lstat(markerPath).then(() => true, () => false)) {
+      const activeMarkers = ['restore.pending', 'restore.applying', 'restore.applied'];
+      if ((await Promise.all(activeMarkers.map((name) => lstat(join(this.options.stageRoot, name)).then(() => true, () => false)))).some(Boolean)) {
         throw new SystemRecoveryFailure(409, 'restore_already_staged', 'A system restore is already staged or being staged.');
       }
       const dumpHandle = await open(dumpPath, 'wx', 0o600);

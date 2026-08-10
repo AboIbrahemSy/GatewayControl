@@ -6,6 +6,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"net/url"
+	"reflect"
 	"testing"
 	"time"
 
@@ -54,7 +55,7 @@ func TestHeartbeatMatchesServerContractWithoutAgentIDInPath(t *testing.T) {
 		if err := json.NewDecoder(request.Body).Decode(&actual); err != nil {
 			t.Error(err)
 		}
-		if actual != heartbeat {
+		if !reflect.DeepEqual(actual, heartbeat) {
 			t.Errorf("heartbeat = %#v, want %#v", actual, heartbeat)
 		}
 		_, _ = response.Write([]byte(`{"accepted":true}`))
@@ -101,7 +102,7 @@ func TestSubmitResultMatchesServerEnvelope(t *testing.T) {
 		if err := json.NewDecoder(request.Body).Decode(&body); err != nil {
 			t.Error(err)
 		}
-		if body.Status != "succeeded" || body.Result != result {
+		if body.Status != "succeeded" || !reflect.DeepEqual(body.Result, result) {
 			t.Errorf("body = %#v", body)
 		}
 		_, _ = response.Write([]byte(`{"accepted":true,"idempotent":false}`))

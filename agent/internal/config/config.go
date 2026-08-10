@@ -43,6 +43,7 @@ type Config struct {
 	CommandTimeout       time.Duration
 	DockerInfoTimeout    time.Duration
 	MaxOutputBytes       int64
+	ProtectedProjects    []string
 }
 
 func Load() (Config, error) {
@@ -209,6 +210,28 @@ func Load() (Config, error) {
 	if err != nil {
 		return Config{}, err
 	}
+	protectedProjects := []string{"gateway-control"}
+	protectedProjectSet := map[string]struct{}{"gateway-control": {}}
+	protectedValue, err := optionalValue("GATEWAY_PROTECTED_PROJECTS")
+	if err != nil {
+		return Config{}, err
+	}
+	if protectedValue != "" {
+		for _, project := range strings.Split(protectedValue, ",") {
+			project = strings.TrimSpace(project)
+			if !regexp.MustCompile(`^[a-z0-9][a-z0-9_-]{0,62}$`).MatchString(project) {
+				return Config{}, errors.New("GATEWAY_PROTECTED_PROJECTS must contain at most 20 valid comma-separated Compose project names")
+			}
+			if _, exists := protectedProjectSet[project]; exists {
+				continue
+			}
+			if len(protectedProjects) >= 20 {
+				return Config{}, errors.New("GATEWAY_PROTECTED_PROJECTS must contain at most 20 valid comma-separated Compose project names")
+			}
+			protectedProjects = append(protectedProjects, project)
+			protectedProjectSet[project] = struct{}{}
+		}
+	}
 	enrollmentToken, err := optionalValue("GATEWAY_ENROLLMENT_TOKEN")
 	if err != nil {
 		return Config{}, err
@@ -233,7 +256,7 @@ func Load() (Config, error) {
 		TraefikDynamicRoot: traefikDynamicRoot, TraefikDynamicVolume: traefikDynamicVolume,
 		HeartbeatInterval: heartbeatInterval, MetricsInterval: metricsInterval, BackupTimeout: backupTimeout, LongPollTimeout: longPollTimeout,
 		CommandTimeout: commandTimeout, DockerInfoTimeout: dockerInfoTimeout,
-		MaxOutputBytes: maxOutputBytes,
+		MaxOutputBytes: maxOutputBytes, ProtectedProjects: protectedProjects,
 	}, nil
 }
 

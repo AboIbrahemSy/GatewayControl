@@ -29,9 +29,15 @@ var numericIDPattern = regexp.MustCompile(`^[0-9]+$`)
 
 type connectorSyncPayload struct {
 	ConnectorID string `json:"connectorId"`
-	Name        string `json:"name"`
+	Revision    int64  `json:"revision"`
+	Name        string `json:"name,omitempty"`
 	Enabled     *bool  `json:"enabled"`
-	Token       string `json:"token"`
+	Token       string `json:"token,omitempty"`
+}
+
+type connectorRemovePayload struct {
+	ConnectorID string `json:"connectorId"`
+	Revision    int64  `json:"revision"`
 }
 
 func (e *Executor) executeConnectorSync(ctx context.Context, result types.CommandResult, raw json.RawMessage) types.CommandResult {
@@ -49,10 +55,14 @@ func (e *Executor) executeConnectorSync(ctx context.Context, result types.Comman
 	}
 
 	if !*payload.Enabled {
-		output, removeErr := e.removeContainer(commandContext, containerName)
+		candidateOutput, candidateErr := e.removeContainer(commandContext, candidateContainerName)
+		containerOutput, containerErr := e.removeContainer(commandContext, containerName)
 		tokenErr := removeToken(tokenPath)
-		if removeErr != nil {
-			return e.connectorFailure(result, commandContext, payload.Token, "remove connector container", output, removeErr)
+		if candidateErr != nil {
+			return e.connectorFailure(result, commandContext, payload.Token, "remove connector candidate", candidateOutput, candidateErr)
+		}
+		if containerErr != nil {
+			return e.connectorFailure(result, commandContext, payload.Token, "remove connector container", containerOutput, containerErr)
 		}
 		if tokenErr != nil {
 			return e.connectorFailure(result, commandContext, payload.Token, "remove connector token", runOutput{}, tokenErr)
@@ -82,23 +92,23 @@ func (e *Executor) executeConnectorSync(ctx context.Context, result types.Comman
 	}
 	args = append(args, e.cloudflaredImage, "tunnel", "--no-autoupdate", "run", "--token-file", containerTokenPath)
 	if output, err := e.runner.Run(commandContext, "docker", args, e.maxOutput); err != nil {
-		return e.connectorFailure(result, commandContext, payload.Token, "create connector container", output, err)
+		return e.connectorFailureWithCandidateCleanup(result, commandContext, payload.Token, candidateContainerName, "create connector container", output, err)
 	}
 	if output, err := e.runner.Run(commandContext, "docker", []string{"container", "start", candidateContainerName}, e.maxOutput); err != nil {
-		return e.connectorFailure(result, commandContext, payload.Token, "start connector container", output, err)
+		return e.connectorFailureWithCandidateCleanup(result, commandContext, payload.Token, candidateContainerName, "start connector container", output, err)
 	}
 	output, err := e.runner.Run(commandContext, "docker", []string{"container", "inspect", "--format", "{{.State.Running}}", candidateContainerName}, e.maxOutput)
 	if err != nil || strings.TrimSpace(output.stdout) != "true" {
 		if err == nil {
 			err = errors.New("container did not enter the running state")
 		}
-		return e.connectorFailure(result, commandContext, payload.Token, "verify connector container", output, err)
+		return e.connectorFailureWithCandidateCleanup(result, commandContext, payload.Token, candidateContainerName, "verify connector container", output, err)
 	}
 	if output, err := e.removeContainer(commandContext, containerName); err != nil {
-		return e.connectorFailure(result, commandContext, payload.Token, "retire previous connector container", output, err)
+		return e.connectorFailureWithCandidateCleanup(result, commandContext, payload.Token, candidateContainerName, "retire previous connector container", output, err)
 	}
 	if output, err := e.runner.Run(commandContext, "docker", []string{"container", "rename", candidateContainerName, containerName}, e.maxOutput); err != nil {
-		return e.connectorFailure(result, commandContext, payload.Token, "promote connector candidate", output, err)
+		return e.connectorFailureWithCandidateCleanup(result, commandContext, payload.Token, candidateContainerName, "promote connector candidate", output, err)
 	}
 	diagnostic := e.connectorRuntimeDiagnostic(commandContext, payload.ConnectorID)
 	return connectorSuccess(result, "cloudflare connector enabled", diagnostic.Status)
@@ -120,16 +130,48 @@ func decodeConnectorSyncPayload(raw json.RawMessage) (connectorSyncPayload, erro
 	if !connectorUUIDPattern.MatchString(payload.ConnectorID) {
 		return payload, errors.New("connectorId must be a valid UUID")
 	}
-	if !validConnectorName(payload.Name) {
-		return payload, errors.New("name must contain 1 to 120 valid, non-control characters")
-	}
 	if payload.Enabled == nil {
 		return payload, errors.New("enabled must be a boolean")
 	}
-	if len(payload.Token) < 20 || len(payload.Token) > 4096 {
-		return payload, errors.New("token must contain 20 to 4096 bytes")
+	if payload.Revision < 1 {
+		return payload, errors.New("revision must be positive")
+	}
+	if *payload.Enabled {
+		if !validConnectorName(payload.Name) {
+			return payload, errors.New("name must contain 1 to 120 valid, non-control characters")
+		}
+		if len(payload.Token) < 48 || len(payload.Token) > 4096 {
+			return payload, errors.New("token must contain 48 to 4096 bytes")
+		}
+	} else if payload.Name != "" || payload.Token != "" {
+		return payload, errors.New("disabled connector payload must not contain name or token")
 	}
 	return payload, nil
+}
+
+func (e *Executor) executeConnectorRemove(ctx context.Context, result types.CommandResult, raw json.RawMessage) types.CommandResult {
+	var payload connectorRemovePayload
+	decoder := json.NewDecoder(bytes.NewReader(raw))
+	decoder.DisallowUnknownFields()
+	if err := decoder.Decode(&payload); err != nil || decoder.Decode(&struct{}{}) == nil || !connectorUUIDPattern.MatchString(payload.ConnectorID) || payload.Revision < 1 {
+		return e.failure(result, errors.New("invalid connector remove payload"))
+	}
+	commandContext, cancel := context.WithTimeout(ctx, e.timeout)
+	defer cancel()
+	containerName := connectorContainerName(payload.ConnectorID)
+	candidateOutput, candidateErr := e.removeContainer(commandContext, containerName+"-candidate")
+	containerOutput, containerErr := e.removeContainer(commandContext, containerName)
+	tokenErr := removeToken(e.connectorTokenPath(payload.ConnectorID))
+	if candidateErr != nil {
+		return e.connectorFailure(result, commandContext, "", "remove connector candidate", candidateOutput, candidateErr)
+	}
+	if containerErr != nil {
+		return e.connectorFailure(result, commandContext, "", "remove connector container", containerOutput, containerErr)
+	}
+	if tokenErr != nil {
+		return e.connectorFailure(result, commandContext, "", "remove connector token", runOutput{}, tokenErr)
+	}
+	return connectorSuccess(result, "cloudflare connector removed", "stopped")
 }
 
 func validConnectorName(name string) bool {
@@ -295,11 +337,20 @@ func (e *Executor) connectorDiagnostics(ctx context.Context) map[string]types.Co
 
 func (e *Executor) connectorRuntimeDiagnostic(ctx context.Context, connectorID string) types.ConnectorDiagnostic {
 	containerName := connectorContainerName(connectorID)
-	output, err := e.runner.Run(ctx, "docker", []string{"container", "inspect", "--format", "{{.State.Running}}", containerName}, e.maxOutput)
-	if err != nil || strings.TrimSpace(output.stdout) != "true" {
+	output, err := e.runner.Run(ctx, "docker", []string{"container", "inspect", "--format", "{{.State.Running}}|{{.State.StartedAt}}", containerName}, e.maxOutput)
+	parts := strings.SplitN(strings.TrimSpace(output.stdout), "|", 2)
+	if err != nil || len(parts) != 2 || parts[0] != "true" {
+		candidate, candidateErr := e.runner.Run(ctx, "docker", []string{"container", "inspect", containerName + "-candidate"}, e.maxOutput)
+		if candidateErr == nil && candidate.exitCode == 0 {
+			return types.ConnectorDiagnostic{Status: "failed", Error: "an unpromoted connector candidate requires cleanup"}
+		}
 		return types.ConnectorDiagnostic{Status: "stopped", Error: "connector container is not running"}
 	}
-	logs, _ := e.runner.Run(ctx, "docker", []string{"container", "logs", "--tail", "200", containerName}, e.maxOutput)
+	startedAt, parseErr := time.Parse(time.RFC3339Nano, parts[1])
+	if parseErr != nil || startedAt.Before(time.Now().Add(-24*time.Hour)) {
+		startedAt = time.Now().Add(-24 * time.Hour)
+	}
+	logs, _ := e.runner.Run(ctx, "docker", []string{"container", "logs", "--since", startedAt.UTC().Format(time.RFC3339), "--tail", "200", containerName}, e.maxOutput)
 	text := strings.ToLower(logs.stdout + "\n" + logs.stderr)
 	if strings.Contains(text, "unable to reach the origin service") {
 		return types.ConnectorDiagnostic{Status: "origin_unhealthy", Error: "Cloudflare is connected but the origin service is unreachable"}
@@ -329,6 +380,16 @@ func (e *Executor) connectorFailure(result types.CommandResult, ctx context.Cont
 	return result
 }
 
+func (e *Executor) connectorFailureWithCandidateCleanup(result types.CommandResult, primaryContext context.Context, token, candidateName, action string, output runOutput, primaryErr error) types.CommandResult {
+	cleanupContext, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	_, _ = e.removeContainer(cleanupContext, candidateName)
+	return e.connectorFailure(result, primaryContext, token, action, output, primaryErr)
+}
+
 func (e *Executor) redactConnectorOutput(value, token string) string {
+	if token == "" {
+		return e.redact(value)
+	}
 	return strings.ReplaceAll(e.redact(value), token, "[REDACTED]")
 }

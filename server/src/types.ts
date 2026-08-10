@@ -14,7 +14,13 @@ export interface Connector {
   enabled: boolean;
   cloudflareAccountId: string | null;
   tunnelId: string | null;
-  deploymentStatus: 'pending' | 'deploying' | 'active' | 'failed' | 'stopped';
+  desiredRevision: number;
+  tokenAccountIdentifier: string | null;
+  tokenTunnelId: string | null;
+  identityStatus: 'parsed' | 'pending' | 'verified' | 'unmatched' | 'mismatch' | 'invalid' | 'failed';
+  identityVerifiedAt: string | null;
+  identityError: string | null;
+  deploymentStatus: 'pending' | 'deploying' | 'active' | 'failed' | 'stopping' | 'stopped';
   runtimeStatus: 'unknown' | 'connected' | 'origin_unhealthy' | 'reconnecting' | 'stopped' | 'failed';
   lastError: string | null;
   lastDeployedAt: string | null;
@@ -28,9 +34,20 @@ export interface ConnectorDeployment {
   agentId: string;
   name: string;
   enabled: boolean;
+  desiredRevision: number;
   encryptedToken: string;
   cloudflareAccountId: string | null;
   tunnelId: string | null;
+  identityStatus: Connector['identityStatus'];
+}
+
+export interface ConnectorIdentityDeployment extends ConnectorDeployment {
+  identityStatus: Connector['identityStatus'];
+}
+
+export interface ConnectorIdentityExpectation {
+  desiredRevision: number;
+  encryptedToken: string;
 }
 
 export interface CloudflareAccount {
@@ -56,32 +73,66 @@ export interface CloudflareZone {
   updatedAt: string;
 }
 
-export interface CloudflarePublicHostname {
+export interface DomainAccessDnsRecord {
+  type: 'A' | 'AAAA' | 'CNAME';
+  content: string;
+  cloudflareRecordId: string;
+  ownershipMarker: string;
+  status: 'active' | 'cleanup_pending' | 'deleted';
+  lastError: string | null;
+}
+
+export interface CloudflareDomainAccess {
   id: string;
   cloudflareZoneId: string;
   cloudflareAccountId: string;
-  connectorId: string;
+  connectorId: string | null;
   routeId: string;
   hostname: string;
+  accessMethod: 'tunnel' | 'public_ip';
+  publicIpv4: string[];
+  publicIpv6: string[];
+  ownedDnsRecords: DomainAccessDnsRecord[];
   dnsRecordId: string | null;
   enabled: boolean;
+  revision: number;
   proxied: boolean;
-  status: DeploymentStatus;
+  status: DeploymentStatus | 'disabled';
   lastError: string | null;
+  lastReconciledAt: string | null;
   createdAt: string;
   updatedAt: string;
 }
+
+export type CloudflarePublicHostname = CloudflareDomainAccess;
 
 export interface CloudflareAccountSecret extends CloudflareAccount {
   encryptedApiToken: string;
 }
 
-export interface CloudflareHostnameDeployment extends CloudflarePublicHostname {
+export interface CloudflareDomainAccessDeployment extends CloudflareDomainAccess {
   accountIdentifier: string;
   encryptedApiToken: string;
   zoneIdentifier: string;
-  tunnelId: string;
+  zoneName: string;
+  zoneStatus: string;
+  zoneAccountId: string;
+  accountEnabled: boolean;
+  routeEnabled: boolean;
+  routeStatus: DeploymentStatus;
+  routeExposure: 'tunnel' | 'public';
+  routeAgentId: string;
+  routeHostname: string;
+  connectorEnabled: boolean | null;
+  connectorAgentId: string | null;
+  connectorAccountId: string | null;
+  connectorIdentityStatus: Connector['identityStatus'] | null;
+  connectorTokenAccountIdentifier: string | null;
+  connectorTokenTunnelId: string | null;
+  tunnelId: string | null;
 }
+
+export type CloudflareHostnameDeployment = CloudflareDomainAccessDeployment;
 
 export type DeploymentStatus = 'pending' | 'active' | 'failed';
 
@@ -146,7 +197,7 @@ export interface AgentCommand {
   result?: Record<string, unknown> | null;
 }
 
-export const OPERATIONAL_EVENT_TYPES = ['agent.offline', 'service.unhealthy', 'deployment.failed', 'certificate.expiring', 'backup.failed', 'backup.succeeded'] as const;
+export const OPERATIONAL_EVENT_TYPES = ['agent.offline', 'service.unhealthy', 'deployment.failed', 'certificate.expiring', 'backup.failed', 'backup.succeeded', 'runtime.action.succeeded', 'runtime.action.failed'] as const;
 export type OperationalEventType = typeof OPERATIONAL_EVENT_TYPES[number];
 export type OperationStatus = 'pending' | 'running' | 'succeeded' | 'failed';
 export type BackupTarget = 'local' | 'nas';
@@ -157,6 +208,25 @@ export interface TelemetrySnapshot {
   node: Record<string, unknown>;
   services: Array<Record<string, unknown>>;
   receivedAt: string;
+}
+
+export type RuntimeAction = 'start' | 'stop' | 'restart';
+export type RuntimeScope = 'project' | 'service';
+export interface RuntimeOperation {
+  id: string; requestedByUserId: string; agentId: string; commandId: string | null;
+  action: RuntimeAction; scope: RuntimeScope; projectName: string; serviceName: string | null;
+  status: OperationStatus; result: Record<string, unknown> | null; error: string | null;
+  createdAt: string; updatedAt: string; completedAt: string | null;
+}
+export interface RuntimeLogRequest {
+  id: string; requestedByUserId: string; agentId: string; commandId: string | null;
+  projectName: string; serviceName: string; tail: number; since: string | null;
+  status: OperationStatus; result: Record<string, unknown> | null; error: string | null;
+  createdAt: string; updatedAt: string; completedAt: string | null;
+}
+export interface RuntimeInventory {
+  agent: Agent;
+  latest: TelemetrySnapshot | null;
 }
 
 export interface StackBackup {
@@ -224,6 +294,7 @@ export interface NotificationDelivery {
 }
 
 export interface Store {
+  checkReady(): Promise<void>;
   isSetupComplete(): Promise<boolean>;
   createOwner(email: string, passwordHash: string): Promise<User | null>;
   listUsers(): Promise<Omit<User, 'passwordHash'>[]>;
@@ -233,20 +304,27 @@ export interface Store {
   findSessionUser(tokenHash: string): Promise<User | null>;
   deleteSession(tokenHash: string): Promise<void>;
   listConnectors(): Promise<Connector[]>;
-  createConnector(name: string, encryptedToken: string, enabled: boolean, agentId: string, cloudflareAccountId?: string, tunnelId?: string): Promise<Connector | null>;
-  updateConnector(id: string, values: { name?: string; encryptedToken?: string; enabled?: boolean; agentId?: string; cloudflareAccountId?: string | null; tunnelId?: string | null }): Promise<Connector | null>;
+  createConnector(values: { name: string; encryptedToken: string; enabled: boolean; agentId: string; accountId: string; accountIdentifier: string; tunnelId: string }): Promise<Connector | null>;
+  updateConnector(id: string, values: { name?: string; encryptedToken?: string; enabled?: boolean; agentId?: string; accountId?: string; accountIdentifier?: string; tunnelId?: string }): Promise<Connector | null>;
   getConnectorDeployment(connectorId: string): Promise<ConnectorDeployment | null>;
+  getCloudflareAccountSecretByIdentifier(accountIdentifier: string): Promise<CloudflareAccountSecret | null>;
+  listConnectorIdentityDeployments(limit: number): Promise<ConnectorIdentityDeployment[]>;
+  markConnectorIdentity(id: string, expected: ConnectorIdentityExpectation, values: { status: Connector['identityStatus']; accountId?: string; accountIdentifier?: string; tunnelId?: string; error?: string }): Promise<Connector | null>;
   listCloudflareAccounts(): Promise<CloudflareAccount[]>;
   createCloudflareAccount(values: { name: string; accountIdentifier: string; encryptedApiToken: string; enabled: boolean }): Promise<CloudflareAccount>;
   updateCloudflareAccount(id: string, values: { name?: string; accountIdentifier?: string; encryptedApiToken?: string; enabled?: boolean }): Promise<CloudflareAccount | null>;
   getCloudflareAccountSecret(id: string): Promise<CloudflareAccountSecret | null>;
   syncCloudflareZones(accountId: string, zones: Array<{ zoneIdentifier: string; name: string; status: string }>, error?: string): Promise<CloudflareZone[] | null>;
   listCloudflareZones(accountId: string): Promise<CloudflareZone[] | null>;
-  listCloudflarePublicHostnames(): Promise<CloudflarePublicHostname[]>;
-  createPendingCloudflarePublicHostname(values: { zoneId: string; connectorId: string; routeId: string; proxied: boolean }): Promise<CloudflarePublicHostname | null>;
-  setCloudflarePublicHostnamePending(id: string, enabled: boolean): Promise<CloudflarePublicHostname | null>;
-  getCloudflareHostnameDeployment(id: string): Promise<CloudflareHostnameDeployment | null>;
-  markCloudflareHostnameOutcome(id: string, values: { status: 'active' | 'failed'; enabled: boolean; dnsRecordId?: string | null; lastError?: string | null }): Promise<CloudflarePublicHostname | null>;
+  listCloudflareDomainAccess(): Promise<CloudflareDomainAccess[]>;
+  withDomainAccessLock<T>(id: string, callback: () => Promise<T>): Promise<T>;
+  hasEnabledDomainAccessDependency(dependency: 'account' | 'connector' | 'route', id: string): Promise<boolean>;
+  createPendingDomainAccess(values: { accountId: string; zoneId: string; routeId: string; accessMethod: 'tunnel' | 'public_ip'; connectorId?: string; publicIpv4: string[]; publicIpv6: string[]; proxied: boolean }): Promise<CloudflareDomainAccess | null>;
+  setDomainAccessPending(id: string, enabled?: boolean): Promise<CloudflareDomainAccess | null>;
+  getCloudflareDomainAccessDeployment(id: string): Promise<CloudflareDomainAccessDeployment | null>;
+  saveDomainAccessDnsRecord(id: string, revision: number, record: Pick<DomainAccessDnsRecord, 'type' | 'content' | 'cloudflareRecordId' | 'ownershipMarker'>): Promise<CloudflareDomainAccess | null>;
+  markDomainAccessDnsRecordStatus(id: string, revision: number, cloudflareRecordId: string, status: 'cleanup_pending' | 'deleted', lastError?: string): Promise<boolean>;
+  markDomainAccessOutcome(id: string, revision: number, values: { status: 'active' | 'failed' | 'disabled'; lastError?: string | null }): Promise<CloudflareDomainAccess | null>;
   listStacks(): Promise<ManagedStack[]>;
   createStack(values: { agentId: string; name: string; projectName: string; encryptedComposeYaml: string; enabled: boolean; postgresBackupConfig?: { service: string; database: string; user: string } }): Promise<ManagedStack | null>;
   updateStack(id: string, values: { name?: string; encryptedComposeYaml?: string; enabled?: boolean; postgresBackupConfig?: { service: string; database: string; user: string } | null }): Promise<ManagedStack | null>;
@@ -268,6 +346,12 @@ export interface Store {
   recordTelemetry(agentId: string, snapshot: Omit<TelemetrySnapshot, 'agentId' | 'receivedAt'>): Promise<void>;
   getMonitoringSummary(): Promise<TelemetrySnapshot[]>;
   getAgentMonitoring(agentId: string): Promise<{ agent: Agent; latest: TelemetrySnapshot | null; history: TelemetrySnapshot[] } | null>;
+  getLatestRuntimeInventory(): Promise<RuntimeInventory[]>;
+  createRuntimeOperation(values: { requestedByUserId: string; agentId: string; action: RuntimeAction; scope: RuntimeScope; projectName: string; serviceName?: string }): Promise<RuntimeOperation | 'active' | null>;
+  listRuntimeOperations(): Promise<RuntimeOperation[]>;
+  getRuntimeOperation(id: string): Promise<RuntimeOperation | null>;
+  createRuntimeLogRequest(values: { requestedByUserId: string; agentId: string; projectName: string; serviceName: string; tail: number; since?: string }): Promise<RuntimeLogRequest | null>;
+  getRuntimeLogRequest(id: string, requestedByUserId?: string): Promise<RuntimeLogRequest | null>;
   queueLogRequest(stackId: string, requestedByUserId: string, service: string, tail: number, since?: string): Promise<AgentCommand | null>;
   getLogRequest(commandId: string, requestedByUserId: string): Promise<AgentCommand | null>;
   createBackup(stackId: string, requestedByUserId: string, target: BackupTarget): Promise<StackBackup | 'active' | null>;
@@ -289,6 +373,7 @@ export interface Store {
   retryNotificationDelivery(id: string, error: string, delaySeconds: number, terminal: boolean): Promise<void>;
   sweepOfflineAgents(offlineBefore: Date): Promise<number>;
   failStaleCommands(staleBefore: Date): Promise<number>;
+  purgeRuntimeLogResults(completedBefore: Date): Promise<number>;
   createCommand(agentId: string, type: string, payload: Record<string, unknown>): Promise<AgentCommand | null>;
   listCommands(agentId?: string): Promise<AgentCommand[]>;
   getCommand(id: string): Promise<AgentCommand | null>;

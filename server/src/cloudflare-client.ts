@@ -1,6 +1,8 @@
 const BASE_URL = 'https://api.cloudflare.com/client/v4';
+const FED_BASE_URL = 'https://api.fed.cloudflare.com/client/v4';
 const MAX_RESPONSE_BYTES = 256 * 1024;
 const MAX_ZONE_PAGES = 10;
+const MAX_DNS_PAGES = 10;
 
 export interface CloudflareZoneResult {
   id: string;
@@ -14,13 +16,28 @@ export interface CloudflareIngressRule {
   [key: string]: unknown;
 }
 
+export interface CloudflareDnsRecord {
+  id: string;
+  type: 'A' | 'AAAA' | 'CNAME';
+  name: string;
+  content: string;
+  proxied: boolean;
+  comment: string | null;
+}
+
+export interface CloudflareTunnelMetadata {
+  id: string;
+  accountIdentifier: string;
+  deleted: boolean;
+}
+
 export class CloudflareClientError extends Error {
   public constructor(message: string, public readonly status: number, public readonly code?: number) {
     super(message.slice(0, 500));
   }
 
   public isExplicitNotFound(): boolean {
-    return this.status === 404 && this.code !== undefined;
+    return this.status === 404 && this.code === 81044;
   }
 }
 
@@ -32,7 +49,7 @@ interface CloudflareEnvelope {
 }
 
 export class CloudflareClient {
-  public constructor(private readonly apiToken: string, private readonly fetch: typeof globalThis.fetch) {}
+  public constructor(private readonly apiToken: string, private readonly fetch: typeof globalThis.fetch, private readonly endpoint: 'standard' | 'fed' = 'standard') {}
 
   public async verifyToken(): Promise<void> {
     await this.request('GET', '/user/tokens/verify');
@@ -53,7 +70,8 @@ export class CloudflareClient {
         zones.push({ id: zone.id, name: zone.name, status: zone.status });
       }
       const totalPages = Number(envelope.result_info?.total_pages ?? page);
-      if (!Number.isInteger(totalPages) || totalPages <= page) return zones;
+      if (!Number.isInteger(totalPages) || totalPages < page) throw new CloudflareClientError('Cloudflare returned invalid zone pagination metadata.', 502);
+      if (totalPages === page) return zones;
     }
     throw new CloudflareClientError(`Cloudflare zone pagination exceeded the ${MAX_ZONE_PAGES}-page safety limit.`, 502);
   }
@@ -70,17 +88,58 @@ export class CloudflareClient {
     });
   }
 
+  public async getTunnelMetadata(accountIdentifier: string, tunnelId: string): Promise<CloudflareTunnelMetadata> {
+    const envelope = await this.request('GET', this.tunnelPath(accountIdentifier, tunnelId));
+    if (!envelope.result || typeof envelope.result !== 'object') throw new CloudflareClientError('Cloudflare returned invalid tunnel metadata.', 502);
+    const result = envelope.result as Record<string, unknown>;
+    if (typeof result.id !== 'string' || result.id.toLowerCase() !== tunnelId.toLowerCase()
+      || typeof result.account_tag !== 'string' || !/^[a-f0-9]{32}$/i.test(result.account_tag)
+      || (result.deleted_at !== null && result.deleted_at !== undefined && typeof result.deleted_at !== 'string')) {
+      throw new CloudflareClientError('Cloudflare returned invalid tunnel metadata.', 502);
+    }
+    return { id: result.id.toLowerCase(), accountIdentifier: result.account_tag.toLowerCase(), deleted: result.deleted_at !== null && result.deleted_at !== undefined };
+  }
+
+  public async getTunnelToken(accountIdentifier: string, tunnelId: string): Promise<string> {
+    const envelope = await this.request('GET', `${this.tunnelPath(accountIdentifier, tunnelId)}/token`);
+    if (typeof envelope.result !== 'string' || envelope.result.length < 48 || envelope.result.length > 4096 || /\s/.test(envelope.result)) {
+      throw new CloudflareClientError('Cloudflare returned an invalid tunnel token.', 502);
+    }
+    return envelope.result;
+  }
+
   public async putTunnelConfig(accountIdentifier: string, tunnelId: string, ingress: CloudflareIngressRule[]): Promise<void> {
     await this.request('PUT', this.tunnelConfigPath(accountIdentifier, tunnelId), { config: { ingress } });
   }
 
-  public async createDnsCname(zoneIdentifier: string, hostname: string, tunnelId: string, proxied: boolean): Promise<string> {
-    const envelope = await this.request('POST', `/zones/${encodeURIComponent(zoneIdentifier)}/dns_records`, {
-      type: 'CNAME', name: hostname, content: `${tunnelId}.cfargotunnel.com`, proxied, ttl: 1,
-    });
-    const result = envelope.result as { id?: unknown } | undefined;
-    if (typeof result?.id !== 'string') throw new CloudflareClientError('Cloudflare returned an invalid DNS record.', 502);
-    return result.id;
+  public async createDnsCname(zoneIdentifier: string, hostname: string, tunnelId: string, proxied: boolean, comment: string): Promise<CloudflareDnsRecord> {
+    return this.createDnsRecord(zoneIdentifier, 'CNAME', hostname, `${tunnelId}.cfargotunnel.com`, proxied, comment);
+  }
+
+  public async listDnsRecordsExact(zoneIdentifier: string, hostname: string): Promise<CloudflareDnsRecord[]> {
+    const records: CloudflareDnsRecord[] = [];
+    for (let page = 1; page <= MAX_DNS_PAGES; page += 1) {
+      const query = new URLSearchParams({ name: hostname, per_page: '100', page: String(page) });
+      const envelope = await this.request('GET', `/zones/${encodeURIComponent(zoneIdentifier)}/dns_records?${query.toString()}`);
+      if (!Array.isArray(envelope.result)) throw new CloudflareClientError('Cloudflare returned an invalid DNS records response.', 502);
+      records.push(...envelope.result.flatMap((value) => {
+        if (!value || typeof value !== 'object' || !['A', 'AAAA', 'CNAME'].includes(String((value as Record<string, unknown>).type))) return [];
+        return [this.dnsRecord(value, hostname)];
+      }));
+      const totalPages = Number(envelope.result_info?.total_pages ?? page);
+      if (!Number.isInteger(totalPages) || totalPages < page) throw new CloudflareClientError('Cloudflare returned invalid DNS pagination metadata.', 502);
+      if (totalPages === page) return records;
+    }
+    throw new CloudflareClientError(`Cloudflare DNS pagination exceeded the ${MAX_DNS_PAGES}-page safety limit.`, 502);
+  }
+
+  public async createDnsAddress(zoneIdentifier: string, type: 'A' | 'AAAA', hostname: string, content: string, proxied: boolean, comment: string): Promise<CloudflareDnsRecord> {
+    return this.createDnsRecord(zoneIdentifier, type, hostname, content, proxied, comment);
+  }
+
+  public async getDnsRecord(zoneIdentifier: string, dnsRecordId: string, expectedHostname: string): Promise<CloudflareDnsRecord> {
+    const envelope = await this.request('GET', `/zones/${encodeURIComponent(zoneIdentifier)}/dns_records/${encodeURIComponent(dnsRecordId)}`);
+    return this.dnsRecord(envelope.result, expectedHostname);
   }
 
   public async deleteDnsRecord(zoneIdentifier: string, dnsRecordId: string): Promise<void> {
@@ -88,7 +147,28 @@ export class CloudflareClient {
   }
 
   private tunnelConfigPath(accountIdentifier: string, tunnelId: string): string {
-    return `/accounts/${encodeURIComponent(accountIdentifier)}/cfd_tunnel/${encodeURIComponent(tunnelId)}/configurations`;
+    return `${this.tunnelPath(accountIdentifier, tunnelId)}/configurations`;
+  }
+
+  private tunnelPath(accountIdentifier: string, tunnelId: string): string {
+    return `/accounts/${encodeURIComponent(accountIdentifier)}/cfd_tunnel/${encodeURIComponent(tunnelId)}`;
+  }
+
+  private async createDnsRecord(zoneIdentifier: string, type: CloudflareDnsRecord['type'], hostname: string, content: string, proxied: boolean, comment: string): Promise<CloudflareDnsRecord> {
+    const envelope = await this.request('POST', `/zones/${encodeURIComponent(zoneIdentifier)}/dns_records`, {
+      type, name: hostname, content, proxied, ttl: 1, comment,
+    });
+    return this.dnsRecord(envelope.result, hostname);
+  }
+
+  private dnsRecord(value: unknown, expectedHostname: string): CloudflareDnsRecord {
+    if (!value || typeof value !== 'object') throw new CloudflareClientError('Cloudflare returned an invalid DNS record.', 502);
+    const record = value as Record<string, unknown>;
+    if (typeof record.id !== 'string' || !['A', 'AAAA', 'CNAME'].includes(String(record.type)) || typeof record.name !== 'string' || record.name.toLowerCase() !== expectedHostname.toLowerCase() || typeof record.content !== 'string' || typeof record.proxied !== 'boolean') {
+      throw new CloudflareClientError('Cloudflare returned an invalid DNS record.', 502);
+    }
+    if (record.comment !== undefined && record.comment !== null && typeof record.comment !== 'string') throw new CloudflareClientError('Cloudflare returned an invalid DNS record comment.', 502);
+    return { id: record.id, type: record.type as CloudflareDnsRecord['type'], name: record.name.toLowerCase(), content: record.content, proxied: record.proxied, comment: typeof record.comment === 'string' ? record.comment : null };
   }
 
   private isHostname(value: string): boolean {
@@ -99,7 +179,7 @@ export class CloudflareClient {
   private async request(method: string, path: string, body?: unknown): Promise<CloudflareEnvelope> {
     let response: Response;
     try {
-      response = await this.fetch(`${BASE_URL}${path}`, {
+      response = await this.fetch(`${this.endpoint === 'fed' ? FED_BASE_URL : BASE_URL}${path}`, {
         method,
         headers: { authorization: `Bearer ${this.apiToken}`, ...(body === undefined ? {} : { 'content-type': 'application/json' }) },
         ...(body === undefined ? {} : { body: JSON.stringify(body) }),
