@@ -1,4 +1,8 @@
 services:
+  bootstrap:
+    volumes:
+      - ./data/backups/system:/system-backups
+
   control-plane:
     image: gateway-control:local
     build:
@@ -6,8 +10,19 @@ services:
     environment:
       GATEWAY_CONTROL_RELEASE: development
       GATEWAY_AGENT_IMAGE: gateway-control-agent:local
+      GATEWAY_SYSTEM_BACKUP_LOCAL_ROOT: /opt/gateway-control/backups/system
+      GATEWAY_SYSTEM_BACKUP_NAS_ROOT: /mnt/gateway-control-backups
+      GATEWAY_SYSTEM_RESTORE_STAGE_ROOT: /opt/gateway-control/backups/system/.restore-stage
+    volumes:
+      - ./data/backups/system:/opt/gateway-control/backups/system
+      - ./data/backups/nas:/mnt/gateway-control-backups
 
   control-plane-restore:
     image: gateway-control:local
     build:
       context: .
+    environment:
+      GATEWAY_SYSTEM_BACKUP_LOCAL_ROOT: /opt/gateway-control/backups/system
+      GATEWAY_SYSTEM_RESTORE_STAGE_ROOT: /opt/gateway-control/backups/system/.restore-stage
+    volumes:
+      - ./data/backups/system:/opt/gateway-control/backups/system

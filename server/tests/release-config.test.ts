@@ -16,6 +16,15 @@ describe('production release configuration', () => {
     expect(compose.services['control-plane']).toHaveProperty('stop_grace_period');
     expect(compose.services['control-plane-restore']).toMatchObject({ profiles: ['recovery'], restart: 'no' });
     expect(development.services['control-plane']).toHaveProperty('build');
+    expect(development.services.bootstrap?.volumes).toContain('./data/backups/system:/system-backups');
+    expect(development.services['control-plane']?.volumes).toEqual(expect.arrayContaining([
+      './data/backups/system:/opt/gateway-control/backups/system',
+      './data/backups/nas:/mnt/gateway-control-backups',
+    ]));
+
+    const composeSource = await readFile(join(root, 'compose.yaml'), 'utf8');
+    expect(composeSource).toContain('GATEWAY_SYSTEM_BACKUP_LOCAL_HOST_ROOT');
+    expect(composeSource).toContain('GATEWAY_SYSTEM_BACKUP_NAS_HOST_ROOT');
 
     const entrypoint = await readFile(join(root, 'docker', 'control-plane-entrypoint.sh'), 'utf8');
     const serverBranch = entrypoint.slice(entrypoint.indexOf('server)'), entrypoint.indexOf('restore)'));

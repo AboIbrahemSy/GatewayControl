@@ -13,21 +13,21 @@ fail() {
 command -v sha256sum >/dev/null 2>&1 || fail "sha256sum is required."
 command -v realpath >/dev/null 2>&1 || fail "realpath is required for fail-closed restore-path validation."
 
-local_root="${GATEWAY_SYSTEM_BACKUP_LOCAL_ROOT:-/opt/gateway-control/backups/system}"
-stage_root="${GATEWAY_SYSTEM_RESTORE_STAGE_ROOT:-$local_root/.restore-stage}"
+local_root="${GATEWAY_SYSTEM_BACKUP_LOCAL_HOST_ROOT:-/opt/gateway-control/backups/system}"
+stage_root="${GATEWAY_SYSTEM_RESTORE_STAGE_HOST_ROOT:-$local_root/.restore-stage}"
 case "$local_root:$stage_root" in
     /*:/*) ;;
-    *) fail "GATEWAY_SYSTEM_BACKUP_LOCAL_ROOT and GATEWAY_SYSTEM_RESTORE_STAGE_ROOT must be absolute host paths." ;;
+    *) fail "GATEWAY_SYSTEM_BACKUP_LOCAL_HOST_ROOT and GATEWAY_SYSTEM_RESTORE_STAGE_HOST_ROOT must be absolute host paths." ;;
 esac
-[ -d "$local_root" ] && [ ! -L "$local_root" ] || fail "GATEWAY_SYSTEM_BACKUP_LOCAL_ROOT must be an existing real directory."
+[ -d "$local_root" ] && [ ! -L "$local_root" ] || fail "GATEWAY_SYSTEM_BACKUP_LOCAL_HOST_ROOT must be an existing real directory."
 resolved_local_root="$(realpath "$local_root")"
 resolved_stage_root="$(realpath -m "$stage_root")"
 case "$resolved_stage_root" in
     "$resolved_local_root"/*) ;;
-    *) fail "GATEWAY_SYSTEM_RESTORE_STAGE_ROOT must resolve strictly inside GATEWAY_SYSTEM_BACKUP_LOCAL_ROOT." ;;
+    *) fail "GATEWAY_SYSTEM_RESTORE_STAGE_HOST_ROOT must resolve strictly inside GATEWAY_SYSTEM_BACKUP_LOCAL_HOST_ROOT." ;;
 esac
 if [ -e "$stage_root" ] || [ -L "$stage_root" ]; then
-    [ -d "$stage_root" ] && [ ! -L "$stage_root" ] || fail "GATEWAY_SYSTEM_RESTORE_STAGE_ROOT must be a real directory."
+    [ -d "$stage_root" ] && [ ! -L "$stage_root" ] || fail "GATEWAY_SYSTEM_RESTORE_STAGE_HOST_ROOT must be a real directory."
     for marker in restore.pending restore.applying restore.applied; do
         marker_path="$stage_root/$marker"
         if [ -e "$marker_path" ] || [ -L "$marker_path" ]; then

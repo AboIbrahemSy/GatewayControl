@@ -11,3 +11,4 @@ Thumbs.db
 .vscode/
 runtime/traefik/dynamic/*
 !runtime/traefik/dynamic/.gitkeep
+data/

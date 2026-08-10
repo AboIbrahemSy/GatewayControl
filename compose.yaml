@@ -23,7 +23,7 @@ services:
     volumes:
       - gateway_secrets:/secrets
       - traefik_dynamic:/traefik-dynamic
-      - ${GATEWAY_SYSTEM_BACKUP_LOCAL_ROOT:-/opt/gateway-control/backups/system}:/system-backups
+      - ${GATEWAY_SYSTEM_BACKUP_LOCAL_HOST_ROOT:-/opt/gateway-control/backups/system}:/system-backups
     security_opt:
       - no-new-privileges:true
 
@@ -79,8 +79,8 @@ services:
       GATEWAY_SYSTEM_RESTORE_STAGE_ROOT: ${GATEWAY_SYSTEM_RESTORE_STAGE_ROOT:-/opt/gateway-control/backups/system/.restore-stage}
     volumes:
       - gateway_secrets:/run/gateway-secrets:ro
-      - ${GATEWAY_SYSTEM_BACKUP_LOCAL_ROOT:-/opt/gateway-control/backups/system}:${GATEWAY_SYSTEM_BACKUP_LOCAL_ROOT:-/opt/gateway-control/backups/system}
-      - ${GATEWAY_SYSTEM_BACKUP_NAS_ROOT:-/mnt/gateway-control-backups}:${GATEWAY_SYSTEM_BACKUP_NAS_ROOT:-/mnt/gateway-control-backups}
+      - ${GATEWAY_SYSTEM_BACKUP_LOCAL_HOST_ROOT:-/opt/gateway-control/backups/system}:${GATEWAY_SYSTEM_BACKUP_LOCAL_ROOT:-/opt/gateway-control/backups/system}
+      - ${GATEWAY_SYSTEM_BACKUP_NAS_HOST_ROOT:-/mnt/gateway-control-backups}:${GATEWAY_SYSTEM_BACKUP_NAS_ROOT:-/mnt/gateway-control-backups}
     networks:
       - control
       - edge
@@ -117,7 +117,7 @@ services:
       GATEWAY_SYSTEM_RESTORE_STAGE_ROOT: ${GATEWAY_SYSTEM_RESTORE_STAGE_ROOT:-/opt/gateway-control/backups/system/.restore-stage}
     volumes:
       - gateway_secrets:/run/gateway-secrets:ro
-      - ${GATEWAY_SYSTEM_BACKUP_LOCAL_ROOT:-/opt/gateway-control/backups/system}:${GATEWAY_SYSTEM_BACKUP_LOCAL_ROOT:-/opt/gateway-control/backups/system}
+      - ${GATEWAY_SYSTEM_BACKUP_LOCAL_HOST_ROOT:-/opt/gateway-control/backups/system}:${GATEWAY_SYSTEM_BACKUP_LOCAL_ROOT:-/opt/gateway-control/backups/system}
     networks:
       - control
     depends_on:

@@ -64,6 +64,13 @@ Create the local configuration file:
 cp .env.example .env
 ```
 
+Create project-local development backup directories. They are ignored by Git and mounted only by `compose.dev.yaml`:
+
+```bash
+mkdir -p data/backups/system data/backups/pre-update data/backups/nas
+chmod 0700 data/backups/system data/backups/pre-update data/backups/nas
+```
+
 Build the Agent and control-plane images for development, then start the stack with the development override:
 
 ```bash
@@ -117,12 +124,17 @@ The root `.env.example` contains safe placeholders. Replace registry placeholder
 | `GATEWAY_TRAEFIK_DYNAMIC_VOLUME` | Shared Agent and Traefik route volume | `gateway-traefik-dynamic` |
 | `GATEWAY_PROTECTED_PROJECTS` | Bounded comma-separated Compose projects protected by both control plane and generated Agents | `gateway-control` |
 | `GATEWAY_SYSTEM_BACKUP_LOCAL_ROOT` | Control-plane system backup and restore-staging root | `/opt/gateway-control/backups/system` |
+| `GATEWAY_SYSTEM_BACKUP_LOCAL_HOST_ROOT` | Host directory mounted at the control-plane system backup root | `/opt/gateway-control/backups/system` |
 | `GATEWAY_SYSTEM_BACKUP_NAS_ROOT` | Canonical pre-mounted NAS path passed to the control plane and generated Agents | `/mnt/gateway-control-backups` |
+| `GATEWAY_SYSTEM_BACKUP_NAS_HOST_ROOT` | Host NAS mount bound into the control-plane NAS root | `/mnt/gateway-control-backups` |
 | `GATEWAY_SYSTEM_BACKUP_NAS_MARKER` | Required regular marker file name passed to the control plane and generated Agents | `.gateway-control-nas` |
 | `GATEWAY_SYSTEM_RESTORE_STAGE_ROOT` | Private startup restore staging directory | `/opt/gateway-control/backups/system/.restore-stage` |
+| `GATEWAY_SYSTEM_RESTORE_STAGE_HOST_ROOT` | Host path corresponding to the private restore staging directory | `/opt/gateway-control/backups/system/.restore-stage` |
 | `UPDATE_BACKUP_ROOT` | Host directory for verified pre-update database dumps | `/opt/gateway-control/backups/pre-update` |
 
 Do not commit `.env`. Database credentials and the control-plane encryption key are generated into a Docker volume during bootstrap.
+
+Development keeps backup files under `./data/backups`. Production keeps durable host data outside the source checkout by default. Container paths remain absolute and independent from their host source paths.
 
 ## Enroll an Agent
 
