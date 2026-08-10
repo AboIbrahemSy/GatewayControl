@@ -108,13 +108,13 @@ Terminate HTTPS at a trusted reverse proxy, forward requests to the control-plan
 
 ## Configuration
 
-The root `.env.example` contains safe placeholders. Replace registry placeholders before production deployment; `compose.dev.yaml` overrides the control-plane and Agent references with local images for development.
+The root `.env.example` is ready for local development and keeps host backup data under `./data/backups`. Replace the local image references with immutable registry digests and review the host storage paths before production deployment.
 
 | Variable | Purpose | Default example |
 | --- | --- | --- |
-| `GATEWAY_CONTROL_IMAGE` | Required immutable production control-plane image digest | GHCR placeholder in `.env.example` |
-| `GATEWAY_CONTROL_RELEASE` | Human-readable release returned by liveness and readiness endpoints | Release placeholder |
-| `GATEWAY_AGENT_IMAGE` | Explicit version or digest placed in generated Agent commands | GHCR version placeholder |
+| `GATEWAY_CONTROL_IMAGE` | Control-plane image; production wrappers require an immutable digest | `gateway-control:local` for development |
+| `GATEWAY_CONTROL_RELEASE` | Human-readable release returned by liveness and readiness endpoints | `development` |
+| `GATEWAY_AGENT_IMAGE` | Explicit Agent image placed in generated enrollment commands | `gateway-control-agent:local` for development |
 | `CONTROL_HTTP_PORT` | Host port for the control plane | `8080` |
 | `POSTGRES_IMAGE` | PostgreSQL image | `postgres:17-alpine` |
 | `TRAEFIK_IMAGE` | Digest-pinned Traefik image | See `.env.example` |
@@ -124,13 +124,13 @@ The root `.env.example` contains safe placeholders. Replace registry placeholder
 | `GATEWAY_TRAEFIK_DYNAMIC_VOLUME` | Shared Agent and Traefik route volume | `gateway-traefik-dynamic` |
 | `GATEWAY_PROTECTED_PROJECTS` | Bounded comma-separated Compose projects protected by both control plane and generated Agents | `gateway-control` |
 | `GATEWAY_SYSTEM_BACKUP_LOCAL_ROOT` | Control-plane system backup and restore-staging root | `/opt/gateway-control/backups/system` |
-| `GATEWAY_SYSTEM_BACKUP_LOCAL_HOST_ROOT` | Host directory mounted at the control-plane system backup root | `/opt/gateway-control/backups/system` |
+| `GATEWAY_SYSTEM_BACKUP_LOCAL_HOST_ROOT` | Host directory mounted at the control-plane system backup root | `./data/backups/system` for development |
 | `GATEWAY_SYSTEM_BACKUP_NAS_ROOT` | Canonical pre-mounted NAS path passed to the control plane and generated Agents | `/mnt/gateway-control-backups` |
-| `GATEWAY_SYSTEM_BACKUP_NAS_HOST_ROOT` | Host NAS mount bound into the control-plane NAS root | `/mnt/gateway-control-backups` |
+| `GATEWAY_SYSTEM_BACKUP_NAS_HOST_ROOT` | Host NAS mount bound into the control-plane NAS root | `./data/backups/nas` for development |
 | `GATEWAY_SYSTEM_BACKUP_NAS_MARKER` | Required regular marker file name passed to the control plane and generated Agents | `.gateway-control-nas` |
 | `GATEWAY_SYSTEM_RESTORE_STAGE_ROOT` | Private startup restore staging directory | `/opt/gateway-control/backups/system/.restore-stage` |
-| `GATEWAY_SYSTEM_RESTORE_STAGE_HOST_ROOT` | Host path corresponding to the private restore staging directory | `/opt/gateway-control/backups/system/.restore-stage` |
-| `UPDATE_BACKUP_ROOT` | Host directory for verified pre-update database dumps | `/opt/gateway-control/backups/pre-update` |
+| `GATEWAY_SYSTEM_RESTORE_STAGE_HOST_ROOT` | Host path corresponding to the private restore staging directory | `./data/backups/system/.restore-stage` for development |
+| `UPDATE_BACKUP_ROOT` | Host directory for verified pre-update database dumps | `./data/backups/pre-update` for development |
 
 Do not commit `.env`. Database credentials and the control-plane encryption key are generated into a Docker volume during bootstrap.
 

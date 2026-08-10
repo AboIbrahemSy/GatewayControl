@@ -13,17 +13,19 @@ fail() {
 command -v sha256sum >/dev/null 2>&1 || fail "sha256sum is required."
 command -v realpath >/dev/null 2>&1 || fail "realpath is required for fail-closed restore-path validation."
 
-local_root="${GATEWAY_SYSTEM_BACKUP_LOCAL_HOST_ROOT:-/opt/gateway-control/backups/system}"
-stage_root="${GATEWAY_SYSTEM_RESTORE_STAGE_HOST_ROOT:-$local_root/.restore-stage}"
-case "$local_root:$stage_root" in
-    /*:/*) ;;
-    *) fail "GATEWAY_SYSTEM_BACKUP_LOCAL_HOST_ROOT and GATEWAY_SYSTEM_RESTORE_STAGE_HOST_ROOT must be absolute host paths." ;;
-esac
+project_directory=$(CDPATH= cd -- "$script_directory/.." && pwd)
+resolve_host_path() {
+    case "$1" in
+        /*) realpath -m "$1" ;;
+        *) realpath -m "$project_directory/$1" ;;
+    esac
+}
+
+local_root="$(resolve_host_path "${GATEWAY_SYSTEM_BACKUP_LOCAL_HOST_ROOT:-/opt/gateway-control/backups/system}")"
+stage_root="$(resolve_host_path "${GATEWAY_SYSTEM_RESTORE_STAGE_HOST_ROOT:-$local_root/.restore-stage}")"
 [ -d "$local_root" ] && [ ! -L "$local_root" ] || fail "GATEWAY_SYSTEM_BACKUP_LOCAL_HOST_ROOT must be an existing real directory."
-resolved_local_root="$(realpath "$local_root")"
-resolved_stage_root="$(realpath -m "$stage_root")"
-case "$resolved_stage_root" in
-    "$resolved_local_root"/*) ;;
+case "$stage_root" in
+    "$local_root"/*) ;;
     *) fail "GATEWAY_SYSTEM_RESTORE_STAGE_HOST_ROOT must resolve strictly inside GATEWAY_SYSTEM_BACKUP_LOCAL_HOST_ROOT." ;;
 esac
 if [ -e "$stage_root" ] || [ -L "$stage_root" ]; then
@@ -37,11 +39,7 @@ if [ -e "$stage_root" ] || [ -L "$stage_root" ]; then
     done
 fi
 
-backup_root="${UPDATE_BACKUP_ROOT:-/opt/gateway-control/backups/pre-update}"
-case "$backup_root" in
-    /*) ;;
-    *) fail "UPDATE_BACKUP_ROOT must be an absolute host path." ;;
-esac
+backup_root="$(resolve_host_path "${UPDATE_BACKUP_ROOT:-/opt/gateway-control/backups/pre-update}")"
 mkdir -p "$backup_root"
 [ -d "$backup_root" ] && [ ! -L "$backup_root" ] || fail "UPDATE_BACKUP_ROOT must be a real directory."
 chmod 0700 "$backup_root"

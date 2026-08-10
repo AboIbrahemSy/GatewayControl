@@ -84,6 +84,19 @@ describe('production release configuration', () => {
     expect(ui).toContain('sh docker/recover.sh');
   });
 
+  it('ships project-local development host paths without changing absolute container paths', async () => {
+    const environment = await readFile(join(root, '.env.example'), 'utf8');
+    expect(environment).toContain('GATEWAY_CONTROL_IMAGE=gateway-control:local');
+    expect(environment).toContain('GATEWAY_AGENT_IMAGE=gateway-control-agent:local');
+    expect(environment).toContain('GATEWAY_SYSTEM_BACKUP_LOCAL_HOST_ROOT=./data/backups/system');
+    expect(environment).toContain('GATEWAY_SYSTEM_BACKUP_NAS_HOST_ROOT=./data/backups/nas');
+    expect(environment).toContain('GATEWAY_SYSTEM_BACKUP_LOCAL_ROOT=/opt/gateway-control/backups/system');
+    expect(environment).toContain('GATEWAY_SYSTEM_BACKUP_NAS_ROOT=/mnt/gateway-control-backups');
+
+    const update = await readFile(join(root, 'docker', 'update.sh'), 'utf8');
+    expect(update).toContain('realpath -m "$project_directory/$1"');
+  });
+
   it('fails restore mode without a state marker and bounds PostgreSQL readiness without promise races', async () => {
     const restore = await readFile(join(root, 'server', 'src', 'restore-system.ts'), 'utf8');
     const store = await readFile(join(root, 'server', 'src', 'postgres-store.ts'), 'utf8');
