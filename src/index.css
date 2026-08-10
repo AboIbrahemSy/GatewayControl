@@ -5,7 +5,8 @@
 :root {
   font-family: 'Manrope Variable', 'Noto Sans Arabic Variable', ui-sans-serif, system-ui, sans-serif;
   color: #152925;
-  background: #f3f0e8;
+  background-color: #f3f0e8;
+  color-scheme: light;
   font-synthesis: none;
   text-rendering: optimizeLegibility;
 }
@@ -17,17 +18,23 @@
 html {
   min-width: 320px;
   min-height: 100%;
-  background: #f3f0e8;
+  background-color: #f3f0e8;
+  color: #152925;
+  transition: background-color 0.25s ease, color 0.25s ease;
 }
 
 html.dark {
-  background: #07100f;
+  background-color: #07100f;
+  color: #f3f0e8;
+  color-scheme: dark;
 }
 
 body {
   min-width: 320px;
   min-height: 100vh;
   margin: 0;
+  background-color: inherit;
+  color: inherit;
 }
 
 button,
@@ -52,9 +59,24 @@ textarea:focus-visible {
   background: #77e6bd;
 }
 
+/* Ensure cross-platform dropdown readability in select elements */
+html.dark select option {
+  background-color: #0b1715;
+  color: #f3f0e8;
+}
+
+html:not(.dark) select option {
+  background-color: #ffffff;
+  color: #152925;
+}
+
 * {
   scrollbar-color: #b9c3bd transparent;
   scrollbar-width: thin;
+}
+
+html.dark * {
+  scrollbar-color: #1a3832 transparent;
 }
 
 .dashboard-grid {

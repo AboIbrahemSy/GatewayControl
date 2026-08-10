@@ -277,6 +277,8 @@ export const api = {
       enrollmentExpiresAt: string
       enrollmentCommand?: string
     }>('/agents', { method: 'POST', body: JSON.stringify({ name, baseUrl, image }) }),
+  removeAgent: (id: string) =>
+    request<{ mode: 'deleted' | 'archived'; cleanupCommand: string }>(`/agents/${encodeURIComponent(id)}`, { method: 'DELETE' }),
   stacks: () => request<{ stacks: ManagedStack[] }>('/stacks'),
   createStack: (input: CreateStackInput) =>
     request<{ stack: ManagedStack }>('/stacks', { method: 'POST', body: JSON.stringify(input) }),

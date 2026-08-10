@@ -223,6 +223,7 @@ export interface Store {
   saveNotificationSettings(botTokenEncrypted: string, groupIdEncrypted: string, selectedEvents: string[]): Promise<void>;
   listAgents(): Promise<Agent[]>;
   createAgent(name: string, enrollmentTokenHash: string, enrollmentExpiresAt: Date): Promise<Agent>;
+  removeAgent(id: string): Promise<'deleted' | 'archived' | 'blocked' | 'missing'>;
   enrollAgent(enrollmentTokenHash: string, credentialHash: string): Promise<Agent | null>;
   authenticateAgent(credentialHash: string): Promise<Agent | null>;
   heartbeatAgent(id: string, metadata: Record<string, unknown>): Promise<void>;
@@ -241,6 +242,7 @@ export interface Store {
   completeNotificationDelivery(id: string): Promise<void>;
   retryNotificationDelivery(id: string, error: string, delaySeconds: number, terminal: boolean): Promise<void>;
   sweepOfflineAgents(offlineBefore: Date): Promise<number>;
+  failStaleCommands(staleBefore: Date): Promise<number>;
   createCommand(agentId: string, type: string, payload: Record<string, unknown>): Promise<AgentCommand | null>;
   listCommands(agentId?: string): Promise<AgentCommand[]>;
   claimCommands(agentId: string, limit: number): Promise<AgentCommand[]>;

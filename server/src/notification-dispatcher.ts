@@ -9,6 +9,7 @@ export interface NotificationDispatcherOptions {
   logger: FastifyBaseLogger;
   intervalMs?: number;
   offlineAfterMs?: number;
+  commandStaleAfterMs?: number;
 }
 
 function message(delivery: NotificationDelivery): string {
@@ -41,6 +42,7 @@ export class NotificationDispatcher {
     this.running = true;
     try {
       await this.options.store.sweepOfflineAgents(new Date(Date.now() - (this.options.offlineAfterMs ?? 3 * 60_000)));
+      await this.options.store.failStaleCommands(new Date(Date.now() - (this.options.commandStaleAfterMs ?? 24 * 60 * 60_000)));
       const delivery = await this.options.store.claimNotificationDelivery();
       if (!delivery) return;
       await this.dispatch(delivery);

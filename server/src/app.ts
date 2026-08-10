@@ -51,6 +51,7 @@ export interface BuildAppOptions {
   traefikDynamicVolume?: string;
   notificationIntervalMs?: number;
   offlineAfterMs?: number;
+  commandStaleAfterMs?: number;
 }
 
 function objectBody(body: unknown): Record<string, unknown> {
@@ -138,6 +139,9 @@ function enrollmentCommand(baseUrl: string, image: string, enrollmentToken: stri
   const stateVolume = `${containerName}-state`;
   const insecureHttpOption = url.protocol === 'http:' ? '-e GATEWAY_ALLOW_INSECURE_HTTP=true' : '';
   const pullPolicy = image.endsWith(':local') ? '--pull never' : '--pull always';
+  const imagePreflight = image.endsWith(':local')
+    ? `docker image inspect ${shellQuote(image)} >/dev/null 2>&1 || { printf '%s\n' ${shellQuote(`Local Agent image ${image} was not found. Build it on this host before enrollment.`)} >&2; exit 1; }`
+    : '';
 
   const initializeWritableMounts = [
     'docker run --rm',
@@ -182,7 +186,13 @@ function enrollmentCommand(baseUrl: string, image: string, enrollmentToken: stri
     `-v ${shellQuote(traefikDynamicVolume)}:/srv/traefik-dynamic`,
     shellQuote(image),
   ].filter(Boolean).join(' ');
-  return `${initializeWritableMounts} && ${startAgent}`;
+  return [imagePreflight, initializeWritableMounts, startAgent].filter(Boolean).join(' && ');
+}
+
+function agentCleanupCommand(agentId: string): string {
+  const containerName = `gateway-agent-${agentId.slice(0, 8)}`;
+  const stateVolume = `${containerName}-state`;
+  return `docker rm -f ${shellQuote(containerName)} 2>/dev/null || true; docker volume rm ${shellQuote(stateVolume)} 2>/dev/null || true`;
 }
 
 function validateResourceName(value: string, field = 'name'): string {
@@ -333,6 +343,7 @@ export async function buildApp(options: BuildAppOptions) {
     store: options.store, secretBox, fetch: httpFetch, logger: app.log,
     ...(options.notificationIntervalMs !== undefined ? { intervalMs: options.notificationIntervalMs } : {}),
     ...(options.offlineAfterMs !== undefined ? { offlineAfterMs: options.offlineAfterMs } : {}),
+    ...(options.commandStaleAfterMs !== undefined ? { commandStaleAfterMs: options.commandStaleAfterMs } : {}),
   });
 
   async function cloudflareClientForAccount(id: string): Promise<{ client: CloudflareClient; accountIdentifier: string }> {
@@ -413,7 +424,7 @@ export async function buildApp(options: BuildAppOptions) {
       reply.header('cache-control', 'no-store');
       reply.header('content-security-policy', "default-src 'none'; frame-ancestors 'none'");
     } else {
-      reply.header('content-security-policy', "default-src 'self'; connect-src 'self'; font-src 'self'; img-src 'self' data:; object-src 'none'; base-uri 'self'; frame-ancestors 'none'");
+      reply.header('content-security-policy', "default-src 'self'; connect-src 'self'; font-src 'self' data:; img-src 'self' data:; object-src 'none'; base-uri 'self'; frame-ancestors 'none'");
     }
   });
 
@@ -778,6 +789,13 @@ export async function buildApp(options: BuildAppOptions) {
       );
     }
     return reply.code(201).send(response);
+  });
+  app.delete('/api/agents/:id', { preHandler: (request, reply) => requireUser(request, reply, 'owner') }, async (request) => {
+    const id = idParameter(request);
+    const result = await options.store.removeAgent(id);
+    if (result === 'missing') throw new ApiError(404, 'Agent not found.');
+    if (result === 'blocked') throw new ApiError(409, 'Reassign or remove the Agent dependencies and wait for active commands to finish before removing it.');
+    return { mode: result, cleanupCommand: agentCleanupCommand(id) };
   });
   app.post('/api/agents/enrollment-command', { preHandler: (request, reply) => requireUser(request, reply, 'operator') }, async (request) => {
     const body = objectBody(request.body);

@@ -13,6 +13,7 @@ import {
 import { useEffect, useRef, useState } from 'react'
 import { api, ApiError, type Agent, type ManagedStack, type Role, type RuntimeServiceStatus, type TelemetrySnapshot } from './api'
 import type { Locale, Translate } from './App'
+import { copyText } from './clipboard'
 
 const panelClass = 'rounded-[1.4rem] border border-stone-200/80 bg-sand-50 shadow-panel dark:border-white/[0.07] dark:bg-ink-900/80'
 const inputClass = 'h-12 w-full rounded-xl border border-stone-200 bg-white px-3.5 text-sm font-semibold text-ink-800 outline-none transition focus:border-mint-400 focus:ring-4 focus:ring-mint-400/10 disabled:cursor-not-allowed disabled:opacity-60 dark:border-white/[0.08] dark:bg-white/[0.035] dark:text-stone-100'
@@ -158,7 +159,7 @@ export function LogsPage({ t, locale, role }: { t: Translate; locale: Locale; ro
   }
 
   async function copy() {
-    try { await navigator.clipboard.writeText(logs); setCopied(true); window.setTimeout(() => setCopied(false), 2_000) }
+    try { await copyText(logs); setCopied(true); window.setTimeout(() => setCopied(false), 2_000) }
     catch { setError(t('copyFailed')) }
   }
 

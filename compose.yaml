@@ -65,7 +65,7 @@ services:
       DATABASE_USER: gateway_control
       DATABASE_PASSWORD_FILE: /run/gateway-secrets/database-password
       GATEWAY_CONTROL_MASTER_KEY_FILE: /run/gateway-secrets/master-key
-      SESSION_COOKIE_SECURE: "true"
+      SESSION_COOKIE_SECURE: ${SESSION_COOKIE_SECURE:-true}
       SESSION_TTL_HOURS: ${SESSION_TTL_HOURS:-24}
       TRUST_PROXY: ${TRUST_PROXY:-false}
       GATEWAY_AGENT_IMAGE: ${GATEWAY_AGENT_IMAGE:-gateway-control-agent:local}

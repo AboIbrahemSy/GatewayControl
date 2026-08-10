@@ -29,6 +29,16 @@ function cloudflareResponse(result: unknown = {}, options: { status?: number; su
 }
 
 describe('control-plane API', () => {
+  it('allows bundled data fonts in the application content security policy', async () => {
+    const store = new FakeStore();
+    const app = await buildApp({ store, masterKey: randomBytes(32), secureCookie: false });
+    apps.push(app);
+
+    const response = await app.inject({ method: 'GET', url: '/' });
+
+    expect(response.headers['content-security-policy']).toContain("font-src 'self' data:");
+  }, 15_000);
+
   it('reports first-run state and allows owner setup exactly once', async () => {
     const store = new FakeStore();
     const app = await buildApp({ store, masterKey: randomBytes(32), secureCookie: false });
@@ -121,8 +131,52 @@ describe('control-plane API', () => {
     expect(heartbeat.statusCode).toBe(200);
 
     const localDefinition = await app.inject({ method: 'POST', url: '/api/agents', headers: { cookie }, payload: { name: 'local-edge', baseUrl: 'http://127.0.0.1:8080', image: 'gateway-control-agent:local' } });
+    expect(localDefinition.json().enrollmentCommand).toContain("docker image inspect 'gateway-control-agent:local'");
+    expect(localDefinition.json().enrollmentCommand).toContain('Build it on this host before enrollment.');
     expect(localDefinition.json().enrollmentCommand).toContain('--pull never');
     expect(localDefinition.json().enrollmentCommand).toContain('GATEWAY_ALLOW_INSECURE_HTTP=true');
+  });
+
+  it('lets only owners safely remove unassigned agents and returns host cleanup instructions', async () => {
+    const { app, store, cookie } = await appWithOwner();
+    const pendingResponse = await app.inject({
+      method: 'POST', url: '/api/agents', headers: { cookie },
+      payload: { name: 'pending-removal', baseUrl: 'https://control.example.test', image: 'example/gateway-agent:1.0.0' },
+    });
+    const pendingAgent = pendingResponse.json().agent;
+    const operator = await store.createUser('operator@example.com', store.users[0]!.passwordHash, 'operator');
+    store.sessions.set(hashToken('operator-session-token-that-is-long-enough'), operator.id);
+
+    const forbidden = await app.inject({
+      method: 'DELETE', url: `/api/agents/${pendingAgent.id}`,
+      headers: { cookie: 'gateway_control_session=operator-session-token-that-is-long-enough' },
+    });
+    expect(forbidden.statusCode).toBe(403);
+
+    const deleted = await app.inject({ method: 'DELETE', url: `/api/agents/${pendingAgent.id}`, headers: { cookie } });
+    expect(deleted.statusCode).toBe(200);
+    expect(deleted.json()).toMatchObject({ mode: 'deleted' });
+    expect(deleted.json().cleanupCommand).toContain(`gateway-agent-${pendingAgent.id.slice(0, 8)}`);
+    expect(store.agents.some((agent) => agent.id === pendingAgent.id)).toBe(false);
+
+    const enrolledResponse = await app.inject({
+      method: 'POST', url: '/api/agents', headers: { cookie },
+      payload: { name: 'enrolled-removal', baseUrl: 'https://control.example.test', image: 'example/gateway-agent:1.0.0' },
+    });
+    const enrolledBody = enrolledResponse.json();
+    const enrollment = await app.inject({ method: 'POST', url: '/api/agent/enroll', payload: { enrollmentToken: enrolledBody.enrollmentToken } });
+    const credential = enrollment.json().credential;
+    const archived = await app.inject({ method: 'DELETE', url: `/api/agents/${enrolledBody.agent.id}`, headers: { cookie } });
+    expect(archived.statusCode).toBe(200);
+    expect(archived.json()).toMatchObject({ mode: 'archived' });
+    expect((await store.listAgents()).some((agent) => agent.id === enrolledBody.agent.id)).toBe(false);
+    expect((await app.inject({ method: 'POST', url: '/api/agent/heartbeat', headers: { authorization: `Bearer ${credential}` }, payload: {} })).statusCode).toBe(401);
+
+    const assigned = await store.createAgent('assigned-removal', hashToken('assigned-enrollment-token-that-is-long'));
+    await store.createStack({ agentId: assigned.id, name: 'assigned-stack', projectName: 'assigned-stack', encryptedComposeYaml: 'encrypted', enabled: false });
+    const blocked = await app.inject({ method: 'DELETE', url: `/api/agents/${assigned.id}`, headers: { cookie } });
+    expect(blocked.statusCode).toBe(409);
+    expect((await store.listAgents()).some((agent) => agent.id === assigned.id)).toBe(true);
   });
 
   it('preserves configured Telegram credentials when only events change', async () => {
@@ -397,6 +451,33 @@ describe('control-plane API', () => {
     expect(listedRestores.json().restores[0]).toMatchObject({ id: restored.json().restore.id, backupId, status: 'pending' });
     const restorePoll = await app.inject({ method: 'GET', url: '/api/agent/commands', headers: { authorization: `Bearer ${credential}` } });
     expect(restorePoll.json().commands[0].payload).toMatchObject({ backupId, target: 'nas', projectName: 'data_project' });
+  });
+
+  it('fails backup and restore commands that remain incomplete for 24 hours', async () => {
+    const store = new FakeStore();
+    const owner = await store.createOwner('owner@example.com', 'password-hash');
+    const agent = await store.createAgent('stale-operation-agent', hashToken('stale-operation-enrollment-token'));
+    const stack = await store.createStack({ agentId: agent.id, name: 'stale', projectName: 'stale', encryptedComposeYaml: 'encrypted', enabled: true });
+    store.commands.length = 0;
+
+    const staleBackup = await store.createBackup(stack!.id, owner!.id, 'local');
+    store.commands[0]!.createdAt = new Date(Date.now() - 25 * 60 * 60_000).toISOString();
+    await store.claimCommands(agent.id, 1);
+    expect(await store.failStaleCommands(new Date(Date.now() - 24 * 60 * 60_000))).toBe(1);
+    expect(staleBackup).toMatchObject({ status: 'failed', result: { error: 'The operation exceeded the 24-hour completion window.' } });
+    expect(store.events.at(-1)).toMatchObject({ type: 'backup.failed', payload: { operation: 'backup', reason: 'stale' } });
+
+    const successfulBackup = await store.createBackup(stack!.id, owner!.id, 'local');
+    const backupCommand = store.commands.at(-1)!;
+    await store.claimCommands(agent.id, 1);
+    await store.completeCommand(agent.id, backupCommand.id, 'succeeded', {});
+    const staleRestore = await store.createRestore((successfulBackup as { id: string }).id, owner!.id);
+    const restoreCommand = store.commands.at(-1)!;
+    restoreCommand.createdAt = new Date(Date.now() - 25 * 60 * 60_000).toISOString();
+    await store.claimCommands(agent.id, 1);
+    expect(await store.failStaleCommands(new Date(Date.now() - 24 * 60 * 60_000))).toBe(1);
+    expect(staleRestore).toMatchObject({ status: 'failed', result: { error: 'The operation exceeded the 24-hour completion window.' } });
+    expect(store.events.at(-1)).toMatchObject({ type: 'backup.failed', payload: { operation: 'restore', reason: 'stale' } });
   });
 
   it('dispatches selected durable backup events through injected Telegram fetch', async () => {

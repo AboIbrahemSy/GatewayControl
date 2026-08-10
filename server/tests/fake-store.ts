@@ -10,8 +10,8 @@ export class FakeStore implements Store {
   public cloudflarePublicHostnames: CloudflarePublicHostname[] = [];
   public stacks: Array<ManagedStack & { encryptedComposeYaml: string }> = [];
   public routes: ManagedRoute[] = [];
-  public agents: Array<Agent & { enrollmentTokenHash?: string; credentialHash?: string }> = [];
-  public commands: AgentCommand[] = [];
+  public agents: Array<Agent & { enrollmentTokenHash?: string; credentialHash?: string; archivedAt?: string }> = [];
+  public commands: Array<AgentCommand & { createdAt?: string }> = [];
   public notificationSecrets: { botTokenEncrypted: string; groupIdEncrypted: string } | null = null;
   public selectedEvents: string[] = [];
   public telemetry: TelemetrySnapshot[] = [];
@@ -184,11 +184,34 @@ export class FakeStore implements Store {
     this.notificationSecrets = { botTokenEncrypted, groupIdEncrypted };
     this.selectedEvents = selectedEvents;
   }
-  public async listAgents(): Promise<Agent[]> { return this.agents; }
+  public async listAgents(): Promise<Agent[]> { return this.agents.filter((item) => !item.archivedAt); }
   public async createAgent(name: string, enrollmentTokenHash: string): Promise<Agent> {
     const created = { id: randomUUID(), name, enabled: true, enrolledAt: null, lastHeartbeatAt: null, createdAt: new Date().toISOString(), enrollmentTokenHash };
     this.agents.push(created);
     return created;
+  }
+  public async removeAgent(id: string): Promise<'deleted' | 'archived' | 'blocked' | 'missing'> {
+    const index = this.agents.findIndex((item) => item.id === id && !item.archivedAt);
+    if (index < 0) return 'missing';
+    const item = this.agents[index]!;
+    const blocked = this.connectors.some((connector) => connector.agentId === id)
+      || this.stacks.some((stack) => stack.agentId === id)
+      || this.routes.some((route) => route.gatewayAgentId === id)
+      || this.backups.some((backup) => backup.agentId === id)
+      || this.restores.some((restore) => restore.agentId === id)
+      || this.commands.some((command) => command.agentId === id && ['pending', 'claimed'].includes(command.status));
+    if (blocked) return 'blocked';
+    const hasHistory = this.commands.some((command) => command.agentId === id)
+      || this.telemetry.some((snapshot) => snapshot.agentId === id);
+    if (!item.enrolledAt && !hasHistory) {
+      this.agents.splice(index, 1);
+      return 'deleted';
+    }
+    item.enabled = false;
+    item.archivedAt = new Date().toISOString();
+    delete item.enrollmentTokenHash;
+    delete item.credentialHash;
+    return 'archived';
   }
   public async enrollAgent(enrollmentTokenHash: string, credentialHash: string): Promise<Agent | null> {
     const item = this.agents.find((agent) => agent.enrollmentTokenHash === enrollmentTokenHash && !agent.enrolledAt);
@@ -215,10 +238,10 @@ export class FakeStore implements Store {
     }
   }
   public async getMonitoringSummary(): Promise<TelemetrySnapshot[]> {
-    return [...new Map(this.telemetry.map((item) => [item.agentId, item])).values()];
+    return [...new Map(this.telemetry.filter((item) => this.agents.some((agent) => agent.id === item.agentId && !agent.archivedAt)).map((item) => [item.agentId, item])).values()];
   }
   public async getAgentMonitoring(agentId: string): Promise<{ agent: Agent; latest: TelemetrySnapshot | null; history: TelemetrySnapshot[] } | null> {
-    const found = this.agents.find((item) => item.id === agentId);
+    const found = this.agents.find((item) => item.id === agentId && !item.archivedAt);
     if (!found) return null;
     const history = this.telemetry.filter((item) => item.agentId === agentId).slice(0, 288);
     return { agent: found, latest: history[0] ?? null, history };
@@ -274,7 +297,7 @@ export class FakeStore implements Store {
   }
   public async createCommand(agentId: string, type: string, payload: Record<string, unknown>): Promise<AgentCommand | null> {
     if (!this.agents.some((item) => item.id === agentId && item.enabled)) return null;
-    const created: AgentCommand = { id: randomUUID(), agentId, type, payload, status: 'pending' };
+    const created: AgentCommand & { createdAt: string } = { id: randomUUID(), agentId, type, payload, status: 'pending', createdAt: new Date().toISOString() };
     this.commands.push(created);
     return created;
   }
@@ -342,12 +365,37 @@ export class FakeStore implements Store {
     if (found) Object.assign(found, { status: terminal ? 'failed' : 'pending', error });
   }
   public async sweepOfflineAgents(_offlineBefore: Date): Promise<number> { return 0; }
+  public async failStaleCommands(staleBefore: Date): Promise<number> {
+    const stale = this.commands.filter((command) => ['stack.backup.create', 'stack.restore.apply'].includes(command.type)
+      && ['pending', 'claimed'].includes(command.status) && Date.parse(command.createdAt ?? '') < staleBefore.getTime());
+    const completedAt = new Date().toISOString();
+    const result = { error: 'The operation exceeded the 24-hour completion window.' };
+    for (const command of stale) {
+      command.status = 'failed';
+      command.result = result;
+      if (command.type === 'stack.backup.create') {
+        const backup = this.backups.find((item) => item.commandId === command.id && ['pending', 'running'].includes(item.status));
+        if (backup) {
+          Object.assign(backup, { status: 'failed', result, completedAt, updatedAt: completedAt });
+          this.queueEvent('backup.failed', { backupId: backup.id, operation: 'backup', reason: 'stale' });
+        }
+      }
+      if (command.type === 'stack.restore.apply') {
+        const restore = this.restores.find((item) => item.commandId === command.id && ['pending', 'running'].includes(item.status));
+        if (restore) {
+          Object.assign(restore, { status: 'failed', result, completedAt, updatedAt: completedAt });
+          this.queueEvent('backup.failed', { restoreId: restore.id, backupId: restore.backupId, operation: 'restore', reason: 'stale' });
+        }
+      }
+    }
+    return stale.length;
+  }
   public async close(): Promise<void> {}
 
   private queueInternalSync(agentId: string, type: string, entityKey: string, entityId: string): AgentCommand {
     const existing = this.commands.find((command) => command.agentId === agentId && command.type === type && command.status === 'pending' && command.payload[entityKey] === entityId);
     if (existing) return existing;
-    const command: AgentCommand = { id: randomUUID(), agentId, type, payload: { [entityKey]: entityId }, status: 'pending' };
+    const command: AgentCommand & { createdAt: string } = { id: randomUUID(), agentId, type, payload: { [entityKey]: entityId }, status: 'pending', createdAt: new Date().toISOString() };
     this.commands.push(command);
     return command;
   }

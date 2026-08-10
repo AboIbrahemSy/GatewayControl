@@ -442,7 +442,7 @@ export class PgStore implements Store {
   }
 
   public async listAgents(): Promise<Agent[]> {
-    const result = await this.pool.query('SELECT id, name, enabled, enrolled_at, last_heartbeat_at, created_at FROM agents ORDER BY name');
+    const result = await this.pool.query('SELECT id, name, enabled, enrolled_at, last_heartbeat_at, created_at FROM agents WHERE archived_at IS NULL ORDER BY name');
     return result.rows.map(agent);
   }
 
@@ -453,6 +453,46 @@ export class PgStore implements Store {
       [name, enrollmentTokenHash, enrollmentExpiresAt],
     );
     return agent(result.rows[0]);
+  }
+
+  public async removeAgent(id: string): Promise<'deleted' | 'archived' | 'blocked' | 'missing'> {
+    return this.transaction(async (client) => {
+      const agentResult = await client.query('SELECT id, enrolled_at FROM agents WHERE id = $1 AND archived_at IS NULL FOR UPDATE', [id]);
+      if (!agentResult.rows[0]) return 'missing';
+
+      const dependencyResult = await client.query(
+        `SELECT
+          EXISTS (SELECT 1 FROM cloudflare_connectors WHERE agent_id = $1)
+          OR EXISTS (SELECT 1 FROM managed_stacks WHERE agent_id = $1)
+          OR EXISTS (SELECT 1 FROM managed_routes WHERE gateway_agent_id = $1)
+          OR EXISTS (SELECT 1 FROM stack_backups WHERE agent_id = $1)
+          OR EXISTS (SELECT 1 FROM stack_restores WHERE agent_id = $1)
+          OR EXISTS (SELECT 1 FROM agent_commands WHERE agent_id = $1 AND status IN ('pending', 'claimed'))
+          AS blocked`,
+        [id],
+      );
+      if (dependencyResult.rows[0].blocked) return 'blocked';
+
+      const historyResult = await client.query(
+        `SELECT
+          EXISTS (SELECT 1 FROM agent_commands WHERE agent_id = $1)
+          OR EXISTS (SELECT 1 FROM agent_telemetry_snapshots WHERE agent_id = $1)
+          OR EXISTS (SELECT 1 FROM operational_events WHERE agent_id = $1)
+          AS referenced`,
+        [id],
+      );
+      if (!agentResult.rows[0].enrolled_at && !historyResult.rows[0].referenced) {
+        await client.query('DELETE FROM agents WHERE id = $1', [id]);
+        return 'deleted';
+      }
+
+      await client.query(
+        `UPDATE agents SET enabled = false, enrollment_token_hash = NULL, enrollment_expires_at = NULL,
+         credential_hash = NULL, archived_at = now(), offline_detected_at = NULL, updated_at = now() WHERE id = $1`,
+        [id],
+      );
+      return 'archived';
+    });
   }
 
   public async enrollAgent(enrollmentTokenHash: string, credentialHash: string): Promise<Agent | null> {
@@ -503,12 +543,16 @@ export class PgStore implements Store {
   }
 
   public async getMonitoringSummary(): Promise<TelemetrySnapshot[]> {
-    const result = await this.pool.query('SELECT DISTINCT ON (agent_id) * FROM agent_telemetry_snapshots ORDER BY agent_id, observed_at DESC');
+    const result = await this.pool.query(
+      `SELECT DISTINCT ON (snapshot.agent_id) snapshot.* FROM agent_telemetry_snapshots snapshot
+       JOIN agents agent ON agent.id = snapshot.agent_id WHERE agent.archived_at IS NULL
+       ORDER BY snapshot.agent_id, snapshot.observed_at DESC`,
+    );
     return result.rows.map(telemetry);
   }
 
   public async getAgentMonitoring(agentId: string): Promise<{ agent: Agent; latest: TelemetrySnapshot | null; history: TelemetrySnapshot[] } | null> {
-    const agentResult = await this.pool.query('SELECT id, name, enabled, enrolled_at, last_heartbeat_at, created_at FROM agents WHERE id = $1', [agentId]);
+    const agentResult = await this.pool.query('SELECT id, name, enabled, enrolled_at, last_heartbeat_at, created_at FROM agents WHERE id = $1 AND archived_at IS NULL', [agentId]);
     if (!agentResult.rows[0]) return null;
     const snapshots = await this.pool.query('SELECT * FROM agent_telemetry_snapshots WHERE agent_id = $1 ORDER BY observed_at DESC LIMIT 288', [agentId]);
     const history = snapshots.rows.map(telemetry);
@@ -723,6 +767,47 @@ export class PgStore implements Store {
       );
       for (const row of result.rows) await this.enqueueEvent(client, 'agent.offline', { agentId: row.id, payload: { agentId: row.id, agentName: row.name } });
       return result.rowCount ?? 0;
+    });
+  }
+
+  public async failStaleCommands(staleBefore: Date): Promise<number> {
+    return this.transaction(async (client) => {
+      const safeResult = { error: 'The operation exceeded the 24-hour completion window.' };
+      const commands = await client.query(
+        `UPDATE agent_commands SET status = 'failed', result = $2, completed_at = now(), lease_expires_at = NULL
+         WHERE type IN ('stack.backup.create', 'stack.restore.apply') AND status IN ('pending', 'claimed') AND created_at < $1
+         RETURNING id, agent_id, type, payload`,
+        [staleBefore, safeResult],
+      );
+      for (const commandRow of commands.rows) {
+        if (commandRow.type === 'stack.backup.create') {
+          const operation = await client.query(
+            `UPDATE stack_backups SET status = 'failed', result = $2, completed_at = now(), updated_at = now()
+             WHERE command_id = $1 AND status IN ('pending', 'running') RETURNING id, stack_id`,
+            [commandRow.id, safeResult],
+          );
+          if (operation.rows[0]) {
+            await this.enqueueEvent(client, 'backup.failed', {
+              agentId: commandRow.agent_id, stackId: operation.rows[0].stack_id,
+              payload: { backupId: operation.rows[0].id, operation: 'backup', reason: 'stale' },
+            });
+          }
+        }
+        if (commandRow.type === 'stack.restore.apply') {
+          const operation = await client.query(
+            `UPDATE stack_restores SET status = 'failed', result = $2, completed_at = now(), updated_at = now()
+             WHERE command_id = $1 AND status IN ('pending', 'running') RETURNING id, stack_id, backup_id`,
+            [commandRow.id, safeResult],
+          );
+          if (operation.rows[0]) {
+            await this.enqueueEvent(client, 'backup.failed', {
+              agentId: commandRow.agent_id, stackId: operation.rows[0].stack_id,
+              payload: { restoreId: operation.rows[0].id, backupId: operation.rows[0].backup_id, operation: 'restore', reason: 'stale' },
+            });
+          }
+        }
+      }
+      return commands.rowCount ?? 0;
     });
   }
 
