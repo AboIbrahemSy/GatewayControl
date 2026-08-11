@@ -336,9 +336,9 @@ export const api = {
   updateCloudflareAccount: (id: string, input: UpdateCloudflareAccountInput) =>
     request<{ account: CloudflareAccount }>(`/cloudflare/accounts/${encodeURIComponent(id)}`, { method: 'PATCH', body: JSON.stringify(input) }),
   testCloudflareAccount: (id: string) =>
-    request<{ verified: true }>(`/cloudflare/accounts/${encodeURIComponent(id)}/test`, { method: 'POST' }),
+    request<{ verified: true; zoneCount?: number }>(`/cloudflare/accounts/${encodeURIComponent(id)}/test`, { method: 'POST' }),
   syncCloudflareAccount: (id: string) =>
-    request<{ zones: CloudflareZone[] }>(`/cloudflare/accounts/${encodeURIComponent(id)}/sync`, { method: 'POST' }),
+    request<{ zones: CloudflareZone[]; zoneCount?: number }>(`/cloudflare/accounts/${encodeURIComponent(id)}/sync`, { method: 'POST' }),
   cloudflareZones: (accountId: string) =>
     request<{ zones: CloudflareZone[] }>(`/cloudflare/accounts/${encodeURIComponent(accountId)}/zones`),
   cloudflareDomainAccess: () => request<{ domainAccess: CloudflareDomainAccess[] }>('/cloudflare/domain-access'),

@@ -216,8 +216,8 @@ export function CloudflareManagementPage({
     setSuccess("");
     try {
       if (action === "test") {
-        await api.testCloudflareAccount(account.id);
-        setSuccess(t("cloudflareTestSucceeded"));
+        const result = await api.testCloudflareAccount(account.id);
+        setSuccess(zoneResultMessage(t, locale, "cloudflareTestWithZones", "cloudflareNoZoneAccess", result.zoneCount, "cloudflareTestSucceeded"));
       } else {
         const result = await api.syncCloudflareAccount(account.id);
         setZonesByAccount((current) => ({
@@ -228,10 +228,16 @@ export function CloudflareManagementPage({
         setZoneId(result.zones[0]?.id || "");
         const refreshed = await api.cloudflareAccounts();
         setAccounts(refreshed.accounts);
-        setSuccess(t("cloudflareSyncSucceeded"));
+        setSuccess(zoneResultMessage(t, locale, "cloudflareSyncWithZones", "cloudflareSyncNoZones", result.zoneCount ?? result.zones.length));
       }
     } catch (caught) {
       setError(friendlyError(caught, t));
+      try {
+        const refreshed = await api.cloudflareAccounts();
+        setAccounts(refreshed.accounts);
+      } catch {
+        // Preserve the actionable operation error if refreshing account state also fails.
+      }
     } finally {
       setBusy("");
     }
@@ -716,7 +722,7 @@ function AccountsArea({
                     onClick={() => action(account, "test")}
                   >
                     <ShieldCheck size={15} />
-                    {t("testAccount")}
+                    {t("testZoneAccess")}
                   </button>
                   <button
                     type="button"
@@ -1356,6 +1362,11 @@ function hostnameWithinZone(hostname: string, zone: string) {
 function parseIpList(value: string) {
   return value.split(/[\s,]+/).map((item) => item.trim()).filter(Boolean);
 }
+function zoneResultMessage(t: Translate, locale: Locale, successKey: MessageKey, emptyKey: MessageKey, zoneCount: number | undefined, unavailableKey?: MessageKey) {
+  if (zoneCount === undefined && unavailableKey) return t(unavailableKey);
+  const count = typeof zoneCount === "number" && Number.isFinite(zoneCount) && zoneCount > 0 ? Math.floor(zoneCount) : 0;
+  return t(count > 0 ? successKey : emptyKey).replace("{count}", new Intl.NumberFormat(locale).format(count));
+}
 function friendlyError(error: unknown, t: Translate) {
   if (error instanceof ApiError) {
     const codeMessages: Partial<Record<string, MessageKey>> = {
@@ -1368,6 +1379,15 @@ function friendlyError(error: unknown, t: Translate) {
       dns_record_conflict: "dnsRecordConflict",
       cloudflare_reconciliation_failed: "cloudflareReconciliationFailed",
       domain_access_dependency_enabled: "linkedDomainAccessEnabled",
+      cloudflare_token_invalid: "cloudflareTokenInvalid",
+      cloudflare_token_inactive: "cloudflareTokenInactive",
+      cloudflare_token_verification_failed: "cloudflareTokenVerificationFailed",
+      cloudflare_account_mismatch: "cloudflareAccountMismatch",
+      cloudflare_zone_access_denied: "cloudflareZoneAccessDenied",
+      cloudflare_zone_access_forbidden: "cloudflareZoneAccessDenied",
+      cloudflare_zone_list_failed: "cloudflareZoneListFailed",
+      cloudflare_rate_limited: "cloudflareRateLimited",
+      cloudflare_service_unavailable: "cloudflareServiceUnavailable",
     };
     const mappedCode = error.code ? codeMessages[error.code] : undefined;
     if (mappedCode) return t(mappedCode);

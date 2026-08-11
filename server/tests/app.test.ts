@@ -1,6 +1,7 @@
 import { randomBytes, randomUUID } from 'node:crypto';
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import { buildApp } from '../src/app.js';
+import { CloudflareClient } from '../src/cloudflare-client.js';
 import { hashToken } from '../src/crypto.js';
 import { FakeStore } from './fake-store.js';
 import { SystemRecoveryFailure, type SystemRecoveryService } from '../src/system-recovery.js';
@@ -497,6 +498,9 @@ describe('control-plane API', () => {
     expect(polled.json().commands).toHaveLength(1);
     expect(polled.json().commands[0].payload).toMatchObject({ projectName: 'authoritative', serviceName: 'web', tail: 100 });
     expect(polled.json().commands[0].payload).not.toHaveProperty('requestedByUserId');
+    const failedLogs = await app.inject({ method: 'POST', url: `/api/agent/commands/${logCommand.id}/result`, headers: { authorization: `Bearer ${credential}` }, payload: { status: 'failed', result: { error: 'runtime log collection failed: permission denied' } } });
+    expect(failedLogs.statusCode).toBe(200);
+    expect((await app.inject({ method: 'GET', url: `/api/runtime-log-requests/${queued.json().request.id}`, headers: { cookie } })).json().request.error).toBe('runtime log collection failed: permission denied');
     expect((await app.inject({ method: 'GET', url: `/api/runtime-log-requests/${queued.json().request.id}`, headers: { cookie } })).statusCode).toBe(200);
     const other = await store.createUser('other@example.com', store.users[0]!.passwordHash, 'operator'); store.sessions.set(hashToken('other-operator-session-token-long-enough'), other.id);
     expect((await app.inject({ method: 'GET', url: `/api/runtime-log-requests/${queued.json().request.id}`, headers: { cookie: 'gateway_control_session=other-operator-session-token-long-enough' } })).statusCode).toBe(404);
@@ -709,14 +713,46 @@ describe('control-plane API', () => {
     const viewerCookie = 'gateway_control_session=cloudflare-viewer-session-token-long-enough';
     expect((await app.inject({ method: 'GET', url: '/api/cloudflare/accounts', headers: { cookie: viewerCookie } })).statusCode).toBe(200);
     expect((await app.inject({ method: 'POST', url: `/api/cloudflare/accounts/${accountId}/test`, headers: { cookie: viewerCookie } })).statusCode).toBe(403);
-    expect((await app.inject({ method: 'POST', url: `/api/cloudflare/accounts/${accountId}/test`, headers: { cookie } })).json()).toEqual({ verified: true });
+    expect((await app.inject({ method: 'POST', url: `/api/cloudflare/accounts/${accountId}/test`, headers: { cookie } })).json()).toEqual({ verified: true, zoneCount: 2 });
     const synced = await app.inject({ method: 'POST', url: `/api/cloudflare/accounts/${accountId}/sync`, headers: { cookie } });
     expect(synced.statusCode).toBe(200);
+    expect(synced.json().zoneCount).toBe(2);
     expect(synced.json().zones).toHaveLength(2);
     expect((await app.inject({ method: 'POST', url: `/api/cloudflare/accounts/${accountId}/sync`, headers: { cookie } })).json().zones).toHaveLength(2);
     expect(store.cloudflareZones.map((zone) => zone.name)).toEqual(['one.example', 'two.example']);
     expect(store.cloudflareAccounts[0]?.lastSyncedAt).not.toBeNull();
-    expect(fetchMock).toHaveBeenCalledTimes(7);
+    expect(fetchMock).toHaveBeenCalledTimes(9);
+  });
+
+  it('tests zero-zone accounts and maps zone authorization failures without leaking Cloudflare responses', async () => {
+    const apiToken = 'cloudflare-zone-test-token-that-must-not-leak';
+    let denyZones = false;
+    const fetchMock = vi.fn<typeof globalThis.fetch>(async (input) => {
+      if (String(input).endsWith('/user/tokens/verify')) return cloudflareResponse({ status: 'active' });
+      if (denyZones) return cloudflareResponse({ private: apiToken }, { status: 403, success: false, errors: [{ code: 1000 }] });
+      return cloudflareResponse([], { resultInfo: { page: 1, total_pages: 1 } });
+    });
+    const { app, cookie } = await appWithOwner({ fetch: fetchMock });
+    const created = await app.inject({ method: 'POST', url: '/api/cloudflare/accounts', headers: { cookie }, payload: { name: 'Empty', accountIdentifier: '3'.repeat(32), apiToken } });
+    const accountId = created.json().account.id as string;
+    expect((await app.inject({ method: 'POST', url: `/api/cloudflare/accounts/${accountId}/test`, headers: { cookie } })).json()).toEqual({ verified: true, zoneCount: 0 });
+    denyZones = true;
+    const denied = await app.inject({ method: 'POST', url: `/api/cloudflare/accounts/${accountId}/test`, headers: { cookie } });
+    expect(denied.statusCode).toBe(502);
+    expect(denied.json().code).toBe('cloudflare_zone_access_denied');
+    expect(denied.body).not.toContain(apiToken);
+  });
+
+  it('rejects unstable zone pagination and duplicate zone identifiers', async () => {
+    const accountIdentifier = '4'.repeat(32);
+    const zone = { id: '5'.repeat(32), name: 'example.test', status: 'active' };
+    const unstable = vi.fn<typeof globalThis.fetch>(async (input) => String(input).includes('page=1')
+      ? cloudflareResponse([zone], { resultInfo: { page: 1, total_pages: 2 } })
+      : cloudflareResponse([], { resultInfo: { page: 2, total_pages: 3 } }));
+    await expect(new CloudflareClient('token', unstable).listZones(accountIdentifier)).rejects.toThrow('invalid zone pagination metadata');
+
+    const duplicate = vi.fn<typeof globalThis.fetch>().mockResolvedValue(cloudflareResponse([zone, zone], { resultInfo: { page: 1, total_pages: 1 } }));
+    await expect(new CloudflareClient('token', duplicate).listZones(accountIdentifier)).rejects.toThrow('duplicate zone identifiers');
   });
 
   it('reconciles and disables a public hostname while preserving unrelated tunnel ingress', async () => {
@@ -813,7 +849,7 @@ describe('control-plane API', () => {
     const agent = await store.createAgent('rollback-agent', hashToken('rollback-agent-enrollment-token-long-enough'));
     store.agents.find((item) => item.id === agent.id)!.enrolledAt = new Date().toISOString();
     const rollbackTunnelId = randomUUID();
-    const connector = await store.createConnector({ name: 'rollback-tunnel', encryptedToken: 'encrypted-agent-token', enabled: true, agentId: agent.id, accountId: secondId, accountIdentifier: '5'.repeat(32), tunnelId: rollbackTunnelId });
+    const connector = await store.createConnector({ name: 'rollback-tunnel', encryptedToken: 'encrypted-agent-token', enabled: true, agentId: agent.id, accountId: secondId, accountIdentifier: '5'.repeat(32), tunnelId: rollbackTunnelId, identityStatus: 'verified' });
     const route = await store.createRoute({ gatewayAgentId: agent.id, name: 'rollback', hostname: 'rollback.example.test', exposure: 'tunnel', backends: ['http://rollback:80'], enabled: true });
     route!.status = 'active';
     const mismatch = await app.inject({ method: 'POST', url: '/api/cloudflare/public-hostnames', headers: { cookie }, payload: { zoneId: store.cloudflareZones[0]!.id, connectorId: connector!.id, routeId: route!.id } });

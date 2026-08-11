@@ -9,7 +9,7 @@ import { CloudflareClient, CloudflareClientError, type CloudflareDnsRecord, type
 import { CloudflareTunnelTokenError, parseCloudflareTunnelToken, type ParsedCloudflareTunnelToken } from './cloudflare-tunnel-token.js';
 import { NotificationDispatcher } from './notification-dispatcher.js';
 import { SystemRecoveryFailure, type SystemRecoveryService } from './system-recovery.js';
-import { OPERATIONAL_EVENT_TYPES, type Agent, type AgentCommand, type Role, type StackBackup, type StackRestore, type Store, type SystemBackup, type SystemRestore, type User } from './types.js';
+import { OPERATIONAL_EVENT_TYPES, type Agent, type AgentCommand, type Connector, type Role, type StackBackup, type StackRestore, type Store, type SystemBackup, type SystemRestore, type User } from './types.js';
 
 const SESSION_COOKIE = 'gateway_control_session';
 const EMAIL_PATTERN = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
@@ -441,6 +441,34 @@ function safeCloudflareError(error: unknown): string {
   return error instanceof CloudflareClientError ? error.message.slice(0, 500) : 'Cloudflare reconciliation failed.';
 }
 
+function cloudflareAccountApiError(error: unknown, operation: 'token' | 'zones'): ApiError {
+  if (!(error instanceof CloudflareClientError)) {
+    return new ApiError(502, 'Cloudflare could not be reached.', 'cloudflare_unreachable');
+  }
+  const accountScopeCodes = new Set([1001, 7003]);
+  const tokenCodes = new Set([10000, 9109]);
+  if (operation === 'token' && (error.status === 401 || error.status === 403 || (error.code !== undefined && tokenCodes.has(error.code)))) {
+    return new ApiError(502, 'The Cloudflare API token is invalid.', 'cloudflare_token_invalid');
+  }
+  if (operation === 'zones' && error.code !== undefined && accountScopeCodes.has(error.code)) {
+    return new ApiError(502, 'The Cloudflare API token does not have access to the configured account.', 'cloudflare_account_scope_mismatch');
+  }
+  if (operation === 'zones' && error.status === 401) {
+    return new ApiError(502, 'The Cloudflare API token is invalid.', 'cloudflare_token_invalid');
+  }
+  if (operation === 'zones' && error.status === 403) {
+    return new ApiError(502, 'The Cloudflare API token cannot list zones for this account.', 'cloudflare_zone_access_denied');
+  }
+  if (error.status === 0 || error.status >= 500 && error.status !== 502) {
+    return new ApiError(502, 'Cloudflare could not be reached.', 'cloudflare_unreachable');
+  }
+  return new ApiError(502, 'Cloudflare returned an invalid zones response.', 'cloudflare_zone_response_invalid');
+}
+
+function connectorIdentityAllowsRuntime(status: Connector['identityStatus'], accountIdentifier: string | null, tunnelId: string | null): boolean {
+  return ['verified', 'parsed', 'unmatched', 'mismatch', 'failed'].includes(status) && accountIdentifier !== null && tunnelId !== null;
+}
+
 function enabledIngress(ingress: CloudflareIngressRule[], hostname: string): CloudflareIngressRule[] {
   const retained = ingress.filter((rule) => rule.hostname?.toLowerCase() !== hostname);
   const namedRules = retained.filter((rule) => rule.hostname !== undefined);
@@ -527,6 +555,41 @@ export async function buildApp(options: BuildAppOptions) {
     }
     try {
       return await verifyParsedConnectorIdentity(parsed);
+    } finally {
+      parsed.secretMaterial.fill(0);
+    }
+  }
+
+  async function connectorIdentityForCreation(token: string, submittedAccountId?: string, submittedTunnelId?: string): Promise<{
+    accountId?: string;
+    accountIdentifier: string;
+    tunnelId: string;
+    identityStatus: Connector['identityStatus'];
+    identityError?: string;
+  }> {
+    let parsed: ParsedCloudflareTunnelToken;
+    try {
+      parsed = parseCloudflareTunnelToken(token);
+    } catch (error) {
+      if (error instanceof CloudflareTunnelTokenError) throw new ApiError(400, 'The Cloudflare tunnel connector token is invalid.', 'invalid_connector_token');
+      throw error;
+    }
+    try {
+      const parsedIdentity = { accountIdentifier: parsed.accountIdentifier, tunnelId: parsed.tunnelId };
+      const account = await options.store.getCloudflareAccountSecretByIdentifier(parsed.accountIdentifier);
+      if (!account) return { ...parsedIdentity, identityStatus: 'unmatched', identityError: 'connector_account_unlinked' };
+      if ((submittedAccountId && submittedAccountId !== account.id)
+        || (submittedTunnelId && submittedTunnelId.toLowerCase() !== parsed.tunnelId)) {
+        return { ...parsedIdentity, accountId: account.id, identityStatus: 'mismatch', identityError: 'connector_submitted_identity_mismatch' };
+      }
+      try {
+        const verified = await verifyParsedConnectorIdentity(parsed);
+        return { ...verified, identityStatus: 'verified' };
+      } catch (error) {
+        const apiError = error instanceof ApiError ? error : new ApiError(503, 'Cloudflare connector identity verification is temporarily unavailable.', 'connector_identity_verification_failed');
+        const status = apiError.code === 'connector_identity_verification_failed' ? 'parsed' : 'mismatch';
+        return { ...parsedIdentity, accountId: account.id, identityStatus: status, identityError: apiError.code ?? 'connector_identity_verification_failed' };
+      }
     } finally {
       parsed.secretMaterial.fill(0);
     }
@@ -896,12 +959,9 @@ export async function buildApp(options: BuildAppOptions) {
     if (!UUID_PATTERN.test(agentId)) throw new ApiError(400, 'agentId must be a valid UUID.');
     const submittedAccountId = optionalUuid(body, 'cloudflareAccountId');
     const submittedTunnelId = optionalUuid(body, 'tunnelId');
-    const identity = await verifyConnectorToken(token);
-    if ((submittedAccountId && submittedAccountId !== identity.accountId) || (submittedTunnelId && submittedTunnelId.toLowerCase() !== identity.tunnelId)) {
-      throw new ApiError(409, 'Submitted connector binding does not match the token identity.', 'connector_submitted_identity_mismatch');
-    }
+    const identity = await connectorIdentityForCreation(token, submittedAccountId, submittedTunnelId);
     const connector = await options.store.createConnector({ name, encryptedToken: secretBox.encrypt(token), enabled, agentId, ...identity });
-    if (!connector) throw new ApiError(409, 'An enabled, enrolled agent and matching Cloudflare account are required.', 'connector_target_unavailable');
+    if (!connector) throw new ApiError(409, 'An enabled, enrolled agent is required.', 'connector_target_unavailable');
     return reply.code(201).send({ connector });
   });
   app.patch('/api/connectors/:id', { preHandler: (request, reply) => requireUser(request, reply, 'operator') }, async (request) => {
@@ -927,8 +987,8 @@ export async function buildApp(options: BuildAppOptions) {
       || (submittedTunnelId && submittedTunnelId.toLowerCase() !== (identity?.tunnelId ?? current.tokenTunnelId))) {
       throw new ApiError(409, 'Submitted connector binding does not match the token identity.', 'connector_submitted_identity_mismatch');
     }
-    if (enabled === true && !identity && current.identityStatus !== 'verified') {
-      throw new ApiError(409, 'The connector identity must be verified before it can be enabled.', 'connector_identity_unverified');
+    if (enabled === true && !identity && !connectorIdentityAllowsRuntime(current.identityStatus, current.tokenAccountIdentifier, current.tokenTunnelId)) {
+      throw new ApiError(409, 'The connector token must contain a parsed identity before it can be enabled.', 'connector_identity_unverified');
     }
     const connector = await options.store.updateConnector(id, {
       ...(name !== undefined ? { name } : {}),
@@ -973,28 +1033,33 @@ export async function buildApp(options: BuildAppOptions) {
     return { account };
   });
   app.post('/api/cloudflare/accounts/:id/test', { preHandler: (request, reply) => requireUser(request, reply, 'operator') }, async (request) => {
-    const { client } = await cloudflareClientForAccount(idParameter(request));
+    const { client, accountIdentifier } = await cloudflareClientForAccount(idParameter(request));
+    let operation: 'token' | 'zones' = 'token';
     try {
       await client.verifyToken();
+      operation = 'zones';
+      const zones = await client.listZones(accountIdentifier);
+      return { verified: true, zoneCount: zones.length };
     } catch (error) {
-      throw new ApiError(502, safeCloudflareError(error));
+      throw cloudflareAccountApiError(error, operation);
     }
-    return { verified: true };
   });
   app.post('/api/cloudflare/accounts/:id/sync', { preHandler: (request, reply) => requireUser(request, reply, 'operator') }, async (request) => {
     const id = idParameter(request);
     const { client, accountIdentifier } = await cloudflareClientForAccount(id);
+    let operation: 'token' | 'zones' = 'token';
     try {
       await client.verifyToken();
+      operation = 'zones';
       const zones = await client.listZones(accountIdentifier);
       const stored = await options.store.syncCloudflareZones(id, zones.map((zone) => ({ zoneIdentifier: zone.id, name: zone.name, status: zone.status })));
       if (!stored) throw new ApiError(404, 'Cloudflare account not found.');
-      return { zones: stored };
+      return { zones: stored, zoneCount: zones.length };
     } catch (error) {
       if (error instanceof ApiError) throw error;
-      const safeError = safeCloudflareError(error);
-      await options.store.syncCloudflareZones(id, [], safeError);
-      throw new ApiError(502, safeError);
+      const apiError = cloudflareAccountApiError(error, operation);
+      await options.store.syncCloudflareZones(id, [], apiError.code ?? 'cloudflare_unreachable');
+      throw apiError;
     }
   });
   app.get('/api/cloudflare/accounts/:id/zones', { preHandler: (request, reply) => requireUser(request, reply) }, async (request) => {
@@ -1393,8 +1458,8 @@ export async function buildApp(options: BuildAppOptions) {
         commands.push({ ...command, payload: { connectorId: deployment.connectorId, revision, enabled: false } });
         continue;
       }
-      if (deployment.identityStatus !== 'verified') {
-        await options.store.completeCommand(agent.id, command.id, 'failed', { error: 'Connector identity is not verified.' });
+      if (!connectorIdentityAllowsRuntime(deployment.identityStatus, deployment.tokenAccountIdentifier, deployment.tokenTunnelId)) {
+        await options.store.completeCommand(agent.id, command.id, 'failed', { error: 'Connector token identity is unavailable.' });
         continue;
       }
       let token: string;

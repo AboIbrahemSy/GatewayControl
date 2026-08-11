@@ -65,6 +65,27 @@ function dnsFetch() {
 }
 
 describe('Cloudflare domain access', () => {
+  it('rejects standalone connectors that are not verified and linked to the selected account', async () => {
+    const dns = dnsFetch();
+    const context = await fixture(dns.fetch, 'tunnel');
+    context.agent.enrolledAt = new Date().toISOString();
+    const tunnelId = randomUUID();
+    const connector = await context.store.createConnector({
+      name: 'standalone', encryptedToken: 'encrypted', enabled: true, agentId: context.agent.id,
+      accountIdentifier: 'a'.repeat(32), tunnelId, identityStatus: 'unmatched', identityError: 'connector_account_unlinked',
+    });
+    context.store.commands.length = 0;
+
+    const created = await context.app.inject({
+      method: 'POST', url: '/api/cloudflare/domain-access', headers: { cookie: context.operatorCookie },
+      payload: { accountId: context.accountId, zoneId: context.zoneId, routeId: context.route.id, accessMethod: 'tunnel', connectorId: connector!.id },
+    });
+
+    expect(created.statusCode).toBe(409);
+    expect(created.json().code).toBe('tunnel_topology_mismatch');
+    expect(dns.fetch).not.toHaveBeenCalled();
+  });
+
   it('lets operators create and viewers read public IPv4/IPv6 access without exposing tokens', async () => {
     const dns = dnsFetch();
     const context = await fixture(dns.fetch);
@@ -139,7 +160,7 @@ describe('Cloudflare domain access', () => {
     const context = await fixture(fetch, 'tunnel');
     const otherAgent = await context.store.createAgent('other-agent', hashToken('other-agent-enrollment-token'));
     context.store.agents.find((item) => item.id === otherAgent.id)!.enrolledAt = new Date().toISOString();
-    const connector = await context.store.createConnector({ name: 'wrong-agent-tunnel', encryptedToken: 'encrypted', enabled: true, agentId: otherAgent.id, accountId: context.accountId, accountIdentifier: 'a'.repeat(32), tunnelId: randomUUID() });
+    const connector = await context.store.createConnector({ name: 'wrong-agent-tunnel', encryptedToken: 'encrypted', enabled: true, agentId: otherAgent.id, accountId: context.accountId, accountIdentifier: 'a'.repeat(32), tunnelId: randomUUID(), identityStatus: 'verified' });
     const payload = { accountId: context.accountId, zoneId: context.zoneId, routeId: context.route.id, accessMethod: 'tunnel', connectorId: connector!.id };
     const mismatch = await context.app.inject({ method: 'POST', url: '/api/cloudflare/domain-access', headers: { cookie: context.ownerCookie }, payload });
     expect(mismatch.json().code).toBe('tunnel_topology_mismatch');
@@ -155,7 +176,7 @@ describe('Cloudflare domain access', () => {
     const fetch = vi.fn<typeof globalThis.fetch>();
     const context = await fixture(fetch, 'tunnel');
     context.store.agents.find((item) => item.id === context.agent.id)!.enrolledAt = new Date().toISOString();
-    const connector = await context.store.createConnector({ name: 'derived mismatch', encryptedToken: 'encrypted', enabled: true, agentId: context.agent.id, accountId: context.accountId, accountIdentifier: 'a'.repeat(32), tunnelId: randomUUID() });
+    const connector = await context.store.createConnector({ name: 'derived mismatch', encryptedToken: 'encrypted', enabled: true, agentId: context.agent.id, accountId: context.accountId, accountIdentifier: 'a'.repeat(32), tunnelId: randomUUID(), identityStatus: 'verified' });
     const payload = { accountId: context.accountId, zoneId: context.zoneId, routeId: context.route.id, accessMethod: 'tunnel', connectorId: connector!.id };
     context.store.connectors[0]!.tokenAccountIdentifier = 'c'.repeat(32);
 
@@ -308,7 +329,7 @@ describe('Cloudflare domain access', () => {
     const agent = await store.createAgent('shared-tunnel-agent', hashToken('shared-tunnel-enrollment'));
     store.agents[0]!.enrolledAt = new Date().toISOString();
     const tunnelId = randomUUID();
-    const connector = await store.createConnector({ name: 'shared', encryptedToken: 'encrypted', enabled: true, agentId: agent.id, accountId: account.id, accountIdentifier: account.accountIdentifier, tunnelId });
+    const connector = await store.createConnector({ name: 'shared', encryptedToken: 'encrypted', enabled: true, agentId: agent.id, accountId: account.id, accountIdentifier: account.accountIdentifier, tunnelId, identityStatus: 'verified' });
     const now = new Date().toISOString();
     for (const hostname of ['one.example.test', 'two.example.test']) {
       store.cloudflareDomainAccess.push({

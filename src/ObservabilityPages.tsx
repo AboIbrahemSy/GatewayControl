@@ -21,6 +21,7 @@ const primaryButton = 'flex min-h-12 items-center justify-center gap-2 rounded-x
 const secondaryButton = 'flex min-h-11 items-center justify-center gap-2 rounded-xl border border-stone-200 bg-white px-4 text-xs font-extrabold transition hover:border-mint-400 disabled:cursor-not-allowed disabled:opacity-50 dark:border-white/10 dark:bg-white/5'
 const servicePattern = /^[a-zA-Z0-9][a-zA-Z0-9_.-]*$/
 const maxLogCharacters = 500_000
+const maxLogErrorCharacters = 500
 
 export function MonitoringPage({ t, locale }: { t: Translate; locale: Locale }) {
   const [snapshots, setSnapshots] = useState<TelemetrySnapshot[]>([])
@@ -114,6 +115,7 @@ export function LogsPage({ t, locale, role }: { t: Translate; locale: Locale; ro
   const [busy, setBusy] = useState(false)
   const [copied, setCopied] = useState(false)
   const [error, setError] = useState('')
+  const [errorDetail, setErrorDetail] = useState('')
   const [protectedProjectsHidden, setProtectedProjectsHidden] = useState(false)
   const pollTimer = useRef<number | null>(null)
   const mounted = useRef(true)
@@ -126,7 +128,7 @@ export function LogsPage({ t, locale, role }: { t: Translate; locale: Locale; ro
   function clearResult() {
     requestGeneration.current += 1
     if (pollTimer.current !== null) window.clearTimeout(pollTimer.current)
-    setLogs(''); setStatus(''); setTruncated(false); setCopied(false); setBusy(false)
+    setLogs(''); setStatus(''); setTruncated(false); setCopied(false); setBusy(false); setErrorDetail('')
   }
 
   async function refreshProjects(initial = false) {
@@ -165,7 +167,7 @@ export function LogsPage({ t, locale, role }: { t: Translate; locale: Locale; ro
         return
       }
       if (result.request.status === 'failed') {
-        setError(t('logRequestFailed')); setBusy(false); return
+        setError(t('logRequestFailed')); setErrorDetail(safeLogError(result.request.error)); setBusy(false); return
       }
       pollTimer.current = window.setTimeout(() => void poll(commandId, generation), 2_000)
     } catch (caught) {
@@ -178,9 +180,10 @@ export function LogsPage({ t, locale, role }: { t: Translate; locale: Locale; ro
     event.preventDefault()
     const normalizedService = service.trim(); const [agentId, projectName] = targetKey.split('\u0000'); const project = projects.find((item) => item.agentId === agentId && item.projectName === projectName)
     if (!project || !project.services.some((item) => item.name === normalizedService)) { setError(t('invalidServiceName')); return }
-    clearResult(); const generation = requestGeneration.current; setBusy(true); setError(''); setStatus('pending')
+    clearResult(); const generation = requestGeneration.current; setBusy(true); setError(''); setErrorDetail(''); setStatus('pending')
     try {
-      const since = windowMinutes === 0 ? undefined : new Date(Date.now() - windowMinutes * 60_000).toISOString()
+      const requestedWindowMinutes = windowMinutes === 1440 ? 1435 : windowMinutes
+      const since = requestedWindowMinutes === 0 ? undefined : new Date(Date.now() - requestedWindowMinutes * 60_000).toISOString()
       const result = await api.requestRuntimeLogs({ agentId: project.agentId, projectName: project.projectName, serviceName: normalizedService, tail, ...(since ? { since } : {}) })
       if (!mounted.current || generation !== requestGeneration.current) return
       setStatus(result.request.status)
@@ -197,7 +200,7 @@ export function LogsPage({ t, locale, role }: { t: Translate; locale: Locale; ro
   return <PageShell icon={FileText} title={t('logsTitle')} description={t('logsDescription')}>
     {role === 'viewer' && <Notice>{t('logsPermissionNotice')}</Notice>}
     {protectedProjectsHidden && <Notice>{t('protectedLogsOwnerOnly')}</Notice>}
-    {error && <Alert>{error}</Alert>}
+    {error && <Alert><span className="min-w-0">{error}{errorDetail && <bdi dir="auto" className="block break-words pt-1 font-semibold">{errorDetail}</bdi>}</span></Alert>}
     {loading ? <Loading t={t} /> : <>
       {role !== 'viewer' && <form onSubmit={submit} className={`${panelClass} grid grid-cols-1 gap-5 p-5 sm:grid-cols-2 sm:p-6 xl:grid-cols-12 items-start`}>
         <Field label={t('projectName')} className="xl:col-span-3"><select disabled={busy} required value={targetKey} onChange={(event) => { clearResult(); setError(''); setTargetKey(event.target.value); const next = projects.find((item) => `${item.agentId}\u0000${item.projectName}` === event.target.value); setService(next?.services[0]?.name || '') }} className={inputClass}><option value="">{t('chooseRuntimeProject')}</option>{projects.map((project) => <option key={`${project.agentId}:${project.projectName}`} value={`${project.agentId}\u0000${project.projectName}`}>{project.projectName} · {project.agentName}</option>)}</select></Field>
@@ -208,7 +211,7 @@ export function LogsPage({ t, locale, role }: { t: Translate; locale: Locale; ro
       </form>}
       {!loading && projects.length === 0 && <Notice>{t('noRuntimeForLogs')}</Notice>}
       <section className={`${panelClass} min-w-0 overflow-hidden`}>
-        <div className="flex flex-wrap items-center justify-between gap-3 border-b border-stone-200/70 p-3 dark:border-white/[0.06] sm:px-5"><div className="min-w-0"><div className="flex flex-wrap items-center gap-2"><Container size={16} className="text-mint-500" /><span className="text-xs font-extrabold">{t('logOutput')}</span>{status && <span className="rounded-full bg-stone-200/70 px-2 py-1 text-[0.62rem] font-bold dark:bg-white/10">{t(status as 'pending' | 'claimed' | 'succeeded' | 'failed')}</span>}</div>{selected && <bdi dir="ltr" className="block truncate pt-1 font-mono text-[0.65rem] text-stone-400">{selected.agentName} / {selected.projectName} / {service}</bdi>}</div><div className="grid w-full grid-cols-1 gap-2 sm:flex sm:w-auto"><button type="button" aria-pressed={wrapped} onClick={() => setWrapped((value) => !value)} className={secondaryButton}><WrapText size={15} />{t(wrapped ? 'unwrapLines' : 'wrapLines')}</button><button type="button" disabled={!logs} onClick={() => void copy()} className={secondaryButton}><Clipboard size={15} />{t(copied ? 'copied' : 'copy')}</button></div></div>
+        <div className="flex flex-wrap items-center justify-between gap-3 border-b border-stone-200/70 p-3 dark:border-white/[0.06] sm:px-5"><div className="min-w-0"><div className="flex flex-wrap items-center gap-x-3 gap-y-2"><span className="flex items-center gap-2"><Container size={16} className="text-mint-500" /><span className="text-xs font-extrabold">{t('logOutput')}</span></span>{status && <span className="flex items-center gap-1.5 text-[0.62rem] font-bold text-stone-400"><span>{t('logStatus')}:</span><span className="rounded-full bg-stone-200/70 px-2 py-1 text-ink-800 dark:bg-white/10 dark:text-stone-100">{t(status as 'pending' | 'claimed' | 'succeeded' | 'failed')}</span></span>}</div>{selected && <div className="flex min-w-0 items-baseline gap-1.5 pt-1 text-[0.65rem] text-stone-400"><span className="shrink-0 font-bold">{t('logTarget')}:</span><bdi dir="ltr" title={`${selected.agentName} / ${selected.projectName} / ${service}`} className="truncate font-mono">{selected.agentName} / {selected.projectName} / {service}</bdi></div>}</div><div className="grid w-full grid-cols-1 gap-2 sm:flex sm:w-auto"><button type="button" aria-pressed={wrapped} onClick={() => setWrapped((value) => !value)} className={secondaryButton}><WrapText size={15} />{t(wrapped ? 'unwrapLines' : 'wrapLines')}</button><button type="button" disabled={!logs} onClick={() => void copy()} className={secondaryButton}><Clipboard size={15} />{t(copied ? 'copied' : 'copy')}</button></div></div>
         {busy && <div role="status" className="flex min-h-40 items-center justify-center gap-3 bg-ink-950 text-sm font-bold text-stone-400"><RefreshCw className="animate-spin" size={18} />{t('waitingForLogs')}</div>}
         {!busy && <pre dir="ltr" tabIndex={0} aria-label={t('logOutput')} className={`max-h-[60vh] min-h-64 overflow-auto bg-[#050b0a] p-4 text-left font-mono text-xs leading-5 text-stone-200 sm:p-5 ${wrapped ? 'whitespace-pre-wrap break-words' : 'whitespace-pre'}`}>{logs || t('noLogOutput')}</pre>}
         {truncated && <div role="status" className="flex items-center gap-2 border-t border-amber-500/20 bg-amber-500/10 px-4 py-3 text-xs font-bold text-amber-700 dark:text-amber-300"><TriangleAlert size={15} />{t('logsTruncated')}</div>}
@@ -233,4 +236,5 @@ function formatDecimal(value: number, locale: Locale) { return new Intl.NumberFo
 function formatBytes(value: number, locale: Locale) { if (!Number.isFinite(value) || value < 0) return '—'; const units = ['B', 'KB', 'MB', 'GB', 'TB']; const index = value === 0 ? 0 : Math.min(Math.floor(Math.log(value) / Math.log(1024)), units.length - 1); return `${new Intl.NumberFormat(locale, { maximumFractionDigits: 1 }).format(value / 1024 ** index)} ${units[index]}` }
 function formatDuration(seconds: number, locale: Locale) { const days = Math.floor(seconds / 86_400); const hours = Math.floor((seconds % 86_400) / 3_600); const minutes = Math.floor((seconds % 3_600) / 60); const unit = (value: number, name: 'day' | 'hour' | 'minute') => new Intl.NumberFormat(locale, { style: 'unit', unit: name, unitDisplay: 'short' }).format(value); return days > 0 ? `${unit(days, 'day')} ${unit(hours, 'hour')}` : `${unit(hours, 'hour')} ${unit(minutes, 'minute')}` }
 function formatDate(value: string, locale: Locale) { const date = new Date(value); return Number.isNaN(date.getTime()) ? '—' : new Intl.DateTimeFormat(locale, { dateStyle: 'medium', timeStyle: 'short' }).format(date) }
+function safeLogError(value: string | null) { return typeof value === 'string' ? value.trim().slice(0, maxLogErrorCharacters) : '' }
 function friendlyError(error: unknown, t: Translate) { if (error instanceof ApiError) { if (error.code === 'protected_logs_owner_required' || error.code === 'project_protected') return t('protectedRuntime'); if (error.code === 'telemetry_stale') return t('staleRuntime'); if (error.code === 'agent_unavailable') return t('offlineRuntime'); if (error.status === 403) return t('forbidden'); if (error.status === 409) return t('conflict'); if (error.status === 400) return t('validationError') } return t('requestFailed') }

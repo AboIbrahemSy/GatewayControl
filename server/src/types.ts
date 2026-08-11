@@ -38,6 +38,8 @@ export interface ConnectorDeployment {
   encryptedToken: string;
   cloudflareAccountId: string | null;
   tunnelId: string | null;
+  tokenAccountIdentifier: string | null;
+  tokenTunnelId: string | null;
   identityStatus: Connector['identityStatus'];
 }
 
@@ -304,7 +306,7 @@ export interface Store {
   findSessionUser(tokenHash: string): Promise<User | null>;
   deleteSession(tokenHash: string): Promise<void>;
   listConnectors(): Promise<Connector[]>;
-  createConnector(values: { name: string; encryptedToken: string; enabled: boolean; agentId: string; accountId: string; accountIdentifier: string; tunnelId: string }): Promise<Connector | null>;
+  createConnector(values: { name: string; encryptedToken: string; enabled: boolean; agentId: string; accountId?: string; accountIdentifier: string; tunnelId: string; identityStatus: Connector['identityStatus']; identityError?: string }): Promise<Connector | null>;
   updateConnector(id: string, values: { name?: string; encryptedToken?: string; enabled?: boolean; agentId?: string; accountId?: string; accountIdentifier?: string; tunnelId?: string }): Promise<Connector | null>;
   getConnectorDeployment(connectorId: string): Promise<ConnectorDeployment | null>;
   getCloudflareAccountSecretByIdentifier(accountIdentifier: string): Promise<CloudflareAccountSecret | null>;

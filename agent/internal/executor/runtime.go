@@ -14,6 +14,8 @@ import (
 )
 
 const maximumRuntimeContainers = 100
+const runtimeSinceTolerance = 5 * time.Minute
+const maximumRuntimeDiagnosticRunes = 500
 
 type runtimeActionPayload struct {
 	OperationID string `json:"operationId"`
@@ -64,7 +66,14 @@ func (e *Executor) executeRuntimeLogs(ctx context.Context, result types.CommandR
 	if !connectorUUIDPattern.MatchString(payload.RequestID) || !composeProjectPattern.MatchString(payload.ProjectName) || !composeServicePattern.MatchString(payload.ServiceName) || payload.Tail < 1 || payload.Tail > 1000 {
 		return e.failure(result, errors.New("invalid runtime log request fields"))
 	}
-	if payload.Since != "" { since, err := time.Parse(time.RFC3339, payload.Since); now := time.Now().UTC(); if err != nil || since.After(now) || now.Sub(since) > 24*time.Hour { return e.failure(result, errors.New("since must be within the last 24 hours")) } }
+	if payload.Since != "" {
+		since, err := time.Parse(time.RFC3339, payload.Since)
+		now := time.Now().UTC()
+		if err != nil || since.After(now) || now.Sub(since) > 24*time.Hour+runtimeSinceTolerance { return e.failure(result, errors.New("since must be within the last 24 hours")) }
+		oldest := now.Add(-24 * time.Hour)
+		if since.Before(oldest) { since = oldest }
+		payload.Since = since.UTC().Format(time.RFC3339Nano)
+	}
 	commandContext, cancel := context.WithTimeout(ctx, e.timeout); defer cancel()
 	containers, err := e.discoverRuntimeContainers(commandContext, payload.ProjectName, payload.ServiceName)
 	if err != nil { return e.failure(result, err) }
@@ -74,7 +83,7 @@ func (e *Executor) executeRuntimeLogs(ctx context.Context, result types.CommandR
 		args := []string{"logs", "--timestamps", "--tail", strconv.Itoa(payload.Tail)}
 		if payload.Since != "" { args = append(args, "--since", payload.Since) }
 		output, runErr := e.runner.Run(commandContext, "docker", append(args, container.id), e.maxOutput)
-		if runErr != nil { result.ExitCode, result.Error, result.FinishedAt = output.exitCode, "runtime log collection failed", time.Now().UTC(); return result }
+		if runErr != nil { result.ExitCode, result.Error, result.FinishedAt = output.exitCode, e.runtimeDiagnostic("runtime log collection failed", output, runErr), time.Now().UTC(); return result }
 		name := container.name; if !stackPattern.MatchString(name) || validContainerID(name) { name = "container-" + strconv.Itoa(index+1) }
 		merged.WriteString("[" + name + "]\n"); merged.WriteString(output.stdout); merged.WriteString(output.stderr)
 		if !strings.HasSuffix(merged.String(), "\n") { merged.WriteByte('\n') }
@@ -90,7 +99,7 @@ func (e *Executor) discoverRuntimeContainers(ctx context.Context, project, servi
 	if service != "" { filters = append(filters, "--filter", "label=com.docker.compose.service="+service) }
 	filters = append(filters, "--format", `{{.ID}}`)
 	output, err := e.runner.Run(ctx, "docker", filters, e.maxOutput)
-	if err != nil { return nil, errors.New("runtime container discovery failed") }
+	if err != nil { return nil, errors.New(e.runtimeDiagnostic("runtime container discovery failed", output, err)) }
 	ids := strings.Fields(output.stdout); if len(ids) > maximumRuntimeContainers { return nil, errors.New("runtime target exceeds the container limit") }
 	sort.Strings(ids); containers := make([]runtimeContainer, 0, len(ids))
 	seen := make(map[string]struct{}, len(ids))
@@ -103,6 +112,16 @@ func (e *Executor) discoverRuntimeContainers(ctx context.Context, project, servi
 		containers = append(containers, runtimeContainer{id: id, name: strings.TrimPrefix(fields[1], "/"), project: fields[2], service: fields[3]})
 	}
 	return containers, nil
+}
+
+func (e *Executor) runtimeDiagnostic(prefix string, output runOutput, runErr error) string {
+	detail := strings.TrimSpace(output.stderr)
+	if detail == "" && runErr != nil { detail = runErr.Error() }
+	detail = strings.TrimSpace(e.redact(cleanCommandOutput(detail)))
+	if detail == "" { return prefix }
+	runes := []rune(detail)
+	if len(runes) > maximumRuntimeDiagnosticRunes { detail = string(runes[:maximumRuntimeDiagnosticRunes]) }
+	return prefix + ": " + detail
 }
 
 func validContainerID(value string) bool {

@@ -48,15 +48,15 @@ export class FakeStore implements Store {
   }
   public async deleteSession(tokenHash: string): Promise<void> { this.sessions.delete(tokenHash); }
   public async listConnectors(): Promise<Connector[]> { return this.connectors.map(({ encryptedToken: _, ...item }) => item); }
-  public async createConnector(values: { name: string; encryptedToken: string; enabled: boolean; agentId: string; accountId: string; accountIdentifier: string; tunnelId: string }): Promise<Connector | null> {
+  public async createConnector(values: { name: string; encryptedToken: string; enabled: boolean; agentId: string; accountId?: string; accountIdentifier: string; tunnelId: string; identityStatus: Connector['identityStatus']; identityError?: string }): Promise<Connector | null> {
     if (!this.agents.some((agent) => agent.id === values.agentId && agent.enabled && agent.enrolledAt)) return null;
-    if (!this.cloudflareAccounts.some((account) => account.id === values.accountId && account.enabled && account.accountIdentifier === values.accountIdentifier)) return null;
+    if (values.accountId && !this.cloudflareAccounts.some((account) => account.id === values.accountId && account.enabled && account.accountIdentifier === values.accountIdentifier)) return null;
     const now = new Date().toISOString();
     const created = {
       id: randomUUID(), agentId: values.agentId, name: values.name, enabled: values.enabled,
-      cloudflareAccountId: values.accountId, tunnelId: values.tunnelId, desiredRevision: 1,
+      cloudflareAccountId: values.accountId ?? null, tunnelId: values.accountId ? values.tunnelId : null, desiredRevision: 1,
       tokenAccountIdentifier: values.accountIdentifier, tokenTunnelId: values.tunnelId,
-      identityStatus: 'verified' as const, identityVerifiedAt: now, identityError: null,
+      identityStatus: values.identityStatus, identityVerifiedAt: values.identityStatus === 'verified' ? now : null, identityError: values.identityError ?? null,
       deploymentStatus: 'pending' as const, runtimeStatus: 'unknown' as const, lastError: null, lastDeployedAt: null,
       lastObservedAt: null, encryptedToken: values.encryptedToken, createdAt: now, updatedAt: now,
     };
@@ -71,7 +71,8 @@ export class FakeStore implements Store {
     const targetAgentId = values.agentId ?? item.agentId;
     if (!this.agents.some((agent) => agent.id === targetAgentId && agent.enabled && agent.enrolledAt)) return null;
     if (values.accountId && !this.cloudflareAccounts.some((account) => account.id === values.accountId && account.enabled && account.accountIdentifier === values.accountIdentifier)) return null;
-    if (values.enabled === true && !values.encryptedToken && item.identityStatus !== 'verified') return null;
+    if (values.enabled === true && !values.encryptedToken
+      && (!['verified', 'parsed', 'unmatched', 'mismatch', 'failed'].includes(item.identityStatus) || !item.tokenAccountIdentifier || !item.tokenTunnelId)) return null;
     const oldAgentId = item.agentId;
     const nextRevision = item.desiredRevision + 1;
     Object.assign(item, values, {
@@ -86,7 +87,7 @@ export class FakeStore implements Store {
   }
   public async getConnectorDeployment(connectorId: string): Promise<ConnectorDeployment | null> {
     const item = this.connectors.find((connector) => connector.id === connectorId);
-    return item ? { connectorId: item.id, agentId: item.agentId, name: item.name, enabled: item.enabled, desiredRevision: item.desiredRevision, encryptedToken: item.encryptedToken, cloudflareAccountId: item.cloudflareAccountId, tunnelId: item.tunnelId, identityStatus: item.identityStatus } : null;
+    return item ? { connectorId: item.id, agentId: item.agentId, name: item.name, enabled: item.enabled, desiredRevision: item.desiredRevision, encryptedToken: item.encryptedToken, cloudflareAccountId: item.cloudflareAccountId, tunnelId: item.tunnelId, tokenAccountIdentifier: item.tokenAccountIdentifier, tokenTunnelId: item.tokenTunnelId, identityStatus: item.identityStatus } : null;
   }
   public async listCloudflareAccounts(): Promise<CloudflareAccount[]> { return this.cloudflareAccounts.map(({ encryptedApiToken: _, ...item }) => item); }
   public async createCloudflareAccount(values: { name: string; accountIdentifier: string; encryptedApiToken: string; enabled: boolean }): Promise<CloudflareAccount> {
@@ -110,9 +111,11 @@ export class FakeStore implements Store {
     return this.cloudflareAccounts.find((account) => account.enabled && account.accountIdentifier === accountIdentifier) ?? null;
   }
   public async listConnectorIdentityDeployments(limit: number): Promise<ConnectorIdentityDeployment[]> {
-    return this.connectors.filter((item) => ['pending', 'parsed', 'failed'].includes(item.identityStatus)).slice(0, Math.max(1, Math.min(limit, 50))).map((item) => ({
+    return this.connectors.filter((item) => ['pending', 'parsed', 'failed'].includes(item.identityStatus)
+      || item.identityStatus === 'unmatched' && Date.parse(item.updatedAt) < Date.now() - 3_600_000).slice(0, Math.max(1, Math.min(limit, 50))).map((item) => ({
       connectorId: item.id, agentId: item.agentId, name: item.name, enabled: item.enabled, desiredRevision: item.desiredRevision,
-      encryptedToken: item.encryptedToken, cloudflareAccountId: item.cloudflareAccountId, tunnelId: item.tunnelId, identityStatus: item.identityStatus,
+      encryptedToken: item.encryptedToken, cloudflareAccountId: item.cloudflareAccountId, tunnelId: item.tunnelId,
+      tokenAccountIdentifier: item.tokenAccountIdentifier, tokenTunnelId: item.tokenTunnelId, identityStatus: item.identityStatus,
     }));
   }
   public async markConnectorIdentity(id: string, expected: ConnectorIdentityExpectation, values: { status: Connector['identityStatus']; accountId?: string; accountIdentifier?: string; tunnelId?: string; error?: string }): Promise<Connector | null> {

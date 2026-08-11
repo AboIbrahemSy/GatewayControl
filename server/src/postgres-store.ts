@@ -241,17 +241,20 @@ export class PgStore implements Store {
     return result.rows.map(connector);
   }
 
-  public async createConnector(values: { name: string; encryptedToken: string; enabled: boolean; agentId: string; accountId: string; accountIdentifier: string; tunnelId: string }): Promise<Connector | null> {
+  public async createConnector(values: { name: string; encryptedToken: string; enabled: boolean; agentId: string; accountId?: string; accountIdentifier: string; tunnelId: string; identityStatus: Connector['identityStatus']; identityError?: string }): Promise<Connector | null> {
     return this.transaction(async (client) => {
       const result = await client.query(
         `INSERT INTO cloudflare_connectors
-           (name, token_encrypted, enabled, agent_id, cloudflare_account_id, tunnel_id, desired_revision,
-            token_account_identifier, token_tunnel_id, identity_status, identity_verified_at)
-         SELECT $1, $2, $3, a.id, cf.id, $7, 1, $6, $7::uuid, 'verified', now()
-         FROM agents a JOIN cloudflare_accounts cf ON cf.id = $5 AND cf.enabled AND lower(cf.account_identifier) = lower($6)
-         WHERE a.id = $4 AND a.enabled AND a.enrolled_at IS NOT NULL
-         RETURNING *`,
-        [values.name, values.encryptedToken, values.enabled, values.agentId, values.accountId, values.accountIdentifier, values.tunnelId],
+            (name, token_encrypted, enabled, agent_id, cloudflare_account_id, tunnel_id, desired_revision,
+             token_account_identifier, token_tunnel_id, identity_status, identity_verified_at, identity_error)
+          SELECT $1, $2, $3, a.id, cf.id, CASE WHEN cf.id IS NULL THEN NULL ELSE $7 END, 1, $6, $7::uuid, $8,
+            CASE WHEN $8 = 'verified' THEN now() ELSE NULL END, $9
+          FROM agents a
+          LEFT JOIN cloudflare_accounts cf ON cf.id = $5 AND cf.enabled AND lower(cf.account_identifier) = lower($6)
+          WHERE a.id = $4 AND a.enabled AND a.enrolled_at IS NOT NULL AND ($5::uuid IS NULL OR cf.id IS NOT NULL)
+          RETURNING *`,
+        [values.name, values.encryptedToken, values.enabled, values.agentId, values.accountId ?? null, values.accountIdentifier,
+          values.tunnelId, values.identityStatus, values.identityError?.slice(0, 100) ?? null],
       );
       if (!result.rows[0]) return null;
       const created = connector(result.rows[0]);
@@ -262,13 +265,15 @@ export class PgStore implements Store {
 
   public async updateConnector(id: string, values: { name?: string; encryptedToken?: string; enabled?: boolean; agentId?: string; accountId?: string; accountIdentifier?: string; tunnelId?: string }): Promise<Connector | null> {
     return this.transaction(async (client) => {
-      const current = await client.query('SELECT agent_id, identity_status, desired_revision FROM cloudflare_connectors WHERE id = $1 FOR UPDATE', [id]);
+      const current = await client.query('SELECT agent_id, identity_status, token_account_identifier, token_tunnel_id, desired_revision FROM cloudflare_connectors WHERE id = $1 FOR UPDATE', [id]);
       if (!current.rows[0]) return null;
       const targetAgentId = values.agentId ?? current.rows[0].agent_id;
       const targetAgent = await client.query('SELECT 1 FROM agents WHERE id = $1 AND enabled AND enrolled_at IS NOT NULL', [targetAgentId]);
       if (!targetAgent.rows[0]) return null;
       if (values.accountId && !(await client.query('SELECT 1 FROM cloudflare_accounts WHERE id = $1 AND enabled AND lower(account_identifier) = lower($2)', [values.accountId, values.accountIdentifier])).rows[0]) return null;
-      if (values.enabled === true && !values.encryptedToken && current.rows[0].identity_status !== 'verified') return null;
+      if (values.enabled === true && !values.encryptedToken
+        && (!['verified', 'parsed', 'unmatched', 'mismatch', 'failed'].includes(current.rows[0].identity_status)
+          || !current.rows[0].token_account_identifier || !current.rows[0].token_tunnel_id)) return null;
       if (values.agentId && values.agentId !== current.rows[0].agent_id) {
         await client.query(
           `INSERT INTO agent_commands (agent_id, type, payload)
@@ -303,11 +308,11 @@ export class PgStore implements Store {
 
   public async getConnectorDeployment(connectorId: string): Promise<ConnectorDeployment | null> {
     const result = await this.pool.query(
-      'SELECT id, agent_id, name, enabled, desired_revision, token_encrypted, cloudflare_account_id, tunnel_id, identity_status FROM cloudflare_connectors WHERE id = $1',
+      'SELECT id, agent_id, name, enabled, desired_revision, token_encrypted, cloudflare_account_id, tunnel_id, token_account_identifier, token_tunnel_id, identity_status FROM cloudflare_connectors WHERE id = $1',
       [connectorId],
     );
     const row = result.rows[0];
-    return row ? { connectorId: row.id, agentId: row.agent_id, name: row.name, enabled: row.enabled, desiredRevision: Number(row.desired_revision), encryptedToken: row.token_encrypted, cloudflareAccountId: row.cloudflare_account_id ?? null, tunnelId: row.tunnel_id ?? null, identityStatus: row.identity_status } : null;
+    return row ? { connectorId: row.id, agentId: row.agent_id, name: row.name, enabled: row.enabled, desiredRevision: Number(row.desired_revision), encryptedToken: row.token_encrypted, cloudflareAccountId: row.cloudflare_account_id ?? null, tunnelId: row.tunnel_id ?? null, tokenAccountIdentifier: row.token_account_identifier ?? null, tokenTunnelId: row.token_tunnel_id ?? null, identityStatus: row.identity_status } : null;
   }
 
   public async listCloudflareAccounts(): Promise<CloudflareAccount[]> {
@@ -346,14 +351,18 @@ export class PgStore implements Store {
 
   public async listConnectorIdentityDeployments(limit: number): Promise<ConnectorIdentityDeployment[]> {
     const result = await this.pool.query(
-      `SELECT id, agent_id, name, enabled, desired_revision, token_encrypted, cloudflare_account_id, tunnel_id, identity_status
-       FROM cloudflare_connectors WHERE identity_status IN ('pending', 'parsed', 'failed') ORDER BY updated_at LIMIT $1`,
+       `SELECT id, agent_id, name, enabled, desired_revision, token_encrypted, cloudflare_account_id, tunnel_id,
+          token_account_identifier, token_tunnel_id, identity_status
+       FROM cloudflare_connectors WHERE identity_status IN ('pending', 'parsed', 'failed')
+         OR (identity_status = 'unmatched' AND updated_at < now() - interval '1 hour')
+       ORDER BY updated_at LIMIT $1`,
       [Math.max(1, Math.min(limit, 50))],
     );
     return result.rows.map((row) => ({
       connectorId: row.id, agentId: row.agent_id, name: row.name, enabled: row.enabled,
       desiredRevision: Number(row.desired_revision), encryptedToken: row.token_encrypted,
       cloudflareAccountId: row.cloudflare_account_id ?? null, tunnelId: row.tunnel_id ?? null,
+      tokenAccountIdentifier: row.token_account_identifier ?? null, tokenTunnelId: row.token_tunnel_id ?? null,
       identityStatus: row.identity_status,
     }));
   }

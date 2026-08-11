@@ -7,6 +7,7 @@ import (
 	"reflect"
 	"strings"
 	"testing"
+	"time"
 
 	"gatewaycontrol/agent/internal/types"
 )
@@ -32,6 +33,41 @@ func TestRuntimeActionRevalidatesLabelsAndUsesOnlyFixedContainerArguments(t *tes
 	if !reflect.DeepEqual(runner.commands[0].args, []string{"ps", "--all", "--no-trunc", "--filter", "label=com.docker.compose.project=project", "--filter", "label=com.docker.compose.service=web", "--format", "{{.ID}}"}) {
 		t.Fatalf("discovery args = %#v", runner.commands[0].args)
 	}
+}
+
+func TestRuntimeLogsAcceptDelayedTwentyFourHourSinceAndClampForDocker(t *testing.T) {
+	executor := newTestExecutor(t)
+	runner := &logsScriptedRunner{run: func(args []string) (runOutput, error) {
+		switch args[0] {
+		case "ps": return runOutput{stdout: runtimeContainerID}, nil
+		case "inspect": return runOutput{stdout: runtimeContainerID + "\t/web-1\tproject\tweb"}, nil
+		case "logs": return runOutput{}, nil
+		}
+		return runOutput{}, errors.New("unexpected command")
+	}}
+	executor.runner = runner
+	submitted := time.Now().UTC().Add(-24 * time.Hour).Format(time.RFC3339Nano)
+	payload := `{"requestId":"123e4567-e89b-12d3-a456-426614174000","projectName":"project","serviceName":"web","tail":100,"since":"` + submitted + `"}`
+	result := executor.Execute(context.Background(), types.Command{ID: "id", Type: "compose.runtime.logs", Payload: json.RawMessage(payload)})
+	if !result.Success { t.Fatalf("result = %#v", result) }
+	passed := runner.commands[2].args[5]
+	parsed, err := time.Parse(time.RFC3339Nano, passed)
+	if err != nil || passed == submitted || time.Since(parsed) > 24*time.Hour+time.Second { t.Fatalf("docker since = %q", passed) }
+}
+
+func TestRuntimeLogsReturnBoundedRedactedStderrDiagnostic(t *testing.T) {
+	executor := newTestExecutor(t)
+	executor.runner = &logsScriptedRunner{run: func(args []string) (runOutput, error) {
+		switch args[0] {
+		case "ps": return runOutput{stdout: runtimeContainerID}, nil
+		case "inspect": return runOutput{stdout: runtimeContainerID + "\t/web-1\tproject\tweb"}, nil
+		case "logs": return runOutput{stderr: "\x1b[31mtoken=secret\x01\x1b[0m", exitCode: 1}, errors.New("docker failed with token=other")
+		}
+		return runOutput{}, errors.New("unexpected command")
+	}}
+	payload := `{"requestId":"123e4567-e89b-12d3-a456-426614174000","projectName":"project","serviceName":"web","tail":100}`
+	result := executor.Execute(context.Background(), types.Command{ID: "id", Type: "compose.runtime.logs", Payload: json.RawMessage(payload)})
+	if result.Success || result.Error != "runtime log collection failed: token=[REDACTED]" { t.Fatalf("result = %#v", result) }
 }
 
 func TestRuntimeActionRejectsProtectionUnknownFieldsChangedLabelsAndNoMatches(t *testing.T) {

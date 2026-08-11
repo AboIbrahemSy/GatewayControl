@@ -88,17 +88,30 @@ describe('connector identity and revision lifecycle', () => {
   });
 
   it.each([
-    ['unlinked account', 'connector_account_unlinked', undefined],
-    ['current token mismatch', 'connector_token_mismatch', cloudflareFetch(token(Buffer.alloc(32, 4)))],
-    ['transient Cloudflare failure', 'connector_identity_verification_failed', vi.fn<typeof globalThis.fetch>().mockRejectedValue(new Error('network token secret'))],
-  ])('rejects %s with a stable redacted code', async (_case, code, fetch) => {
+    ['unlinked account', 'unmatched', 'connector_account_unlinked', undefined],
+    ['current token mismatch', 'mismatch', 'connector_token_mismatch', cloudflareFetch(token(Buffer.alloc(32, 4)))],
+    ['transient Cloudflare failure', 'parsed', 'connector_identity_verification_failed', vi.fn<typeof globalThis.fetch>().mockRejectedValue(new Error('network token secret'))],
+  ])('persists and deploys strictly parsed tokens after %s', async (_case, identityStatus, identityError, fetch) => {
     const context = await fixture(fetch ?? cloudflareFetch());
-    if (code === 'connector_account_unlinked') context.store.cloudflareAccounts[0]!.enabled = false;
+    if (identityStatus === 'unmatched') context.store.cloudflareAccounts[0]!.enabled = false;
     const connectorToken = token();
-    const result = await context.app.inject({ method: 'POST', url: '/api/connectors', headers: { cookie: context.cookie }, payload: { name: 'rejected', token: connectorToken, agentId: context.agent.id } });
-    expect(result.json().code).toBe(code);
+    const result = await context.app.inject({ method: 'POST', url: '/api/connectors', headers: { cookie: context.cookie }, payload: { name: 'standalone', token: connectorToken, agentId: context.agent.id } });
+    expect(result.statusCode).toBe(201);
+    expect(result.json().connector).toMatchObject({
+      identityStatus, identityError, tokenAccountIdentifier: accountIdentifier, tokenTunnelId: tunnelId,
+      ...(identityStatus === 'unmatched' ? { cloudflareAccountId: null, tunnelId: null } : { cloudflareAccountId: context.accountId, tunnelId }),
+    });
     expect(result.body).not.toContain(connectorToken);
     expect(result.body).not.toContain(apiToken);
+    const poll = await context.app.inject({ method: 'GET', url: '/api/agent/commands', headers: { authorization: `Bearer ${context.credential}` } });
+    expect(poll.json().commands[0].payload).toMatchObject({ connectorId: result.json().connector.id, enabled: true, token: connectorToken });
+  });
+
+  it('rejects malformed connector tokens before persistence', async () => {
+    const context = await fixture();
+    const result = await context.app.inject({ method: 'POST', url: '/api/connectors', headers: { cookie: context.cookie }, payload: { name: 'malformed', token: 'x'.repeat(48), agentId: context.agent.id } });
+    expect(result.statusCode).toBe(400);
+    expect(result.json().code).toBe('invalid_connector_token');
     expect(context.store.connectors).toHaveLength(0);
   });
 

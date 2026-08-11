@@ -57,6 +57,8 @@ export class CloudflareClient {
 
   public async listZones(accountIdentifier: string): Promise<CloudflareZoneResult[]> {
     const zones: CloudflareZoneResult[] = [];
+    const identifiers = new Set<string>();
+    let expectedTotalPages: number | null = null;
     for (let page = 1; page <= MAX_ZONE_PAGES; page += 1) {
       const query = new URLSearchParams({ 'account.id': accountIdentifier, per_page: '50', page: String(page) });
       const envelope = await this.request('GET', `/zones?${query.toString()}`);
@@ -67,10 +69,20 @@ export class CloudflareClient {
         if (typeof zone.id !== 'string' || !/^[a-f0-9]{32}$/i.test(zone.id) || typeof zone.name !== 'string' || !this.isHostname(zone.name) || typeof zone.status !== 'string' || zone.status.length < 1 || zone.status.length > 64) {
           throw new CloudflareClientError('Cloudflare returned an invalid zone.', 502);
         }
-        zones.push({ id: zone.id, name: zone.name, status: zone.status });
+        const identifier = zone.id.toLowerCase();
+        if (identifiers.has(identifier)) throw new CloudflareClientError('Cloudflare returned duplicate zone identifiers.', 502);
+        identifiers.add(identifier);
+        zones.push({ id: identifier, name: zone.name, status: zone.status });
+      }
+      const reportedPage = envelope.result_info?.page;
+      if (reportedPage !== undefined && (!Number.isInteger(Number(reportedPage)) || Number(reportedPage) !== page)) {
+        throw new CloudflareClientError('Cloudflare returned invalid zone pagination metadata.', 502);
       }
       const totalPages = Number(envelope.result_info?.total_pages ?? page);
-      if (!Number.isInteger(totalPages) || totalPages < page) throw new CloudflareClientError('Cloudflare returned invalid zone pagination metadata.', 502);
+      if (!Number.isInteger(totalPages) || totalPages < page || (expectedTotalPages !== null && totalPages !== expectedTotalPages)) {
+        throw new CloudflareClientError('Cloudflare returned invalid zone pagination metadata.', 502);
+      }
+      expectedTotalPages ??= totalPages;
       if (totalPages === page) return zones;
     }
     throw new CloudflareClientError(`Cloudflare zone pagination exceeded the ${MAX_ZONE_PAGES}-page safety limit.`, 502);
@@ -186,7 +198,7 @@ export class CloudflareClient {
         signal: AbortSignal.timeout(15_000),
       });
     } catch {
-      throw new CloudflareClientError('Cloudflare could not be reached.', 502);
+      throw new CloudflareClientError('Cloudflare could not be reached.', 0);
     }
     const envelope = await this.readEnvelope(response);
     if (response.ok && envelope.success === true) return envelope;
