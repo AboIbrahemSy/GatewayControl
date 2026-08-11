@@ -1,6 +1,6 @@
-import { Archive, CheckCircle2, Clipboard, DatabaseBackup, Eye, EyeOff, HardDrive, KeyRound, Network, RefreshCw, RotateCcw, Server, ShieldCheck, Sparkles, TriangleAlert } from 'lucide-react'
+import { Archive, CheckCircle2, Clipboard, DatabaseBackup, Download, Eye, EyeOff, HardDrive, KeyRound, Network, RefreshCw, RotateCcw, Server, ShieldCheck, Sparkles, TriangleAlert, Upload } from 'lucide-react'
 import { useEffect, useState } from 'react'
-import { api, ApiError, type ManagedStack, type OperationStatus, type Role, type StackBackup, type StackRestore, type SystemBackup, type SystemRestore } from './api'
+import { api, ApiError, type ManagedStack, type OperationStatus, type Role, type StackBackup, type StackRestore, type SystemBackup, type SystemBackupImport, type SystemRestore } from './api'
 import type { Locale, MessageKey, Translate } from './App'
 import { copyText } from './clipboard'
 import { Modal } from './Modal'
@@ -37,6 +37,13 @@ export function BackupsPage({ t, locale, role }: { t: Translate; locale: Locale;
   const [passphraseCopied, setPassphraseCopied] = useState(false)
   const [restoreCommand, setRestoreCommand] = useState('')
   const [restoreCommandCopied, setRestoreCommandCopied] = useState(false)
+  const [systemImports, setSystemImports] = useState<SystemBackupImport[]>([])
+  const [systemImportOpen, setSystemImportOpen] = useState(false)
+  const [importFile, setImportFile] = useState<File | null>(null)
+  const [importProgress, setImportProgress] = useState(0)
+  const [recoverySupervisorEnabled, setRecoverySupervisorEnabled] = useState(false)
+  const [applyRestore, setApplyRestore] = useState<SystemRestore | null>(null)
+  const [applyConfirmation, setApplyConfirmation] = useState('')
 
   async function load(background = false) {
     if (!background) setLoading(true)
@@ -59,6 +66,8 @@ export function BackupsPage({ t, locale, role }: { t: Translate; locale: Locale;
       const result = await api.systemBackups()
       setSystemBackups(result.backups)
       setSystemRestores(result.restores)
+      setSystemImports(result.imports)
+      setRecoverySupervisorEnabled(result.recoverySupervisorEnabled)
     } catch { setSystemError(t('systemRecoveryLoadFailed')) }
     finally { setSystemLoading(false) }
   }
@@ -144,6 +153,33 @@ export function BackupsPage({ t, locale, role }: { t: Translate; locale: Locale;
     finally { setBusy('') }
   }
 
+  async function importSystemBackup(event: React.FormEvent) {
+    event.preventDefault()
+    if (!importFile || passphrase.length < 16) { setSystemModalError(t(importFile ? 'systemPassphraseTooShort' : 'chooseBackupFile')); return }
+    setBusy('system-import'); setSystemModalError(''); setImportProgress(0)
+    try {
+      const uploaded = await api.uploadSystemBackup(importFile, setImportProgress)
+      setSystemImports((current) => [uploaded.import, ...current])
+      const validated = await api.validateSystemBackupImport(uploaded.import.id, passphrase)
+      setSystemImports((current) => current.map((item) => item.id === validated.import.id ? validated.import : item))
+      setSystemBackups((current) => current.some((item) => item.id === validated.backup.id) ? current : [validated.backup, ...current])
+      setSuccess(t(validated.idempotent ? 'systemImportAlreadyPresent' : 'systemImportCompleted'))
+      setSystemImportOpen(false); setImportFile(null); setImportProgress(0); resetSystemModal()
+    } catch (caught) { setSystemModalError(systemRecoveryError(caught, t)) }
+    finally { setBusy('') }
+  }
+
+  async function requestApplySystemRestore(event: React.FormEvent) {
+    event.preventDefault()
+    if (!applyRestore || passphrase.length < 16) { setSystemModalError(t('systemPassphraseTooShort')); return }
+    setBusy('system-apply'); setSystemModalError('')
+    try {
+      await api.requestSystemRestoreApply(applyRestore.id, applyConfirmation, passphrase)
+      setSuccess(t('systemApplyQueued')); setApplyRestore(null); setApplyConfirmation(''); resetSystemModal()
+    } catch (caught) { setSystemModalError(systemRecoveryError(caught, t)) }
+    finally { setBusy('') }
+  }
+
   const succeeded = backups.filter((backup) => backup.status === 'succeeded').length
   const failed = backups.filter((backup) => backup.status === 'failed').length
   const totalBytes = backups.reduce((sum, backup) => sum + (backup.result?.sizeBytes || 0), 0)
@@ -155,7 +191,7 @@ export function BackupsPage({ t, locale, role }: { t: Translate; locale: Locale;
     {restoreCommand && <section className={`${panelClass} flex min-w-0 flex-col gap-3 p-4 sm:p-5`}><p className="text-xs font-bold text-amber-700 dark:text-amber-300">{t('systemRestoreStagedManual')}</p><pre dir="ltr" className="overflow-x-auto whitespace-pre-wrap break-all rounded-xl bg-ink-950 p-4 text-left font-mono text-xs text-mint-100"><code>{restoreCommand}</code></pre><button type="button" className={`${secondaryButton} self-end`} onClick={() => void copyText(restoreCommand).then(() => setRestoreCommandCopied(true)).catch(() => setError(t('copyFailed')))}><Clipboard size={15} />{t(restoreCommandCopied ? 'copied' : 'copy')}</button></section>}
     {loading ? <Loading t={t} /> : <>
       <section className="grid grid-cols-2 gap-3 lg:grid-cols-4"><Summary icon={Archive} label={t('totalBackups')} value={formatNumber(backups.length, locale)} /><Summary icon={CheckCircle2} label={t('succeededBackups')} value={formatNumber(succeeded, locale)} /><Summary icon={TriangleAlert} label={t('failedBackups')} value={formatNumber(failed, locale)} /><Summary icon={HardDrive} label={t('storedBackupSize')} value={formatBytes(totalBytes, locale)} /></section>
-      {role === 'owner' && <SystemRecoveryPanel t={t} locale={locale} loading={systemLoading} error={systemError} backups={systemBackups} restores={systemRestores} openCreate={openSystemCreate} openRestore={openSystemRestore} />}
+      {role === 'owner' && <SystemRecoveryPanel t={t} locale={locale} loading={systemLoading} error={systemError} backups={systemBackups} restores={systemRestores} imports={systemImports} supervisorEnabled={recoverySupervisorEnabled} openCreate={openSystemCreate} openImport={() => { resetSystemModal(); setImportFile(null); setImportProgress(0); setSystemImportOpen(true) }} openRestore={openSystemRestore} openApply={(restore) => { resetSystemModal(); setApplyConfirmation(''); setApplyRestore(restore) }} />}
       {role !== 'viewer' ? <Modal open={createOpen} title={t('createBackup')} description={t('backupsDescription')} closeLabel={t('cancel')} busy={busy === 'create'} onClose={() => { setTarget('local'); setCreateOpen(false); setError('') }}><form onSubmit={create} className="grid grid-cols-1 items-start gap-5 p-5 sm:grid-cols-2 sm:p-6"><Field label={t('stack')}><select required value={stackId} onChange={(event) => setStackId(event.target.value)} className={inputClass}><option value="">{t('chooseStack')}</option>{stacks.map((stack) => <option key={stack.id} value={stack.id} disabled={!stack.enabled}>{stack.name}</option>)}</select></Field><div><p className="pb-2 text-xs font-extrabold">{t('backupTarget')}</p><div role="radiogroup" aria-label={t('backupTarget')} className="grid grid-cols-2 gap-2"><Target active={target === 'local'} icon={HardDrive} label={t('localTarget')} onClick={() => setTarget('local')} /><Target active={target === 'nas'} icon={Network} label={t('nasTarget')} onClick={() => setTarget('nas')} /></div></div><button disabled={busy === 'create' || stacks.length === 0} className={`${primaryButton} sm:col-span-2`}><DatabaseBackup size={16} />{t('createBackup')}</button></form></Modal> : <Notice>{t('backupViewerNotice')}</Notice>}
       {confirming && <section role="alertdialog" aria-modal="false" aria-labelledby="restore-confirm-title" className="rounded-[1.4rem] border border-amber-400/40 bg-amber-500/10 p-5 sm:p-6"><div className="flex items-start gap-3"><ShieldCheck className="mt-0.5 shrink-0 text-amber-600 dark:text-amber-300" size={21} /><div className="min-w-0 flex-1"><h2 id="restore-confirm-title" className="font-black text-ink-900 dark:text-white">{t('confirmRestoreTitle')}</h2><p className="pt-2 text-sm font-semibold leading-6 text-stone-600 dark:text-stone-300">{t('confirmRestoreDescription')} <strong>{confirmingStack?.name || t('unknown')}</strong> <bdi dir="ltr" className="break-all font-mono">#{confirming.id}</bdi></p><p className="pt-2 text-xs font-bold text-amber-700 dark:text-amber-300">{t('restoreWarning')}</p><div className="flex flex-col-reverse gap-2 pt-5 sm:flex-row sm:justify-end"><button type="button" disabled={busy !== ''} className={secondaryButton} onClick={() => setConfirming(null)}>{t('cancel')}</button><button type="button" disabled={busy !== ''} className={primaryButton} onClick={() => void restore()}><RotateCcw size={16} />{t('confirmRestore')}</button></div></div></div></section>}
       <div className="flex items-center justify-between gap-3"><h2 className="flex items-center gap-2 text-lg font-black text-ink-900 dark:text-white"><Archive className="text-mint-500 dark:text-mint-300" size={19} />{t('backupHistory')}</h2>{active && <span role="status" className="flex items-center gap-2 text-xs font-bold text-stone-400"><RefreshCw className="animate-spin" size={14} />{t('operationsActive')}</span>}</div>
@@ -182,19 +218,40 @@ export function BackupsPage({ t, locale, role }: { t: Translate; locale: Locale;
       <form onSubmit={stageSystemRestore} className="flex flex-col gap-5 p-5 sm:p-6">
         {systemModalError && <Alert>{systemModalError}</Alert>}
         <Notice>{t('systemRestoreDestructiveWarning')}</Notice>
+        <Notice>{t('systemSnapshotWarning')}</Notice>
         <bdi dir="ltr" className="break-all rounded-xl bg-stone-100 p-3 font-mono text-xs dark:bg-white/[0.04]">#{systemRestoreBackup?.id}</bdi>
         <PassphraseField label={t('systemPassphrase')} value={passphrase} visible={passphraseVisible} showLabel={t('showPassphrase')} hideLabel={t('hidePassphrase')} onChange={setPassphrase} toggleVisibility={() => setPassphraseVisible((current) => !current)} />
         <button disabled={busy !== ''} className={primaryButton}><RotateCcw size={16} />{t('confirmStageSystemRestore')}</button>
       </form>
     </Modal>}
+    {role === 'owner' && <Modal open={systemImportOpen} title={t('importSystemBackup')} description={t('systemImportDescription')} closeLabel={t('cancel')} busy={busy === 'system-import'} maxWidthClass="max-w-xl" onClose={() => { setSystemImportOpen(false); setImportFile(null); setImportProgress(0); resetSystemModal() }}>
+      <form onSubmit={importSystemBackup} className="flex flex-col gap-5 p-5 sm:p-6">
+        {systemModalError && <Alert>{systemModalError}</Alert>}
+        <Notice>{t('systemImportWarning')}</Notice>
+        <Field label={t('systemBackupFile')}><input type="file" required accept=".gcsb,application/octet-stream" className={`${inputClass} h-auto min-h-12 py-2 file:me-3 file:rounded-lg file:border-0 file:bg-mint-400/10 file:px-3 file:py-2 file:text-xs file:font-extrabold`} onChange={(event) => setImportFile(event.target.files?.[0] ?? null)} /></Field>
+        <PassphraseField label={t('systemPassphrase')} value={passphrase} visible={passphraseVisible} showLabel={t('showPassphrase')} hideLabel={t('hidePassphrase')} onChange={setPassphrase} toggleVisibility={() => setPassphraseVisible((current) => !current)} />
+        {busy === 'system-import' && <div role="status" className="flex flex-col gap-2"><div className="h-2 overflow-hidden rounded-full bg-stone-200 dark:bg-white/10"><div className="h-full bg-mint-400 transition-[width]" style={{ width: `${importProgress}%` }} /></div><p className="text-xs font-bold text-stone-500">{t('uploadProgress')}: <bdi dir="ltr">{importProgress}%</bdi></p></div>}
+        <button disabled={busy !== ''} className={primaryButton}><Upload size={16} />{t('uploadAndValidate')}</button>
+      </form>
+    </Modal>}
+    {role === 'owner' && <Modal open={applyRestore !== null} title={t('applySystemRestore')} description={t('systemApplyDisconnectWarning')} closeLabel={t('cancel')} busy={busy === 'system-apply'} maxWidthClass="max-w-xl" onClose={() => { setApplyRestore(null); setApplyConfirmation(''); resetSystemModal() }}>
+      <form onSubmit={requestApplySystemRestore} className="flex flex-col gap-5 p-5 sm:p-6">
+        {systemModalError && <Alert>{systemModalError}</Alert>}
+        <Notice>{t('systemSnapshotWarning')}</Notice>
+        <Field label={t('typedConfirmation')}><input dir="ltr" required autoComplete="off" value={applyConfirmation} onChange={(event) => setApplyConfirmation(event.target.value)} placeholder={`APPLY ${applyRestore?.id ?? ''}`} className={`${inputClass} text-left font-mono`} /></Field>
+        <PassphraseField label={t('systemPassphrase')} value={passphrase} visible={passphraseVisible} showLabel={t('showPassphrase')} hideLabel={t('hidePassphrase')} onChange={setPassphrase} toggleVisibility={() => setPassphraseVisible((current) => !current)} />
+        <button disabled={busy !== '' || applyConfirmation !== `APPLY ${applyRestore?.id ?? ''}`} className={primaryButton}><RotateCcw size={16} />{t('applySystemRestore')}</button>
+      </form>
+    </Modal>}
   </div>
 }
 
-function SystemRecoveryPanel({ t, locale, loading, error, backups, restores, openCreate, openRestore }: { t: Translate; locale: Locale; loading: boolean; error: string; backups: SystemBackup[]; restores: SystemRestore[]; openCreate: () => void; openRestore: (backup: SystemBackup) => void }) {
-  return <section className="flex flex-col gap-4 rounded-[1.4rem] border border-mint-400/30 bg-mint-400/[0.06] p-4 dark:border-mint-300/20 dark:bg-mint-300/[0.04] sm:p-6"><div className="flex flex-col justify-between gap-4 md:flex-row md:items-start"><div className="max-w-3xl"><h2 className="flex items-center gap-2 text-xl font-black text-ink-900 dark:text-white"><ShieldCheck className="text-mint-500 dark:text-mint-300" size={21} />{t('systemRecoveryTitle')}</h2><p className="pt-2 text-sm font-medium leading-6 text-stone-600 dark:text-stone-300">{t('systemRecoveryScopeDescription')}</p><p className="pt-2 text-xs font-bold leading-5 text-amber-700 dark:text-amber-300">{t('manualSystemRestoreRequired')}</p><bdi dir="ltr" className="mt-2 block break-all font-mono text-[0.7rem] text-stone-500 dark:text-stone-400">sh docker/recover.sh</bdi></div><button type="button" className={`${primaryButton} shrink-0`} onClick={openCreate}><KeyRound size={16} />{t('createSystemBackup')}</button></div>
+function SystemRecoveryPanel({ t, locale, loading, error, backups, restores, imports, supervisorEnabled, openCreate, openImport, openRestore, openApply }: { t: Translate; locale: Locale; loading: boolean; error: string; backups: SystemBackup[]; restores: SystemRestore[]; imports: SystemBackupImport[]; supervisorEnabled: boolean; openCreate: () => void; openImport: () => void; openRestore: (backup: SystemBackup) => void; openApply: (restore: SystemRestore) => void }) {
+  return <section className="flex flex-col gap-4 rounded-[1.4rem] border border-mint-400/30 bg-mint-400/[0.06] p-4 dark:border-mint-300/20 dark:bg-mint-300/[0.04] sm:p-6"><div className="flex flex-col justify-between gap-4 md:flex-row md:items-start"><div className="max-w-3xl"><h2 className="flex items-center gap-2 text-xl font-black text-ink-900 dark:text-white"><ShieldCheck className="text-mint-500 dark:text-mint-300" size={21} />{t('systemRecoveryTitle')}</h2><p className="pt-2 text-sm font-medium leading-6 text-stone-600 dark:text-stone-300">{t('systemRecoveryScopeDescription')}</p><p className="pt-2 text-xs font-bold leading-5 text-amber-700 dark:text-amber-300">{t(supervisorEnabled ? 'platformRecoveryAvailable' : 'manualSystemRestoreRequired')}</p>{!supervisorEnabled && <bdi dir="ltr" className="mt-2 block break-all font-mono text-[0.7rem] text-stone-500 dark:text-stone-400">sh docker/recover.sh</bdi>}</div><div className="flex shrink-0 flex-col gap-2 sm:flex-row"><button type="button" className={secondaryButton} onClick={openImport}><Upload size={16} />{t('importSystemBackup')}</button><button type="button" className={primaryButton} onClick={openCreate}><KeyRound size={16} />{t('createSystemBackup')}</button></div></div>
     {error && <Alert>{error}</Alert>}
-    {loading ? <Loading t={t} /> : <div className="grid grid-cols-1 gap-3 lg:grid-cols-2">{backups.length === 0 ? <div className={`${panelClass} p-5 text-sm font-bold text-stone-400`}>{t('noSystemBackups')}</div> : backups.map((backup) => <article key={backup.id} className={`${panelClass} min-w-0 p-4 sm:p-5`}><div className="flex items-start justify-between gap-3"><div className="min-w-0"><bdi dir="ltr" className="block truncate font-mono text-[0.68rem] text-stone-400">#{backup.id}</bdi><p className="pt-2 text-xs font-bold text-stone-500 dark:text-stone-300">{t(backup.target === 'local' ? 'localTarget' : 'nasTarget')} · {formatDate(backup.createdAt, locale)}</p></div><SystemStatus status={backup.status} t={t} /></div>{backup.sizeBytes !== null && <p className="pt-3 text-xs font-bold text-stone-500 dark:text-stone-300">{t('backupSize')}: <bdi dir="ltr">{formatBytes(backup.sizeBytes, locale)}</bdi></p>}{backup.status === 'failed' && <p className="pt-3 text-xs font-bold text-rose-600 dark:text-rose-300">{t('systemBackupFailedHelp')}</p>}{backup.status === 'succeeded' && <button type="button" className={`${secondaryButton} mt-4 w-full`} onClick={() => openRestore(backup)}><RotateCcw size={15} />{t('stageSystemRestore')}</button>}</article>)}</div>}
-    <div><h3 className="pb-3 text-sm font-black text-ink-900 dark:text-white">{t('systemRestoreHistory')}</h3>{restores.length === 0 ? <p className="text-xs font-bold text-stone-400">{t('noRestores')}</p> : <div className="grid grid-cols-1 gap-2 md:grid-cols-2">{restores.map((restore) => <div key={restore.id} className={`${panelClass} p-3 text-xs`}><div className="flex items-center justify-between gap-2"><bdi dir="ltr" className="truncate font-mono text-stone-400">#{restore.backupId}</bdi><span className="font-extrabold">{t(restore.status)}</span></div>{restore.status === 'failed' && <p className="pt-2 font-bold text-rose-600 dark:text-rose-300">{t('systemRestoreFailedHelp')}</p>}</div>)}</div>}</div>
+    {loading ? <Loading t={t} /> : <div className="grid grid-cols-1 gap-3 lg:grid-cols-2">{backups.length === 0 ? <div className={`${panelClass} p-5 text-sm font-bold text-stone-400`}>{t('noSystemBackups')}</div> : backups.map((backup) => <article key={backup.id} className={`${panelClass} min-w-0 p-4 sm:p-5`}><div className="flex items-start justify-between gap-3"><div className="min-w-0"><bdi dir="ltr" className="block truncate font-mono text-[0.68rem] text-stone-400">#{backup.id}</bdi><p className="pt-2 text-xs font-bold text-stone-500 dark:text-stone-300">{t(backup.target === 'local' ? 'localTarget' : 'nasTarget')} · {formatDate(backup.createdAt, locale)}</p></div><SystemStatus status={backup.status} t={t} /></div>{backup.sizeBytes !== null && <p className="pt-3 text-xs font-bold text-stone-500 dark:text-stone-300">{t('backupSize')}: <bdi dir="ltr">{formatBytes(backup.sizeBytes, locale)}</bdi></p>}{backup.source === 'imported' && <p className="pt-2 text-xs font-extrabold text-mint-600 dark:text-mint-300">{t('importedBackup')}</p>}{backup.status === 'failed' && <p className="pt-3 text-xs font-bold text-rose-600 dark:text-rose-300">{t('systemBackupFailedHelp')}</p>}{backup.status === 'succeeded' && <div className="mt-4 grid grid-cols-1 gap-2 sm:grid-cols-2"><a className={secondaryButton} href={api.exportSystemBackupUrl(backup.id)}><Download size={15} />{t('exportBackup')}</a><button type="button" className={secondaryButton} onClick={() => openRestore(backup)}><RotateCcw size={15} />{t('stageSystemRestore')}</button></div>}</article>)}</div>}
+    {imports.length > 0 && <div><h3 className="pb-3 text-sm font-black text-ink-900 dark:text-white">{t('importHistory')}</h3><div className="grid grid-cols-1 gap-2 md:grid-cols-2">{imports.map((item) => <div key={item.id} className={`${panelClass} flex items-center justify-between gap-3 p-3 text-xs`}><bdi dir="ltr" className="truncate font-mono text-stone-400">#{item.id}</bdi><span className="shrink-0 font-extrabold">{t(item.status)}</span></div>)}</div></div>}
+    <div><h3 className="pb-3 text-sm font-black text-ink-900 dark:text-white">{t('systemRestoreHistory')}</h3>{restores.length === 0 ? <p className="text-xs font-bold text-stone-400">{t('noRestores')}</p> : <div className="grid grid-cols-1 gap-2 md:grid-cols-2">{restores.map((restore) => <div key={restore.id} className={`${panelClass} p-3 text-xs`}><div className="flex items-center justify-between gap-2"><bdi dir="ltr" className="truncate font-mono text-stone-400">#{restore.backupId}</bdi><span className="font-extrabold">{t(restore.status)}</span></div>{restore.status === 'failed' && <p className="pt-2 font-bold text-rose-600 dark:text-rose-300">{t('systemRestoreFailedHelp')}</p>}{restore.status === 'staged' && supervisorEnabled && <button type="button" className={`${primaryButton} mt-3 w-full`} onClick={() => openApply(restore)}><RotateCcw size={15} />{t('applySystemRestore')}</button>}</div>)}</div>}</div>
   </section>
 }
 
@@ -217,7 +274,7 @@ function formatNumber(value: number, locale: Locale) { return new Intl.NumberFor
 function formatBytes(value: number, locale: Locale) { if (!Number.isFinite(value) || value < 0) return '-'; const units = ['B', 'KB', 'MB', 'GB', 'TB']; const index = value === 0 ? 0 : Math.min(Math.floor(Math.log(value) / Math.log(1024)), units.length - 1); return `${new Intl.NumberFormat(locale, { maximumFractionDigits: 1 }).format(value / 1024 ** index)} ${units[index]}` }
 function formatDate(value: string, locale: Locale) { const date = new Date(value); return Number.isNaN(date.getTime()) ? '-' : new Intl.DateTimeFormat(locale, { dateStyle: 'medium', timeStyle: 'short' }).format(date) }
 function friendlyError(error: unknown, t: Translate) { if (error instanceof ApiError) { if (error.status === 403) return t('forbidden'); if (error.status === 409) return t('conflict'); if (error.status === 400) return t('validationError') } return t('requestFailed') }
-function systemRecoveryError(error: unknown, t: Translate) { if (error instanceof ApiError) { const keys: Record<string, MessageKey> = { incorrect_passphrase: 'incorrectPassphrase', nas_unavailable: 'nasUnavailable', restore_already_staged: 'restoreAlreadyStaged', backup_mismatch: 'backupMismatch', invalid_backup: 'invalidBackup' }; if (error.code && keys[error.code]) return t(keys[error.code]) } return friendlyError(error, t) }
+function systemRecoveryError(error: unknown, t: Translate) { if (error instanceof ApiError) { const keys: Record<string, MessageKey> = { incorrect_passphrase: 'incorrectPassphrase', nas_unavailable: 'nasUnavailable', restore_already_staged: 'restoreAlreadyStaged', backup_mismatch: 'backupMismatch', invalid_backup: 'invalidBackup', invalid_import: 'invalidBackup', import_conflict: 'conflict', import_active: 'conflict', recovery_request_pending: 'conflict' }; if (error.code && keys[error.code]) return t(keys[error.code]) } return friendlyError(error, t) }
 
 function generateSecurePassphrase(): string {
   const alphabet = 'ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz23456789'

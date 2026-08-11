@@ -3,6 +3,9 @@ import { afterEach, describe, expect, it, vi } from 'vitest';
 import { buildApp } from '../src/app.js';
 import { CloudflareClient } from '../src/cloudflare-client.js';
 import { hashToken } from '../src/crypto.js';
+import { SecretBox } from '../src/crypto.js';
+import { NotificationDispatcher } from '../src/notification-dispatcher.js';
+import { OPERATIONAL_EVENT_TYPES } from '../src/types.js';
 import { FakeStore } from './fake-store.js';
 import { SystemRecoveryFailure, type SystemRecoveryService } from '../src/system-recovery.js';
 
@@ -142,6 +145,8 @@ describe('control-plane API', () => {
     expect(body.enrollmentCommand).toContain('GATEWAY_STATE_VOLUME=');
     expect(body.enrollmentCommand).toContain('GATEWAY_STACKS_ROOT=/opt/gateway-control/stacks');
     expect(body.enrollmentCommand).toContain('GATEWAY_HOST_STACKS_ROOT=/opt/gateway-control/stacks');
+    expect(body.enrollmentCommand).toContain('GATEWAY_DEPLOYMENTS_ROOT=/opt/gateway-control/deployments');
+    expect(body.enrollmentCommand).toContain('GATEWAY_HOST_DEPLOYMENTS_ROOT=/opt/gateway-control/deployments');
     expect(body.enrollmentCommand).toContain("GATEWAY_AGENT_IMAGE='example/gateway-agent:1.0.0'");
     expect(body.enrollmentCommand).toContain('GATEWAY_HOST_PROC_ROOT=/host/proc');
     expect(body.enrollmentCommand).toContain('GATEWAY_LOCAL_BACKUP_ROOT=/opt/gateway-control/backups/local');
@@ -152,6 +157,7 @@ describe('control-plane API', () => {
     expect(body.enrollmentCommand).toContain('/var/run/docker.sock:/var/run/docker.sock');
     expect(body.enrollmentCommand).toContain('/var/lib/gateway-agent');
     expect(body.enrollmentCommand).toContain('/opt/gateway-control/stacks:/opt/gateway-control/stacks');
+    expect(body.enrollmentCommand).toContain('/opt/gateway-control/deployments:/opt/gateway-control/deployments');
     expect(body.enrollmentCommand).toContain('/proc:/host/proc:ro');
     expect(body.enrollmentCommand).toContain('/opt/gateway-control/backups/local:/opt/gateway-control/backups/local');
     expect(body.enrollmentCommand).toContain("'/mnt/gateway-control-backups:/mnt/gateway-control-backups'");
@@ -269,6 +275,97 @@ describe('control-plane API', () => {
     expect(store.selectedEvents).toEqual(['deployment.failed']);
     const unsupported = await app.inject({ method: 'PUT', url: '/api/notifications/telegram', headers: { cookie }, payload: { selectedEvents: ['command.failed'] } });
     expect(unsupported.statusCode).toBe(400);
+  });
+
+  it('defaults new Telegram settings to every operational event while preserving intentional global opt-outs', async () => {
+    const { app, store, cookie } = await appWithOwner();
+    const defaults = await app.inject({ method: 'GET', url: '/api/notifications/telegram', headers: { cookie } });
+    expect(defaults.json()).toEqual({ configured: false, selectedEvents: [...OPERATIONAL_EVENT_TYPES] });
+
+    await app.inject({ method: 'PUT', url: '/api/notifications/telegram', headers: { cookie }, payload: { botToken: '123456:ABCDEFGHIJKLMNOPQRSTUVWXYZabcd', groupId: '-1001234567890', selectedEvents: [] } });
+    expect((await app.inject({ method: 'GET', url: '/api/notifications/telegram', headers: { cookie } })).json().selectedEvents).toEqual([]);
+    expect(store.selectedEvents).toEqual([]);
+  });
+
+  it('returns hierarchical notification preferences and authorizes scope changes by role', async () => {
+    const { app, store, cookie } = await appWithOwner();
+    const agent = await store.createAgent('notification-agent', hashToken('notification-agent-enrollment-token'));
+    store.agents[0]!.enrolledAt = new Date().toISOString();
+    await store.recordTelemetry(agent.id, {
+      observedAt: new Date().toISOString(), node: {},
+      services: [{ name: 'alpha/web', projectName: 'alpha', serviceName: 'web', status: 'healthy' }],
+    });
+    const operator = await store.createUser('notification-operator@example.com', store.users[0]!.passwordHash, 'operator');
+    const viewer = await store.createUser('notification-viewer@example.com', store.users[0]!.passwordHash, 'viewer');
+    store.sessions.set(hashToken('notification-operator-session-long-enough'), operator.id);
+    store.sessions.set(hashToken('notification-viewer-session-long-enough'), viewer.id);
+    const operatorCookie = 'gateway_control_session=notification-operator-session-long-enough';
+    const viewerCookie = 'gateway_control_session=notification-viewer-session-long-enough';
+
+    expect((await app.inject({ method: 'GET', url: '/api/notifications/topology', headers: { cookie: viewerCookie } })).statusCode).toBe(200);
+    expect((await app.inject({ method: 'PATCH', url: `/api/notifications/agents/${agent.id}`, headers: { cookie: viewerCookie }, payload: { enabled: false } })).statusCode).toBe(403);
+    expect((await app.inject({ method: 'PUT', url: '/api/notifications/telegram', headers: { cookie: operatorCookie }, payload: { selectedEvents: [] } })).statusCode).toBe(403);
+    expect((await app.inject({ method: 'POST', url: '/api/notifications/telegram/test', headers: { cookie: operatorCookie } })).statusCode).toBe(403);
+
+    const mutedAgent = await app.inject({ method: 'PATCH', url: `/api/notifications/agents/${agent.id}`, headers: { cookie: operatorCookie }, payload: { enabled: false } });
+    expect(mutedAgent.json().agent).toMatchObject({ enabled: false, services: [{ projectName: 'alpha', serviceName: 'web', enabled: false, inherited: true, directlyEnabled: true }] });
+    const mutedService = await app.inject({ method: 'PATCH', url: '/api/notifications/services', headers: { cookie: operatorCookie }, payload: { agentId: agent.id, projectName: 'alpha', serviceName: 'web', enabled: false } });
+    expect(mutedService.json().service).toMatchObject({ enabled: false, inherited: false, directlyEnabled: false });
+    const repeated = await app.inject({ method: 'PATCH', url: '/api/notifications/services', headers: { cookie: operatorCookie }, payload: { agentId: agent.id, projectName: 'alpha', serviceName: 'web', enabled: false } });
+    expect(repeated.statusCode).toBe(200);
+    store.telemetry.length = 0;
+    expect((await store.getNotificationTopology()).agents[0]?.services[0]).toMatchObject({ projectName: 'alpha', serviceName: 'web', discovered: false });
+    expect((await app.inject({ method: 'PATCH', url: '/api/notifications/services', headers: { cookie: operatorCookie }, payload: { agentId: agent.id, projectName: 'missing', serviceName: 'unknown', enabled: false } })).statusCode).toBe(404);
+  });
+
+  it('bounds notification topology responses for viewers and marks truncation', async () => {
+    const { app, store } = await appWithOwner();
+    const viewer = await store.createUser('bounded-viewer@example.com', store.users[0]!.passwordHash, 'viewer');
+    store.sessions.set(hashToken('bounded-viewer-session-long-enough'), viewer.id);
+    for (let index = 0; index < 101; index += 1) await store.createAgent(`bounded-agent-${String(index).padStart(3, '0')}`, hashToken(`bounded-enrollment-token-${index}-long-enough`));
+
+    const response = await app.inject({ method: 'GET', url: '/api/notifications/topology', headers: { cookie: 'gateway_control_session=bounded-viewer-session-long-enough' } });
+    expect(response.statusCode).toBe(200);
+    expect(response.json().agents).toHaveLength(100);
+    expect(response.json().truncated).toEqual({ agents: true, services: false, scopes: false });
+  });
+
+  it('applies agent and service notification routing and rechecks policy before send', async () => {
+    const masterKey = randomBytes(32);
+    const secretBox = new SecretBox(masterKey);
+    const store = new FakeStore();
+    const owner = await store.createOwner('routing-owner@example.com', 'password-hash');
+    const agent = await store.createAgent('routing-agent', hashToken('routing-agent-enrollment-token'));
+    store.agents[0]!.enrolledAt = new Date().toISOString();
+    await store.saveNotificationSettings(secretBox.encrypt('123456:ABCDEFGHIJKLMNOPQRSTUVWXYZabcd'), secretBox.encrypt('-1001234567890'), [...OPERATIONAL_EVENT_TYPES]);
+    const healthy = { observedAt: new Date(Date.now() - 1_000).toISOString(), node: {}, services: [{ name: 'alpha/web', projectName: 'alpha', serviceName: 'web', status: 'healthy' }] };
+    await store.recordTelemetry(agent.id, healthy);
+    await store.recordTelemetry(agent.id, { ...healthy, observedAt: new Date().toISOString(), services: [{ ...healthy.services[0]!, status: 'unhealthy' }] });
+    expect(store.deliveries).toHaveLength(1);
+    expect(store.events[0]?.payload).toMatchObject({ agentId: agent.id, projectName: 'alpha', serviceName: 'web' });
+
+    await store.setServiceNotificationPreference(agent.id, 'alpha', 'web', false, owner!.id);
+    const fetchMock = vi.fn<typeof globalThis.fetch>().mockResolvedValue(new Response('{}', { status: 200 }));
+    const dispatcher = new NotificationDispatcher({ store, secretBox, fetch: fetchMock, logger: { error: vi.fn() } as never });
+    await dispatcher.tick();
+    expect(fetchMock).not.toHaveBeenCalled();
+    expect(store.deliveries[0]?.status).toBe('skipped');
+
+    await store.setServiceNotificationPreference(agent.id, 'alpha', 'web', true, owner!.id);
+    await store.recordTelemetry(agent.id, { ...healthy, observedAt: new Date(Date.now() + 1_000).toISOString() });
+    await store.recordTelemetry(agent.id, { ...healthy, observedAt: new Date(Date.now() + 2_000).toISOString(), services: [{ ...healthy.services[0]!, status: 'unhealthy' }] });
+    await dispatcher.tick();
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+    expect(store.deliveries.at(-1)?.status).toBe('succeeded');
+
+    await store.setAgentNotificationPreference(agent.id, false, owner!.id);
+    await store.recordTelemetry(agent.id, { ...healthy, observedAt: new Date(Date.now() + 3_000).toISOString() });
+    await store.recordTelemetry(agent.id, { ...healthy, observedAt: new Date(Date.now() + 4_000).toISOString(), services: [{ ...healthy.services[0]!, status: 'unhealthy' }] });
+    expect(store.deliveries).toHaveLength(2);
+    store.agents[0]!.lastHeartbeatAt = new Date(Date.now() - 10_000).toISOString();
+    await store.sweepOfflineAgents(new Date(Date.now() - 5_000));
+    expect(store.events.find((event) => event.type === 'agent.offline')?.payload).toMatchObject({ agentId: agent.id });
+    expect(store.deliveries).toHaveLength(2);
   });
 
   it('decorates connector sync only for the assigned authenticated agent', async () => {
@@ -419,8 +516,9 @@ describe('control-plane API', () => {
     store.agents[0]!.credentialHash = hashToken(credential);
     store.agents[0]!.enrolledAt = new Date().toISOString();
     const snapshot = { observedAt: new Date().toISOString(), node: { hostname: 'nas-one', cpuPercent: 12.5 }, services: [
-      { name: 'site/web', projectName: 'site', serviceName: 'web', status: 'healthy', total: 1, running: 1, healthy: 1, unhealthy: 0, starting: 0, stopped: 0, completed: 0 },
-      { name: 'site/bootstrap', projectName: 'site', serviceName: 'bootstrap', status: 'completed', total: 1, running: 0, healthy: 0, unhealthy: 0, starting: 0, stopped: 0, completed: 1 },
+      { name: 'gateway-control/server', projectName: 'gateway-control', serviceName: 'server', status: 'healthy', total: 1, running: 1, healthy: 1, unhealthy: 0, starting: 0, stopped: 0, completed: 0 },
+      { name: 'gateway-control/bootstrap', projectName: 'gateway-control', serviceName: 'bootstrap', status: 'completed', total: 1, running: 0, healthy: 0, unhealthy: 0, starting: 0, stopped: 0, completed: 1 },
+      { name: 'firefox/browser', projectName: 'firefox', serviceName: 'browser', status: 'running', total: 1, running: 1, healthy: 0, unhealthy: 0, starting: 0, stopped: 0, completed: 0 },
     ] };
     expect((await app.inject({ method: 'POST', url: '/api/agent/telemetry', payload: snapshot })).statusCode).toBe(401);
     expect((await app.inject({ method: 'POST', url: '/api/agent/telemetry', headers: { authorization: `Bearer ${credential}` }, payload: snapshot })).statusCode).toBe(200);
@@ -432,6 +530,11 @@ describe('control-plane API', () => {
     const summary = await app.inject({ method: 'GET', url: '/api/monitoring/summary', headers: { cookie: viewerCookie } });
     expect(summary.statusCode).toBe(200);
     expect(summary.json().agents[0]).toMatchObject({ agentId: agent.id, node: { hostname: 'nas-one' } });
+    const runtimeProjects = await app.inject({ method: 'GET', url: '/api/runtime-projects', headers: { cookie: viewerCookie } });
+    expect(runtimeProjects.json().projects).toEqual(expect.arrayContaining([
+      expect.objectContaining({ projectName: 'gateway-control', status: 'healthy' }),
+      expect.objectContaining({ projectName: 'firefox', status: 'running' }),
+    ]));
     expect((await app.inject({ method: 'GET', url: `/api/monitoring/agents/${agent.id}`, headers: { cookie } })).json().history).toHaveLength(1);
 
     const futureClock = { ...snapshot, observedAt: new Date(Date.now() + 4 * 60_000).toISOString(), node: { source: 'future-clock' } };
@@ -464,6 +567,8 @@ describe('control-plane API', () => {
     store.agents[0]!.credentialHash = hashToken(credential);
     store.agents[0]!.enrolledAt = new Date().toISOString();
     await store.recordTelemetry(agent.id, { observedAt: new Date().toISOString(), node: {}, services: [{ name: 'authoritative/web', projectName: 'authoritative', serviceName: 'web', status: 'healthy', total: 1, running: 1, healthy: 1, unhealthy: 0, starting: 0, stopped: 0, completed: 0 }] });
+    await store.saveNotificationSettings('encrypted-token', 'encrypted-group', [...OPERATIONAL_EVENT_TYPES]);
+    await store.setServiceNotificationPreference(agent.id, 'authoritative', 'web', false, store.users[0]!.id);
     const viewer = await store.createUser('logs-viewer@example.com', store.users[0]!.passwordHash, 'viewer');
     store.sessions.set(hashToken('logs-viewer-session-token-long-enough'), viewer.id);
     const viewerCookie = 'gateway_control_session=logs-viewer-session-token-long-enough';
@@ -480,6 +585,9 @@ describe('control-plane API', () => {
     expect((await app.inject(completion)).json().idempotent).toBe(false);
     expect((await app.inject(completion)).json().idempotent).toBe(true);
     expect(store.events.filter((event) => event.type === 'runtime.action.succeeded')).toHaveLength(1);
+    expect(store.events.find((event) => event.type === 'runtime.action.succeeded')).toMatchObject({ agentId: agent.id, projectName: 'authoritative', serviceName: 'web' });
+    expect(store.events.find((event) => event.type === 'runtime.action.succeeded')?.payload).toMatchObject({ agentId: agent.id, projectName: 'authoritative', serviceName: 'web' });
+    expect(store.deliveries).toHaveLength(0);
 
     const crashWindowAction = await app.inject({ method: 'POST', url: '/api/runtime-actions', headers: { cookie }, payload: { ...actionPayload, action: 'stop' } });
     const crashWindowCommand = store.commands.at(-1)!;
@@ -629,6 +737,33 @@ describe('control-plane API', () => {
     expect(response.json()).toEqual({ error: 'The NAS backup target is unavailable.', code: 'nas_unavailable' });
   });
 
+  it('authorizes raw backup imports and keeps passphrases and paths out of responses', async () => {
+    const now = new Date().toISOString();
+    const importId = randomUUID();
+    const backupId = randomUUID();
+    const uploaded = { id: importId, requestedByUserId: 'private-user', status: 'uploaded' as const, quarantinePath: '/private/quarantine.gcsb', sizeBytes: 4, checksum: 'a'.repeat(64), backupId: null, error: null, createdAt: now, updatedAt: now, completedAt: null, validationRevision: 0 };
+    const imported = { ...uploaded, status: 'imported' as const, backupId, completedAt: now };
+    const backup = { id: backupId, requestedByUserId: 'private-user', target: 'local' as const, status: 'succeeded' as const, sizeBytes: 4, checksum: 'a'.repeat(64), error: null, source: 'imported' as const, metadata: { importId }, createdAt: now, completedAt: now };
+    const service: SystemRecoveryService = {
+      createBackup: vi.fn(), stageRestore: vi.fn(), listImports: vi.fn(async () => [uploaded]), cleanupStaleImports: vi.fn(async () => undefined),
+      uploadImport: vi.fn(async () => uploaded), validateImport: vi.fn(async () => ({ importRecord: imported, backup, idempotent: false })),
+      requestApply: vi.fn(async () => ({ queued: true as const })), exportArtifact: vi.fn(),
+    };
+    const { app, store, cookie } = await appWithOwner({ systemRecoveryService: service });
+    const operator = await store.createUser('import-operator@example.com', store.users[0]!.passwordHash, 'operator');
+    store.sessions.set(hashToken('import-operator-session-token-long-enough'), operator.id);
+    const operatorCookie = 'gateway_control_session=import-operator-session-token-long-enough';
+
+    expect((await app.inject({ method: 'POST', url: '/api/system-backup-imports', headers: { cookie: operatorCookie, 'content-type': 'application/octet-stream', 'content-length': '4' }, payload: Buffer.from('test') })).statusCode).toBe(403);
+    const upload = await app.inject({ method: 'POST', url: '/api/system-backup-imports', headers: { cookie, 'content-type': 'application/octet-stream', 'content-length': '4' }, payload: Buffer.from('test') });
+    expect(upload.statusCode).toBe(201);
+    expect(upload.body).not.toMatch(/quarantine|private-user|private\//);
+    const validated = await app.inject({ method: 'POST', url: `/api/system-backup-imports/${importId}/validate`, headers: { cookie }, payload: { passphrase: 'valid-import-passphrase' } });
+    expect(validated.statusCode).toBe(200);
+    expect(validated.body).not.toMatch(/passphrase|quarantine|requestedByUserId|private\//);
+    expect(service.validateImport).toHaveBeenCalledWith(expect.objectContaining({ importId, passphrase: 'valid-import-passphrase' }));
+  });
+
   it('fails backup and restore commands that remain incomplete for 24 hours', async () => {
     const store = new FakeStore();
     const owner = await store.createOwner('owner@example.com', 'password-hash');
@@ -654,6 +789,17 @@ describe('control-plane API', () => {
     expect(await store.failStaleCommands(new Date(Date.now() - 24 * 60 * 60_000))).toBe(1);
     expect(staleRestore).toMatchObject({ status: 'failed', result: { error: 'The operation exceeded the 24-hour completion window.' } });
     expect(store.events.at(-1)).toMatchObject({ type: 'backup.failed', payload: { operation: 'restore', reason: 'stale' } });
+
+    store.agents[0]!.enrolledAt = new Date().toISOString();
+    await store.saveNotificationSettings('encrypted-token', 'encrypted-group', [...OPERATIONAL_EVENT_TYPES]);
+    await store.setAgentNotificationPreference(agent.id, false, owner!.id);
+    const runtimeOperation = await store.createRuntimeOperation({ requestedByUserId: owner!.id, agentId: agent.id, projectName: 'stale', serviceName: 'web', scope: 'service', action: 'restart' });
+    const runtimeCommand = store.commands.at(-1)!;
+    runtimeCommand.createdAt = new Date(Date.now() - 25 * 60 * 60_000).toISOString();
+    expect(await store.failStaleCommands(new Date(Date.now() - 24 * 60 * 60_000))).toBe(1);
+    expect(runtimeOperation).toMatchObject({ status: 'failed' });
+    expect(store.events.at(-1)).toMatchObject({ type: 'runtime.action.failed', agentId: agent.id, projectName: 'stale', serviceName: 'web' });
+    expect(store.deliveries).toHaveLength(0);
   });
 
   it('dispatches selected durable backup events through injected Telegram fetch', async () => {
@@ -674,6 +820,7 @@ describe('control-plane API', () => {
     await app.inject({ method: 'POST', url: `/api/agent/commands/${store.commands[0]!.id}/result`, headers: { authorization: `Bearer ${credential}` }, payload: { status: 'succeeded', result: {} } });
     await vi.waitFor(() => expect(fetchMock).toHaveBeenCalledTimes(1));
     expect(store.deliveries[0]?.status).toBe('succeeded');
+    expect(store.events.find((event) => event.type === 'backup.succeeded')?.payload).toMatchObject({ agentId: agent.id, projectName: 'event' });
     const telegramBody = JSON.parse(String(fetchMock.mock.calls[0]?.[1]?.body));
     expect(telegramBody.text).toContain(`Event ID: ${store.deliveries[0]?.eventId}`);
     expect(telegramBody.text).toContain(`Delivery ID: ${store.deliveries[0]?.id}`);

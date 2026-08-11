@@ -267,6 +267,8 @@ The marker file is mandatory. Configure `GATEWAY_SYSTEM_BACKUP_NAS_ROOT` and `GA
 
 Owner system recovery is a same-instance database rollback feature, not master-key disaster recovery. Its encrypted archive includes `master.key` only as an authenticated instance identity check. Restoring requires the original configured master key, and the archived key is never installed or restored.
 
+Owners can export a verified succeeded `.gcsb` artifact and import it into another deployment of the same instance. Export never exposes the passphrase or master key separately. Import is a bounded raw `application/octet-stream` upload controlled by `GATEWAY_SYSTEM_BACKUP_MAX_BYTES` (10 GiB by default), authenticates the archive and original backup UUID, and adds it to backup history without changing the current database. Applying a restore later makes the database exactly match that snapshot and discards every post-snapshot write.
+
 ## Restore
 
 Only an Owner can request a restore. A restore:
@@ -288,6 +290,17 @@ sh docker/recover.sh
 ```
 
 The wrapper requires an immutable control-plane image digest, stops the live control plane, verifies that no application writer remains running, and only then runs the one-shot recovery service. The service waits for PostgreSQL readiness, runs only the staged recovery operation, and exits. After a successful restore, the wrapper recreates the normal control plane and waits for bounded readiness. A failed restore keeps the writer stopped and retains its durable recovery state for safe investigation or retry; it is never replayed by an ordinary restart.
+
+### Optional Host Recovery Supervisor
+
+Platform-assisted restore uses a host service, never a Docker socket mounted into the web application. The web process writes one signed, fixed-schema request under the shared system backup root; the host supervisor validates and claims it, then invokes only `sh docker/recover.sh` from the fixed `/opt/gateway-control` project root with no request-selected command, path, or arguments.
+
+1. Install the repository at `/opt/gateway-control` and configure `GATEWAY_SYSTEM_BACKUP_LOCAL_HOST_ROOT` in the systemd unit if the fixed backup root differs.
+2. Run `sudo sh /opt/gateway-control/docker/systemd/install-recovery-supervisor.sh`. This creates `/etc/gateway-control/recovery-request.secret` with mode `0600` when absent.
+3. Bind-mount that same file read-only into the control plane using a local Compose override, set `GATEWAY_RECOVERY_REQUEST_SECRET_CONTAINER_FILE` to its in-container path, and set `GATEWAY_RECOVERY_SUPERVISOR_ENABLED=true`.
+4. Keep `GATEWAY_RECOVERY_SUPERVISOR_ENABLED=false` when the service is not installed. The UI then presents the copyable `sh docker/recover.sh` fallback.
+
+The supervisor is intentionally host-level because the existing recovery wrapper must stop and recreate the control-plane container. Its status files remain outside the restored database and are bounded to the latest 20 archived requests. Review the unit paths and secret mount before enabling it on a host.
 
 ## Telegram Notifications
 

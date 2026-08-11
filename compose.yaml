@@ -72,11 +72,18 @@ services:
       SESSION_TTL_HOURS: ${SESSION_TTL_HOURS:-24}
       TRUST_PROXY: ${TRUST_PROXY:-false}
       GATEWAY_AGENT_IMAGE: ${GATEWAY_AGENT_IMAGE:-gateway-control-agent:local}
+      GATEWAY_PROTECTED_PROJECTS: ${GATEWAY_PROTECTED_PROJECTS:-gateway-control}
+      GATEWAY_NOTIFICATION_TOPOLOGY_MAX_AGENTS: ${GATEWAY_NOTIFICATION_TOPOLOGY_MAX_AGENTS:-100}
+      GATEWAY_NOTIFICATION_TOPOLOGY_MAX_SERVICES: ${GATEWAY_NOTIFICATION_TOPOLOGY_MAX_SERVICES:-5000}
+      GATEWAY_NOTIFICATION_TOPOLOGY_MAX_SCOPES: ${GATEWAY_NOTIFICATION_TOPOLOGY_MAX_SCOPES:-5000}
       GATEWAY_TRAEFIK_DYNAMIC_VOLUME: ${GATEWAY_TRAEFIK_DYNAMIC_VOLUME:-gateway-traefik-dynamic}
       GATEWAY_SYSTEM_BACKUP_LOCAL_ROOT: ${GATEWAY_SYSTEM_BACKUP_LOCAL_ROOT:-/opt/gateway-control/backups/system}
       GATEWAY_SYSTEM_BACKUP_NAS_ROOT: ${GATEWAY_SYSTEM_BACKUP_NAS_ROOT:-/mnt/gateway-control-backups}
       GATEWAY_SYSTEM_BACKUP_NAS_MARKER: ${GATEWAY_SYSTEM_BACKUP_NAS_MARKER:-.gateway-control-nas}
       GATEWAY_SYSTEM_RESTORE_STAGE_ROOT: ${GATEWAY_SYSTEM_RESTORE_STAGE_ROOT:-/opt/gateway-control/backups/system/.restore-stage}
+      GATEWAY_SYSTEM_BACKUP_MAX_BYTES: ${GATEWAY_SYSTEM_BACKUP_MAX_BYTES:-10737418240}
+      GATEWAY_RECOVERY_SUPERVISOR_ENABLED: ${GATEWAY_RECOVERY_SUPERVISOR_ENABLED:-false}
+      GATEWAY_RECOVERY_REQUEST_SECRET_FILE: ${GATEWAY_RECOVERY_REQUEST_SECRET_CONTAINER_FILE:-}
     volumes:
       - gateway_secrets:/run/gateway-secrets:ro
       - ${GATEWAY_SYSTEM_BACKUP_LOCAL_HOST_ROOT:-/opt/gateway-control/backups/system}:${GATEWAY_SYSTEM_BACKUP_LOCAL_ROOT:-/opt/gateway-control/backups/system}
@@ -147,6 +154,8 @@ services:
     ports:
       - "80:80"
       - "443:443"
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
     volumes:
       - traefik_dynamic:/etc/traefik/dynamic:ro
       - traefik_acme:/var/lib/traefik

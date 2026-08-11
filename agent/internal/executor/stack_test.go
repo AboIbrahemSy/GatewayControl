@@ -11,7 +11,7 @@ import (
 
 func TestLegacyStackSyncIsPermanentlyUnsupported(t *testing.T) {
 	executor := newTestExecutor(t)
-	runner := &recordingRunner{}
+	runner := &legacyRecordingRunner{}
 	executor.runner = runner
 	payload, err := json.Marshal(map[string]any{
 		"stackId": "123e4567-e89b-12d3-a456-426614174000",
@@ -45,15 +45,15 @@ func TestComposeValidatorsUseProjectAndServiceSpecificRules(t *testing.T) {
 	}
 }
 
-type recordingRunner struct {
+type legacyRecordingRunner struct {
 	calls [][]string
 }
 
-func (r *recordingRunner) Run(_ context.Context, name string, args []string, _ int64) (runOutput, error) {
+func (r *legacyRecordingRunner) Run(_ context.Context, name string, args []string, _ int64) (runOutput, error) {
 	r.calls = append(r.calls, append([]string{name}, args...))
 	return runOutput{}, nil
 }
 
-func (r *recordingRunner) LookPath(string) (string, error) {
+func (r *legacyRecordingRunner) LookPath(string) (string, error) {
 	return "/usr/bin/docker", nil
 }

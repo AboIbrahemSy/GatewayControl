@@ -1,5 +1,5 @@
 import { randomUUID } from 'node:crypto';
-import type { Agent, AgentCommand, BackupTarget, CloudflareAccount, CloudflareAccountSecret, CloudflareDomainAccess, CloudflareDomainAccessDeployment, CloudflareZone, Connector, ConnectorDeployment, ConnectorIdentityDeployment, ConnectorIdentityExpectation, DomainAccessDnsRecord, ManagedRoute, ManagedStack, NotificationDelivery, NotificationSettings, OperationalEventType, Role, RuntimeAction, RuntimeInventory, RuntimeLogRequest, RuntimeOperation, RuntimeScope, StackBackup, StackDeployment, StackRestore, Store, StoredSystemBackup, SystemBackup, SystemRestore, TelemetrySnapshot, User } from '../src/types.js';
+import { OPERATIONAL_EVENT_TYPES, type Agent, type AgentCommand, type BackupTarget, type CloudflareAccount, type CloudflareAccountSecret, type CloudflareDomainAccess, type CloudflareDomainAccessDeployment, type CloudflareZone, type Connector, type ConnectorDeployment, type ConnectorIdentityDeployment, type ConnectorIdentityExpectation, type Deployment, type DeploymentCommandSource, type DeploymentRevision, type DeploymentRun, type DomainAccessDnsRecord, type GuidedOperation, type ManagedRoute, type ManagedStack, type NotificationAgentPreference, type NotificationDelivery, type NotificationServicePreference, type NotificationSettings, type NotificationTopology, type OperationalEventType, type Role, type RuntimeAction, type RuntimeInventory, type RuntimeLogRequest, type RuntimeOperation, type RuntimeScope, type StackBackup, type StackDeployment, type StackRestore, type Store, type StoredSystemBackup, type SystemBackup, type SystemBackupImport, type SystemRestore, type TelemetrySnapshot, type TlsObservation, type TlsObservationTarget, type User } from '../src/types.js';
 
 export class FakeStore implements Store {
   public users: User[] = [];
@@ -14,17 +14,26 @@ export class FakeStore implements Store {
   public agents: Array<Agent & { enrollmentTokenHash?: string; credentialHash?: string; archivedAt?: string }> = [];
   public commands: Array<AgentCommand & { createdAt?: string }> = [];
   public notificationSecrets: { botTokenEncrypted: string; groupIdEncrypted: string } | null = null;
-  public selectedEvents: string[] = [];
+  public selectedEvents: string[] = [...OPERATIONAL_EVENT_TYPES];
+  public notificationScopes: Array<{ agentId: string; projectName: string | null; serviceName: string | null; enabled: boolean; updatedByUserId: string }> = [];
   public telemetry: TelemetrySnapshot[] = [];
   public backups: StackBackup[] = [];
   public restores: StackRestore[] = [];
   public systemBackups: StoredSystemBackup[] = [];
   public systemRestores: SystemRestore[] = [];
-  public events: Array<{ id: string; type: OperationalEventType; payload: Record<string, unknown>; occurredAt: string }> = [];
-  public deliveries: Array<NotificationDelivery & { status: 'pending' | 'dispatching' | 'succeeded' | 'failed'; error?: string }> = [];
+  public systemBackupImports: SystemBackupImport[] = [];
+  public systemBackupTransferEvents: Array<Record<string, unknown>> = [];
+  public systemRecoveryRequests: Array<{ id: string; ownershipToken: string; status: 'publishing' | 'published' | 'failed'; error: string | null }> = [];
+  public events: Array<{ id: string; type: OperationalEventType; agentId: string | null; projectName: string | null; serviceName: string | null; payload: Record<string, unknown>; occurredAt: string }> = [];
+  public deliveries: Array<NotificationDelivery & { status: 'pending' | 'dispatching' | 'succeeded' | 'failed' | 'skipped'; error?: string }> = [];
   public runtimeOperations: RuntimeOperation[] = [];
   public runtimeLogRequests: RuntimeLogRequest[] = [];
+  public guidedOperations: GuidedOperation[] = [];
+  public deployments: Deployment[] = [];
+  public deploymentRevisions: Array<DeploymentRevision & { encryptedSourceCompose: string; encryptedNormalizedCompose: string }> = [];
+  public deploymentRuns: DeploymentRun[] = [];
   private readonly mutexTails = new Map<string, Promise<void>>();
+  private readonly offlineNotifications = new Set<string>();
 
   public async checkReady(): Promise<void> {}
   public async isSetupComplete(): Promise<boolean> { return this.users.some((item) => item.role === 'owner'); }
@@ -159,6 +168,31 @@ export class FakeStore implements Store {
     return this.cloudflareAccounts.some((account) => account.id === accountId) ? this.cloudflareZones.filter((zone) => zone.cloudflareAccountId === accountId) : null;
   }
   public async listCloudflareDomainAccess(): Promise<CloudflareDomainAccess[]> { return this.cloudflareDomainAccess; }
+  public async createOrGetGuidedOperation(values: { kind: GuidedOperation['kind']; idempotencyKey: string; requestedByUserId: string; requestHash: string; encryptedRequest: string }): Promise<{ operation: GuidedOperation; created: boolean }> {
+    const existing = this.guidedOperations.find((item) => item.kind === values.kind && item.idempotencyKey === values.idempotencyKey && item.requestedByUserId === values.requestedByUserId);
+    if (existing) return { operation: existing, created: false };
+    const now = new Date().toISOString();
+    const operation: GuidedOperation = { id: randomUUID(), ...values, status: 'pending', stage: 'created', cloudflareAccountId: null, connectorId: null, routeId: null, domainAccessId: null, remoteTunnelId: null, remoteTunnelName: null, result: null, error: null, verificationDeadlineAt: null, verificationAttempts: 0, createdAt: now, updatedAt: now, completedAt: null };
+    this.guidedOperations.push(operation);
+    return { operation, created: true };
+  }
+  public async updateGuidedOperation(id: string, values: { status?: GuidedOperation['status']; stage?: string; accountId?: string; connectorId?: string; routeId?: string; domainAccessId?: string; remoteTunnelId?: string; remoteTunnelName?: string; result?: Record<string, unknown>; error?: string | null; clearEncryptedRequest?: boolean; verificationDeadlineAt?: string; incrementVerificationAttempts?: boolean }): Promise<GuidedOperation | null> {
+    const operation = this.guidedOperations.find((item) => item.id === id); if (!operation) return null;
+    Object.assign(operation, values, { cloudflareAccountId: values.accountId ?? operation.cloudflareAccountId, connectorId: values.connectorId ?? operation.connectorId, routeId: values.routeId ?? operation.routeId, domainAccessId: values.domainAccessId ?? operation.domainAccessId, updatedAt: new Date().toISOString() });
+    if (values.clearEncryptedRequest) operation.encryptedRequest = null;
+    if (values.verificationDeadlineAt) operation.verificationDeadlineAt = values.verificationDeadlineAt;
+    if (values.incrementVerificationAttempts) operation.verificationAttempts += 1;
+    if (values.status === 'succeeded') operation.completedAt = new Date().toISOString();
+    return operation;
+  }
+  public async getGuidedOperation(id: string): Promise<GuidedOperation | null> { return this.guidedOperations.find((item) => item.id === id) ?? null; }
+  public async listGuidedOperationsPendingVerification(limit: number): Promise<GuidedOperation[]> { return this.guidedOperations.filter((item) => item.kind === 'domain_publish' && item.status === 'waiting' && item.stage === 'pending_https_verification').slice(0, limit); }
+  public async withGuidedOperationLock<T>(kind: GuidedOperation['kind'], requestedByUserId: string, idempotencyKey: string, callback: () => Promise<T>): Promise<T> {
+    const release = await this.acquireMutex(`guided-operation:${kind}:${requestedByUserId}:${idempotencyKey}`);
+    try { return await callback(); } finally { release(); }
+  }
+  public async listTlsObservationTargets(limit: number): Promise<TlsObservationTarget[]> { return this.cloudflareDomainAccess.filter((item) => item.enabled && item.status === 'active' && item.accessMethod === 'public_ip' && !item.proxied).slice(0, limit).map((item) => ({ domainAccessId: item.id, hostname: item.hostname, agentId: this.routes.find((route) => route.id === item.routeId)!.gatewayAgentId })); }
+  public async saveTlsObservation(domainAccessId: string, observation: TlsObservation): Promise<void> { const item = this.cloudflareDomainAccess.find((access) => access.id === domainAccessId); if (!item) return; const prior = item.tlsStatus; Object.assign(item, { tlsStatus: observation.status, tlsIssuer: observation.issuer ?? null, tlsValidTo: observation.validTo ?? null, tlsObservedAt: new Date().toISOString(), tlsError: observation.error ?? null }); if (observation.status === 'expiring' && prior !== 'expiring') this.queueEvent('certificate.expiring', { domainAccessId, agentId: this.routes.find((route) => route.id === item.routeId)?.gatewayAgentId, validTo: observation.validTo }); }
   public async withDomainAccessLock<T>(id: string, callback: () => Promise<T>): Promise<T> {
     const releases = [await this.acquireMutex(`domain-access:${id}`)];
     try {
@@ -189,7 +223,8 @@ export class FakeStore implements Store {
       id: randomUUID(), cloudflareZoneId: zone.id, cloudflareAccountId: account.id, connectorId: connector?.id ?? null,
       routeId: route.id, hostname: route.hostname, accessMethod: values.accessMethod,
       publicIpv4: values.publicIpv4, publicIpv6: values.publicIpv6, ownedDnsRecords: [], dnsRecordId: null,
-      enabled: true, revision: 1, proxied: values.proxied, status: 'pending', lastError: null, lastReconciledAt: null, createdAt: now, updatedAt: now,
+      enabled: true, revision: 1, proxied: values.proxied, status: 'pending', lastError: null, lastReconciledAt: null,
+      tlsStatus: 'not_observed', tlsIssuer: null, tlsValidTo: null, tlsObservedAt: null, tlsError: null, createdAt: now, updatedAt: now,
     };
     this.cloudflareDomainAccess.push(created);
     return created;
@@ -232,7 +267,7 @@ export class FakeStore implements Store {
     Object.assign(record, { status, lastError: status === 'cleanup_pending' ? lastError ?? 'Cloudflare DNS cleanup failed.' : null });
     return true;
   }
-  public async markDomainAccessOutcome(id: string, revision: number, values: { status: 'active' | 'failed' | 'disabled'; lastError?: string | null }): Promise<CloudflareDomainAccess | null> {
+  public async markDomainAccessOutcome(id: string, revision: number, values: { status: 'pending' | 'active' | 'failed' | 'disabled'; lastError?: string | null }): Promise<CloudflareDomainAccess | null> {
     const item = this.cloudflareDomainAccess.find((access) => access.id === id && access.revision === revision);
     if (!item) return null;
     Object.assign(item, values, { dnsRecordId: item.ownedDnsRecords.find((record) => record.type === 'CNAME' && record.status === 'active')?.cloudflareRecordId ?? null, lastError: values.lastError ?? null, lastReconciledAt: new Date().toISOString(), updatedAt: new Date().toISOString() });
@@ -262,6 +297,45 @@ export class FakeStore implements Store {
     if (!item) return null;
     return this.createCommand(item.agentId, type, { composePath: `${item.id}/compose.yaml`, stack: item.name, project: item.projectName });
   }
+  public async listDeployments(): Promise<Deployment[]> {
+    return this.deployments.map((item) => ({
+      ...item,
+      revisions: this.deploymentRevisions.filter((revision) => revision.deploymentId === item.id).map(({ encryptedSourceCompose: _, encryptedNormalizedCompose: __, ...revision }) => revision),
+      latestRun: this.deploymentRuns.filter((run) => run.deploymentId === item.id).at(-1) ?? null,
+    }));
+  }
+  public async createDeployment(values: { agentId: string; displayName: string; projectName: string; sourceRepository: string; commitSha: string; composePath: string; encryptedSourceCompose: string; encryptedNormalizedCompose: string; checksum: string; policyVersion: number; policyResult: DeploymentRevision['policyResult']; requestedByUserId: string }): Promise<Deployment | null> {
+    if (!this.agents.some((agent) => agent.id === values.agentId && agent.enabled && agent.enrolledAt) || this.deployments.some((item) => item.agentId === values.agentId && item.projectName === values.projectName && item.enabled)) return null;
+    const now = new Date().toISOString();
+    const id = randomUUID();
+    const revision = { id: randomUUID(), deploymentId: id, commitSha: values.commitSha, composePath: values.composePath, checksum: values.checksum, policyVersion: values.policyVersion, policyResult: values.policyResult, createdByUserId: values.requestedByUserId, createdAt: now, encryptedSourceCompose: values.encryptedSourceCompose, encryptedNormalizedCompose: values.encryptedNormalizedCompose };
+    const created: Deployment = { id, agentId: values.agentId, displayName: values.displayName, projectName: values.projectName, sourceRepository: values.sourceRepository, enabled: true, currentRevisionId: null, status: 'pending', revisions: [], latestRun: null, createdAt: now, updatedAt: now };
+    this.deploymentRevisions.push(revision); this.deployments.push(created);
+    const { encryptedSourceCompose: _, encryptedNormalizedCompose: __, ...publicRevision } = revision;
+    return { ...created, revisions: [publicRevision], latestRun: null };
+  }
+  public async createDeploymentRevision(deploymentId: string, values: { sourceRepository: string; commitSha: string; composePath: string; encryptedSourceCompose: string; encryptedNormalizedCompose: string; checksum: string; policyVersion: number; policyResult: DeploymentRevision['policyResult']; requestedByUserId: string }): Promise<DeploymentRevision | null> {
+    const target = this.deployments.find((item) => item.id === deploymentId && item.enabled);
+    if (!target || target.sourceRepository !== values.sourceRepository || this.deploymentRevisions.some((item) => item.deploymentId === deploymentId && item.checksum === values.checksum)) return null;
+    const revision = { id: randomUUID(), deploymentId, commitSha: values.commitSha, composePath: values.composePath, checksum: values.checksum, policyVersion: values.policyVersion, policyResult: values.policyResult, createdByUserId: values.requestedByUserId, createdAt: new Date().toISOString(), encryptedSourceCompose: values.encryptedSourceCompose, encryptedNormalizedCompose: values.encryptedNormalizedCompose };
+    target.updatedAt = new Date().toISOString(); this.deploymentRevisions.push(revision);
+    const { encryptedSourceCompose: _, encryptedNormalizedCompose: __, ...publicRevision } = revision;
+    return publicRevision;
+  }
+  public async createDeploymentRun(deploymentId: string, revisionId: string, action: DeploymentRun['action'], requestedByUserId: string): Promise<DeploymentRun | 'active' | null> {
+    const target = this.deployments.find((item) => item.id === deploymentId && item.enabled);
+    if (!target || !this.agents.some((agent) => agent.id === target.agentId && agent.enabled && agent.enrolledAt) || !this.deploymentRevisions.some((revision) => revision.id === revisionId && revision.deploymentId === deploymentId)) return null;
+    if (this.deploymentRuns.some((run) => run.deploymentId === deploymentId && ['pending', 'running'].includes(run.status))) return 'active';
+    const id = randomUUID(); const command = await this.createCommand(target.agentId, 'deployment.compose.apply', { runId: id }); if (!command) return null;
+    const now = new Date().toISOString();
+    const run: DeploymentRun = { id, deploymentId, revisionId, priorRevisionId: target.currentRevisionId, agentId: target.agentId, commandId: command.id, action, status: 'pending', result: null, error: null, startedAt: null, completedAt: null, createdAt: now, updatedAt: now };
+    this.deploymentRuns.push(run); Object.assign(target, { status: action === 'stop' ? 'stopping' : 'deploying', updatedAt: now }); return run;
+  }
+  public async getDeploymentRun(id: string): Promise<DeploymentRun | null> { return this.deploymentRuns.find((item) => item.id === id) ?? null; }
+  public async getDeploymentCommandSource(runId: string): Promise<DeploymentCommandSource | null> {
+    const run = this.deploymentRuns.find((item) => item.id === runId); const target = run && this.deployments.find((item) => item.id === run.deploymentId); const revision = run && this.deploymentRevisions.find((item) => item.id === run.revisionId && item.deploymentId === run.deploymentId); const prior = run?.priorRevisionId ? this.deploymentRevisions.find((item) => item.id === run.priorRevisionId && item.deploymentId === run.deploymentId) : undefined;
+    return run && target && revision ? { ...revision, agentId: target.agentId, projectName: target.projectName, encryptedNormalizedCompose: revision.encryptedNormalizedCompose, priorRevisionId: run.priorRevisionId, encryptedPriorNormalizedCompose: prior?.encryptedNormalizedCompose ?? null, action: run.action, runId: run.id, commandId: run.commandId } : null;
+  }
   public async listRoutes(): Promise<ManagedRoute[]> { return this.routes; }
   public async createRoute(values: { gatewayAgentId: string; name: string; hostname: string; exposure: 'tunnel' | 'public'; backends: string[]; enabled: boolean }): Promise<ManagedRoute | null> {
     if (!this.agents.some((agent) => agent.id === values.gatewayAgentId && agent.enabled)) return null;
@@ -287,6 +361,49 @@ export class FakeStore implements Store {
     this.notificationSecrets = { botTokenEncrypted, groupIdEncrypted };
     this.selectedEvents = selectedEvents;
   }
+  public async getNotificationTopology(): Promise<NotificationTopology> {
+    const maxAgents = 100; const maxServices = 5_000; const maxScopes = 5_000;
+    const availableAgents = this.agents.filter((item) => !item.archivedAt);
+    const availableScopes = this.notificationScopes.slice(0, maxScopes);
+    const agentScopes = new Map(availableScopes.filter((scope) => scope.projectName === null).map((scope) => [scope.agentId, scope.enabled]));
+    const serviceScopes = new Map(availableScopes.filter((scope) => scope.projectName && scope.serviceName).map((scope) => [`${scope.agentId}\u0000${scope.projectName}\u0000${scope.serviceName}`, scope.enabled]));
+    let includedServices = 0;
+    const agents = availableAgents.slice(0, maxAgents).map((item): NotificationAgentPreference => {
+      const enabled = agentScopes.get(item.id) ?? true;
+      const latest = this.telemetry.find((snapshot) => snapshot.agentId === item.id);
+      const services = new Map<string, NotificationServicePreference>();
+      for (const service of latest?.services ?? []) {
+        if (includedServices >= maxServices) break;
+        includedServices += 1;
+        const projectName = String(service.projectName);
+        const serviceName = String(service.serviceName);
+        const status = String(service.status) as NotificationServicePreference['status'];
+        const direct = serviceScopes.get(`${item.id}\u0000${projectName}\u0000${serviceName}`) ?? true;
+        services.set(`${projectName}\u0000${serviceName}`, { projectName, serviceName, status, discovered: true, enabled: enabled && direct, inherited: !enabled && direct, directlyEnabled: direct });
+      }
+      for (const scope of availableScopes) {
+        if (scope.agentId !== item.id || !scope.projectName || !scope.serviceName) continue;
+        const key = `${scope.projectName}\u0000${scope.serviceName}`;
+        if (!services.has(key)) services.set(key, { projectName: scope.projectName!, serviceName: scope.serviceName!, status: 'unknown', discovered: false, enabled: enabled && scope.enabled, inherited: !enabled && scope.enabled, directlyEnabled: scope.enabled });
+      }
+      return { id: item.id, name: item.name, healthStatus: item.healthStatus, lastTelemetryAt: item.lastTelemetryAt, enabled, services: [...services.values()] };
+    });
+    const totalServices = availableAgents.reduce((total, item) => total + (this.telemetry.find((snapshot) => snapshot.agentId === item.id)?.services.length ?? 0), 0);
+    return { ...(await this.getNotificationSettings()), agents, truncated: { agents: availableAgents.length > maxAgents, services: totalServices > maxServices, scopes: this.notificationScopes.length > maxScopes } };
+  }
+  public async setAgentNotificationPreference(agentId: string, enabled: boolean, updatedByUserId: string): Promise<NotificationAgentPreference | null> {
+    if (!this.agents.some((item) => item.id === agentId && !item.archivedAt)) return null;
+    const scope = this.notificationScopes.find((item) => item.agentId === agentId && item.projectName === null);
+    if (scope) Object.assign(scope, { enabled, updatedByUserId }); else this.notificationScopes.push({ agentId, projectName: null, serviceName: null, enabled, updatedByUserId });
+    return (await this.getNotificationTopology()).agents.find((item) => item.id === agentId) ?? null;
+  }
+  public async setServiceNotificationPreference(agentId: string, projectName: string, serviceName: string, enabled: boolean, updatedByUserId: string): Promise<NotificationServicePreference | null> {
+    const retained = this.notificationScopes.find((item) => item.agentId === agentId && item.projectName === projectName && item.serviceName === serviceName);
+    const discovered = this.telemetry.find((snapshot) => snapshot.agentId === agentId)?.services.some((service) => service.projectName === projectName && service.serviceName === serviceName);
+    if (!this.agents.some((item) => item.id === agentId && !item.archivedAt) || (!retained && !discovered)) return null;
+    if (retained) Object.assign(retained, { enabled, updatedByUserId }); else this.notificationScopes.push({ agentId, projectName, serviceName, enabled, updatedByUserId });
+    return (await this.getNotificationTopology()).agents.find((item) => item.id === agentId)?.services.find((item) => item.projectName === projectName && item.serviceName === serviceName) ?? null;
+  }
   public async listAgents(): Promise<Agent[]> { return this.agents.filter((item) => !item.archivedAt); }
   public async createAgent(name: string, enrollmentTokenHash: string): Promise<Agent> {
     const created = {
@@ -303,6 +420,7 @@ export class FakeStore implements Store {
     const item = this.agents[index]!;
     const blocked = this.connectors.some((connector) => connector.agentId === id)
       || this.stacks.some((stack) => stack.agentId === id)
+      || this.deployments.some((deployment) => deployment.agentId === id)
       || this.routes.some((route) => route.gatewayAgentId === id)
       || this.backups.some((backup) => backup.agentId === id)
       || this.restores.some((restore) => restore.agentId === id)
@@ -354,7 +472,7 @@ export class FakeStore implements Store {
     if (agent) { agent.lastTelemetryAt = receivedAt; agent.healthStatus = 'connected'; }
     const previousServices = new Map((previous?.services ?? []).map((service) => [service.name, service]));
     for (const service of snapshot.services) {
-      if (service.status === 'unhealthy' && previousServices.get(service.name)?.status !== 'unhealthy') this.queueEvent('service.unhealthy', { service: service.name });
+      if (service.status === 'unhealthy' && previousServices.get(service.name)?.status !== 'unhealthy') this.queueEvent('service.unhealthy', { agentId, projectName: service.projectName, serviceName: service.serviceName, service: service.name });
     }
   }
   public async getMonitoringSummary(): Promise<TelemetrySnapshot[]> {
@@ -437,7 +555,7 @@ export class FakeStore implements Store {
   }
   public async listRestores(): Promise<StackRestore[]> { return this.restores; }
   public async createSystemBackup(requestedByUserId: string, target: BackupTarget, artifactPath: string): Promise<StoredSystemBackup> {
-    const created: StoredSystemBackup = { id: randomUUID(), requestedByUserId, target, artifactPath, status: 'running', sizeBytes: null, checksum: null, error: null, createdAt: new Date().toISOString(), completedAt: null };
+    const created: StoredSystemBackup = { id: randomUUID(), requestedByUserId, target, artifactPath, status: 'running', sizeBytes: null, checksum: null, error: null, source: 'created', metadata: {}, createdAt: new Date().toISOString(), completedAt: null };
     this.systemBackups.unshift(created);
     return created;
   }
@@ -453,6 +571,53 @@ export class FakeStore implements Store {
   }
   public async listSystemBackups(): Promise<SystemBackup[]> { return this.systemBackups; }
   public async getSystemBackup(id: string): Promise<StoredSystemBackup | null> { return this.systemBackups.find((item) => item.id === id && item.status === 'succeeded') ?? null; }
+  public async importSystemBackup(values: { id: string; requestedByUserId: string; artifactPath: string; sizeBytes: number; checksum: string; importId: string }): Promise<'created' | 'idempotent' | 'conflict'> {
+    const existing = this.systemBackups.find((item) => item.id === values.id);
+    if (existing) return existing.checksum === values.checksum && existing.sizeBytes === values.sizeBytes ? 'idempotent' : 'conflict';
+    const now = new Date().toISOString();
+    this.systemBackups.unshift({ id: values.id, requestedByUserId: values.requestedByUserId, target: 'local', artifactPath: values.artifactPath, status: 'succeeded', sizeBytes: values.sizeBytes, checksum: values.checksum, error: null, source: 'imported', metadata: { importId: values.importId }, createdAt: now, completedAt: now });
+    return 'created';
+  }
+  public async createSystemBackupImport(requestedByUserId: string, quarantinePath: string): Promise<SystemBackupImport | 'active'> {
+    if (this.systemBackupImports.some((item) => ['uploading', 'uploaded', 'validating'].includes(item.status))) return 'active';
+    const now = new Date().toISOString();
+    const created: SystemBackupImport = { id: randomUUID(), requestedByUserId, status: 'uploading', quarantinePath, sizeBytes: null, checksum: null, backupId: null, error: null, createdAt: now, updatedAt: now, completedAt: null, validationRevision: 0 };
+    this.systemBackupImports.unshift(created); return created;
+  }
+  public async updateSystemBackupImport(id: string, status: SystemBackupImport['status'], values: { sizeBytes?: number; checksum?: string; backupId?: string; error?: string } = {}): Promise<SystemBackupImport> {
+    const found = this.systemBackupImports.find((item) => item.id === id); if (!found) throw new Error('Import not found.');
+    Object.assign(found, values, { status, error: values.error ?? null, updatedAt: new Date().toISOString(), completedAt: ['imported', 'rejected'].includes(status) ? new Date().toISOString() : null }); return found;
+  }
+  public async claimSystemBackupImport(id: string, requestedByUserId: string): Promise<SystemBackupImport | 'validating' | null> {
+    const found = this.systemBackupImports.find((item) => item.id === id && item.requestedByUserId === requestedByUserId);
+    if (!found) return null;
+    if (found.status === 'validating') return 'validating';
+    if (found.status !== 'uploaded') return null;
+    Object.assign(found, { status: 'validating', validationRevision: found.validationRevision + 1, updatedAt: new Date().toISOString() });
+    return found;
+  }
+  public async finishSystemBackupImport(id: string, validationRevision: number, status: 'imported' | 'rejected', values: { backupId?: string; error?: string } = {}): Promise<SystemBackupImport | null> {
+    const found = this.systemBackupImports.find((item) => item.id === id && item.status === 'validating' && item.validationRevision === validationRevision);
+    if (!found) return null;
+    Object.assign(found, values, { status, error: values.error ?? null, updatedAt: new Date().toISOString(), completedAt: new Date().toISOString() });
+    return found;
+  }
+  public async getSystemBackupImport(id: string): Promise<SystemBackupImport | null> { return this.systemBackupImports.find((item) => item.id === id) ?? null; }
+  public async listSystemBackupImports(): Promise<SystemBackupImport[]> { return this.systemBackupImports; }
+  public async rejectStaleSystemBackupImports(before: Date): Promise<SystemBackupImport[]> { const stale = this.systemBackupImports.filter((item) => ['uploading', 'uploaded', 'validating'].includes(item.status) && Date.parse(item.updatedAt) < before.getTime()); stale.forEach((item) => Object.assign(item, { status: 'rejected', error: 'upload_interrupted', completedAt: new Date().toISOString() })); return stale; }
+  public async recordSystemBackupTransferEvent(values: { requestedByUserId: string; operation: 'export' | 'import' | 'restore_apply_requested'; backupId?: string; restoreId?: string; importId?: string; metadata?: Record<string, unknown> }): Promise<void> { this.systemBackupTransferEvents.push(values); }
+  public async createSystemRecoveryRequest(_restoreId: string, _requestedByUserId: string, ownershipToken: string): Promise<{ id: string; ownershipToken: string } | 'active'> {
+    if (this.systemRecoveryRequests.some((item) => ['publishing', 'published'].includes(item.status))) return 'active';
+    const created = { id: randomUUID(), ownershipToken, status: 'publishing' as 'publishing' | 'published' | 'failed', error: null as string | null };
+    this.systemRecoveryRequests.push(created);
+    return created;
+  }
+  public async finishSystemRecoveryRequest(id: string, ownershipToken: string, status: 'published' | 'failed', error?: string): Promise<boolean> {
+    const found = this.systemRecoveryRequests.find((item) => item.id === id && item.ownershipToken === ownershipToken && item.status === 'publishing');
+    if (!found) return false;
+    Object.assign(found, { status, error: error ?? null });
+    return true;
+  }
   public async createSystemRestore(backupId: string, requestedByUserId: string, status: 'staging' | 'failed', error?: string): Promise<SystemRestore> {
     const now = new Date().toISOString();
     const created: SystemRestore = { id: randomUUID(), backupId, requestedByUserId, status, error: error ?? null, createdAt: now, completedAt: status === 'failed' ? now : null };
@@ -466,6 +631,7 @@ export class FakeStore implements Store {
     return found;
   }
   public async listSystemRestores(): Promise<SystemRestore[]> { return this.systemRestores; }
+  public async getSystemRestore(id: string): Promise<SystemRestore | null> { return this.systemRestores.find((item) => item.id === id) ?? null; }
   public async getRestoreDeployment(restoreId: string): Promise<{ restore: StackRestore; backup: StackBackup; stack: StackDeployment } | null> {
     const found = this.restores.find((item) => item.id === restoreId);
     const source = found ? this.backups.find((item) => item.id === found.backupId) : undefined;
@@ -500,6 +666,7 @@ export class FakeStore implements Store {
       }
       if (item.type === 'compose.runtime.action') { const operation = this.runtimeOperations.find((candidate) => candidate.id === item.payload.operationId && candidate.agentId === agentId); if (operation) operation.status = 'running'; }
       if (item.type === 'compose.runtime.logs') { const request = this.runtimeLogRequests.find((candidate) => candidate.id === item.payload.requestId && candidate.agentId === agentId); if (request) request.status = 'running'; }
+      if (item.type === 'deployment.compose.apply') { const run = this.deploymentRuns.find((candidate) => candidate.id === item.payload.runId && candidate.agentId === agentId); if (run) { run.status = 'running'; run.startedAt = new Date().toISOString(); } }
     });
     return selected;
   }
@@ -539,12 +706,16 @@ export class FakeStore implements Store {
       const hasPending = this.commands.some((candidate) => candidate.type === item.type && candidate.status === 'pending' && candidate.payload.routeId === item.payload.routeId);
       if (route && !hasPending) route.status = deploymentStatus;
     }
-    if (status === 'failed' && ['compose.stack.sync', 'traefik.route.sync', 'cloudflare.connector.sync'].includes(item.type)) this.queueEvent('deployment.failed', { commandId });
+    if (status === 'failed' && ['compose.stack.sync', 'traefik.route.sync', 'cloudflare.connector.sync'].includes(item.type)) {
+      const stack = item.type === 'compose.stack.sync' ? this.stacks.find((candidate) => candidate.id === item.payload.stackId) : undefined;
+      this.queueEvent('deployment.failed', { agentId, ...(stack ? { projectName: stack.projectName } : {}), commandId, commandType: item.type });
+    }
     if (item.type === 'stack.backup.create') {
       const backup = this.backups.find((candidate) => candidate.id === item.payload.backupId);
       if (backup) {
         Object.assign(backup, { status, result, completedAt: new Date().toISOString(), updatedAt: new Date().toISOString() });
-        this.queueEvent(status === 'succeeded' ? 'backup.succeeded' : 'backup.failed', { backupId: backup.id });
+        const stack = this.stacks.find((candidate) => candidate.id === backup.stackId);
+        this.queueEvent(status === 'succeeded' ? 'backup.succeeded' : 'backup.failed', { agentId, ...(stack ? { projectName: stack.projectName } : {}), backupId: backup.id });
       }
     }
     if (item.type === 'stack.restore.apply') {
@@ -559,6 +730,16 @@ export class FakeStore implements Store {
       const request = this.runtimeLogRequests.find((candidate) => candidate.id === item.payload.requestId && ['pending', 'running'].includes(candidate.status));
       if (request) Object.assign(request, { status, result: status === 'succeeded' ? { logs: typeof result.logs === 'string' ? result.logs : '', truncated: result.truncated === true } : null, error: status === 'failed' ? String(result.error || 'Runtime log request failed.') : null, completedAt: new Date().toISOString(), updatedAt: new Date().toISOString() });
     }
+    if (item.type === 'deployment.compose.apply') {
+      const run = this.deploymentRuns.find((candidate) => candidate.id === item.payload.runId && ['pending', 'running'].includes(candidate.status));
+      const target = run && this.deployments.find((candidate) => candidate.id === run.deploymentId && candidate.agentId === agentId);
+      if (run && target) {
+        const now = new Date().toISOString(); const safeResult = Object.fromEntries(['matched', 'succeeded', 'failed', 'message'].flatMap((key) => typeof result[key] === 'string' || typeof result[key] === 'number' ? [[key, result[key]]] : []));
+        Object.assign(run, { status, result: safeResult, error: status === 'failed' ? String(result.error || 'Deployment failed.') : null, completedAt: now, updatedAt: now });
+        Object.assign(target, { status: status === 'succeeded' ? run.action === 'stop' ? 'stopped' : 'active' : 'failed', ...(status === 'succeeded' && run.action !== 'stop' ? { currentRevisionId: run.revisionId } : {}), updatedAt: now });
+        this.queueEvent(status === 'succeeded' ? 'deployment.succeeded' : 'deployment.failed', { agentId, projectName: target.projectName, deploymentId: target.id, runId: run.id, action: run.action });
+      }
+    }
     return 'updated';
   }
   public async claimNotificationDelivery(): Promise<NotificationDelivery | null> {
@@ -567,6 +748,15 @@ export class FakeStore implements Store {
     found.status = 'dispatching';
     found.attempts += 1;
     return found;
+  }
+  public async isNotificationDeliveryEnabled(delivery: NotificationDelivery): Promise<boolean> {
+    if (!this.notificationSecrets || !this.selectedEvents.includes(delivery.eventType)) return false;
+    if (delivery.agentId && this.notificationScopes.some((scope) => scope.agentId === delivery.agentId && scope.projectName === null && !scope.enabled)) return false;
+    return !(delivery.agentId && delivery.serviceName && this.notificationScopes.some((scope) => scope.agentId === delivery.agentId && scope.projectName === delivery.projectName && scope.serviceName === delivery.serviceName && !scope.enabled));
+  }
+  public async skipNotificationDelivery(id: string): Promise<void> {
+    const found = this.deliveries.find((item) => item.id === id);
+    if (found) found.status = 'skipped';
   }
   public async purgeRuntimeLogResults(completedBefore: Date): Promise<number> {
     let purged = 0;
@@ -588,10 +778,14 @@ export class FakeStore implements Store {
     const found = this.deliveries.find((item) => item.id === id);
     if (found) Object.assign(found, { status: terminal ? 'failed' : 'pending', error });
   }
-  public async sweepOfflineAgents(_offlineBefore: Date): Promise<number> { return 0; }
+  public async sweepOfflineAgents(offlineBefore: Date): Promise<number> {
+    const offline = this.agents.filter((agent) => agent.enabled && agent.enrolledAt && agent.lastHeartbeatAt && Date.parse(agent.lastHeartbeatAt) < offlineBefore.getTime() && !this.offlineNotifications.has(agent.id));
+    for (const agent of offline) { this.offlineNotifications.add(agent.id); this.queueEvent('agent.offline', { agentId: agent.id, agentName: agent.name }); }
+    return offline.length;
+  }
   public async failStaleCommands(staleBefore: Date): Promise<number> {
     const stale = this.commands.filter((command) => ['pending', 'claimed'].includes(command.status) && (
-      (['stack.backup.create', 'stack.restore.apply', 'compose.runtime.action', 'compose.runtime.logs'].includes(command.type) && Date.parse(command.createdAt ?? '') < staleBefore.getTime())
+      (['stack.backup.create', 'stack.restore.apply', 'compose.runtime.action', 'compose.runtime.logs', 'deployment.compose.apply'].includes(command.type) && Date.parse(command.createdAt ?? '') < staleBefore.getTime())
       || (['cloudflare.connector.sync', 'cloudflare.connector.remove'].includes(command.type) && Date.parse(command.createdAt ?? '') < Date.now() - 30 * 60_000)
     ));
     const completedAt = new Date().toISOString();
@@ -607,14 +801,16 @@ export class FakeStore implements Store {
         const backup = this.backups.find((item) => item.commandId === command.id && ['pending', 'running'].includes(item.status));
         if (backup) {
           Object.assign(backup, { status: 'failed', result, completedAt, updatedAt: completedAt });
-          this.queueEvent('backup.failed', { backupId: backup.id, operation: 'backup', reason: 'stale' });
+          const stack = this.stacks.find((item) => item.id === backup.stackId);
+          this.queueEvent('backup.failed', { agentId: backup.agentId, ...(stack ? { projectName: stack.projectName } : {}), backupId: backup.id, operation: 'backup', reason: 'stale' });
         }
       }
       if (command.type === 'stack.restore.apply') {
         const restore = this.restores.find((item) => item.commandId === command.id && ['pending', 'running'].includes(item.status));
         if (restore) {
           Object.assign(restore, { status: 'failed', result, completedAt, updatedAt: completedAt });
-          this.queueEvent('backup.failed', { restoreId: restore.id, backupId: restore.backupId, operation: 'restore', reason: 'stale' });
+          const stack = this.stacks.find((item) => item.id === restore.stackId);
+          this.queueEvent('backup.failed', { agentId: restore.agentId, ...(stack ? { projectName: stack.projectName } : {}), restoreId: restore.id, backupId: restore.backupId, operation: 'restore', reason: 'stale' });
         }
       }
       if (command.type === 'compose.runtime.action') {
@@ -624,6 +820,12 @@ export class FakeStore implements Store {
       if (command.type === 'compose.runtime.logs') {
         const request = this.runtimeLogRequests.find((item) => item.commandId === command.id && ['pending', 'running'].includes(item.status));
         if (request) Object.assign(request, { status: 'failed', result, error: result.error, completedAt, updatedAt: completedAt });
+      }
+      if (command.type === 'deployment.compose.apply') {
+        const run = this.deploymentRuns.find((item) => item.commandId === command.id && ['pending', 'running'].includes(item.status));
+        const target = run && this.deployments.find((item) => item.id === run.deploymentId);
+        if (run) Object.assign(run, { status: 'failed', result, error: result.error, completedAt, updatedAt: completedAt });
+        if (target) Object.assign(target, { status: 'failed', updatedAt: completedAt });
       }
     }
     return stale.length;
@@ -671,7 +873,12 @@ export class FakeStore implements Store {
   private queueEvent(type: OperationalEventType, payload: Record<string, unknown>): void {
     const id = randomUUID();
     const occurredAt = new Date().toISOString();
-    this.events.push({ id, type, payload, occurredAt });
-    if (this.selectedEvents.includes(type)) this.deliveries.push({ id: randomUUID(), eventId: id, eventType: type, payload, occurredAt, attempts: 0, status: 'pending' });
+    const agentId = typeof payload.agentId === 'string' ? payload.agentId : null;
+    const projectName = typeof payload.projectName === 'string' ? payload.projectName : null;
+    const serviceName = typeof payload.serviceName === 'string' ? payload.serviceName : null;
+    this.events.push({ id, type, agentId, projectName, serviceName, payload, occurredAt });
+    const agentMuted = agentId && this.notificationScopes.some((scope) => scope.agentId === agentId && scope.projectName === null && !scope.enabled);
+    const serviceMuted = agentId && serviceName && this.notificationScopes.some((scope) => scope.agentId === agentId && scope.projectName === projectName && scope.serviceName === serviceName && !scope.enabled);
+    if (this.notificationSecrets && this.selectedEvents.includes(type) && !agentMuted && !serviceMuted) this.deliveries.push({ id: randomUUID(), eventId: id, eventType: type, payload, occurredAt, attempts: 0, status: 'pending', agentId, projectName, serviceName });
   }
 }

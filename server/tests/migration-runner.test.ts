@@ -1,6 +1,7 @@
-import { mkdtemp, rm, writeFile } from 'node:fs/promises';
+import { mkdtemp, readFile, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
+import { fileURLToPath } from 'node:url';
 import { afterEach, describe, expect, it } from 'vitest';
 import { discoverMigrations, HISTORICAL_MIGRATION_CHECKSUMS, validateAppliedMigrations } from '../src/migration-runner.js';
 
@@ -34,6 +35,29 @@ describe('migration integrity', () => {
     await expect(discoverMigrations(await migrationDirectory({ '001_first.sql': '', '001_second.sql': '' }))).rejects.toThrow('Duplicate migration sequence');
   });
 
+  it('requires migration numbering to start at 001 without gaps', async () => {
+    await expect(discoverMigrations(await migrationDirectory({ '001_first.sql': '', '003_third.sql': '' })))
+      .rejects.toThrow('expected 002, found 003');
+    await expect(discoverMigrations(await migrationDirectory({ '002_second.sql': '' })))
+      .rejects.toThrow('expected 001, found 002');
+  });
+
+  it('ships contiguous deployment and domain hardening as migration 024', async () => {
+    const migrations = await discoverMigrations(fileURLToPath(new URL('../migrations', import.meta.url)));
+    expect(migrations.at(-1)?.name).toBe('024_deploy_domain_hardening.sql');
+    expect(migrations).toHaveLength(24);
+  });
+
+  it('adds recovery request ownership and import validation revisions additively', async () => {
+    const sql = await readFile(new URL('../migrations/023_recovery_hardening.sql', import.meta.url), 'utf8');
+
+    expect(sql).toContain('ADD COLUMN validation_revision bigint NOT NULL DEFAULT 0');
+    expect(sql).toContain('CREATE TABLE system_recovery_requests');
+    expect(sql).toContain('ownership_token uuid NOT NULL UNIQUE');
+    expect(sql).toContain("WHERE status IN ('publishing', 'published')");
+    expect(sql).not.toMatch(/\b(?:DROP|CASCADE)\b|\bDELETE\s+FROM\b/i);
+  });
+
   it('accepts only the fixed reviewed checksum when baselining historical rows', () => {
     const checksum = HISTORICAL_MIGRATION_CHECKSUMS['001_initial.sql']!;
     expect(() => validateAppliedMigrations([{ name: '001_initial.sql', sql: '', checksum }], [{ name: '001_initial.sql', checksum: null }])).not.toThrow();
@@ -46,5 +70,9 @@ describe('migration integrity', () => {
     ];
     expect(() => validateAppliedMigrations(migrations, [{ name: migrations[1]!.name, checksum: migrations[1]!.checksum }]))
       .toThrow('contiguous prefix');
+    expect(() => validateAppliedMigrations(migrations, [
+      { name: migrations[1]!.name, checksum: migrations[1]!.checksum },
+      { name: migrations[0]!.name, checksum: migrations[0]!.checksum },
+    ])).toThrow('contiguous prefix');
   });
 });

@@ -336,6 +336,7 @@ describe('Cloudflare domain access', () => {
         id: randomUUID(), cloudflareZoneId: randomUUID(), cloudflareAccountId: account.id, connectorId: connector!.id,
         routeId: randomUUID(), hostname, accessMethod: 'tunnel', publicIpv4: [], publicIpv6: [], ownedDnsRecords: [],
         dnsRecordId: null, enabled: true, revision: 1, proxied: true, status: 'pending', lastError: null,
+        tlsStatus: 'not_observed', tlsIssuer: null, tlsValidTo: null, tlsObservedAt: null, tlsError: null,
         lastReconciledAt: null, createdAt: now, updatedAt: now,
       });
     }

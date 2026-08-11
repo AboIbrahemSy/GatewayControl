@@ -4,7 +4,11 @@ import { PgStore } from './postgres-store.js';
 import { FileSystemRecoveryService } from './system-recovery.js';
 
 const config = loadConfig();
-const store = new PgStore(config.databaseUrl);
+const store = new PgStore(config.databaseUrl, {
+  maxAgents: config.notificationTopologyMaxAgents,
+  maxServices: config.notificationTopologyMaxServices,
+  maxScopes: config.notificationTopologyMaxScopes,
+});
 const systemRecoveryService = new FileSystemRecoveryService({
   store,
   databaseUrl: config.databaseUrl,
@@ -13,6 +17,9 @@ const systemRecoveryService = new FileSystemRecoveryService({
   nasRoot: config.systemBackupNasRoot,
   nasMarker: config.systemBackupNasMarker,
   stageRoot: config.systemRestoreStageRoot,
+  maxImportBytes: config.systemBackupMaxBytes,
+  recoverySupervisorEnabled: config.recoverySupervisorEnabled,
+  ...(config.recoveryRequestSecret ? { recoveryRequestSecret: config.recoveryRequestSecret } : {}),
 });
 const app = await buildApp({
   store,
@@ -25,6 +32,7 @@ const app = await buildApp({
   systemBackupNasRoot: config.systemBackupNasRoot,
   systemBackupNasMarker: config.systemBackupNasMarker,
   systemRecoveryService,
+  recoverySupervisorEnabled: config.recoverySupervisorEnabled,
   release: config.release,
   protectedProjects: config.protectedProjects,
   ...(config.webRoot ? { webRoot: config.webRoot } : {}),

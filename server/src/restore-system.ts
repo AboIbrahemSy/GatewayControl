@@ -2,16 +2,29 @@ import { spawn } from 'node:child_process';
 import { lstat, readFile, rename, rm } from 'node:fs/promises';
 import { basename, join } from 'node:path';
 import { pathToFileURL } from 'node:url';
+import { Client } from 'pg';
 import { postgresEnvironment, type ToolRunner } from './system-recovery.js';
 import { validateRestoreStageRoot } from './config.js';
 
 const UUID_PATTERN = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
+const CHECKSUM_PATTERN = /^[a-f0-9]{64}$/;
 const MAX_TOOL_OUTPUT_BYTES = 8_192;
+
+interface RestoreMarker {
+  version: 1 | 2;
+  restoreId: string;
+  backupId: string;
+  dump: string;
+  token: string;
+  backupSizeBytes?: number;
+  backupChecksum?: string;
+}
 
 export async function applyStagedSystemRestore(options: {
   stageRoot: string;
   databaseUrl: string;
   toolRunner?: ToolRunner;
+  finalizeBackup?: (databaseUrl: string, metadata: RestoreMarker) => Promise<void>;
   removeFile?: (path: string) => Promise<void>;
   renameFile?: (source: string, destination: string) => Promise<void>;
 }): Promise<boolean> {
@@ -27,12 +40,15 @@ export async function applyStagedSystemRestore(options: {
   let markerPath = join(options.stageRoot, markerName);
   const marker = activeMarkers[0]!.stat;
   if (!marker?.isFile() || marker.isSymbolicLink()) throw new Error('The staged system restore marker is invalid.');
-  const metadata = JSON.parse(await readFile(markerPath, 'utf8')) as { version?: unknown; restoreId?: unknown; backupId?: unknown; dump?: unknown; token?: unknown };
-  if (metadata.version !== 1 || typeof metadata.restoreId !== 'string' || !UUID_PATTERN.test(metadata.restoreId)
+  const metadata = JSON.parse(await readFile(markerPath, 'utf8')) as Partial<RestoreMarker>;
+  if (![1, 2].includes(metadata.version as number) || typeof metadata.restoreId !== 'string' || !UUID_PATTERN.test(metadata.restoreId)
     || typeof metadata.backupId !== 'string' || !UUID_PATTERN.test(metadata.backupId)
     || typeof metadata.token !== 'string' || !UUID_PATTERN.test(metadata.token)
     || typeof metadata.dump !== 'string' || basename(metadata.dump) !== metadata.dump
+    || (metadata.version === 2 && (!Number.isSafeInteger(metadata.backupSizeBytes) || Number(metadata.backupSizeBytes) < 1
+      || typeof metadata.backupChecksum !== 'string' || !CHECKSUM_PATTERN.test(metadata.backupChecksum)))
     || metadata.dump !== `database-${metadata.backupId}-${metadata.token}.dump`) throw new Error('The staged system restore marker is unsupported.');
+  const restoreMetadata = metadata as RestoreMarker;
   const dumpPath = join(options.stageRoot, metadata.dump);
   const lockPath = join(options.stageRoot, 'restore.lock');
   const lock = await lstat(lockPath).catch(() => null);
@@ -55,6 +71,9 @@ export async function applyStagedSystemRestore(options: {
     const args = ['--clean', '--if-exists', '--no-owner', '--no-privileges', '--exit-on-error', '--single-transaction', '--dbname', database.pathname.slice(1), dumpPath];
     const runner = options.toolRunner ?? { run: runRestoreTool };
     await runner.run('pg_restore', args, postgresEnvironment(database));
+    if (restoreMetadata.version === 2) {
+      await (options.finalizeBackup ?? finalizeRestoredBackup)(options.databaseUrl, restoreMetadata);
+    }
     const appliedPath = join(options.stageRoot, 'restore.applied');
     await renameFile(markerPath, appliedPath);
     markerPath = appliedPath;
@@ -66,6 +85,23 @@ export async function applyStagedSystemRestore(options: {
   await removeFile(markerPath);
   await removeFile(dumpPath);
   return true;
+}
+
+async function finalizeRestoredBackup(databaseUrl: string, metadata: RestoreMarker): Promise<void> {
+  const client = new Client({ connectionString: databaseUrl });
+  await client.connect();
+  try {
+    const result = await client.query(
+      `UPDATE system_backups
+       SET status = 'succeeded', size_bytes = $2, checksum = $3, error = NULL, completed_at = now()
+       WHERE id = $1 AND status = 'running'
+       RETURNING id`,
+      [metadata.backupId, metadata.backupSizeBytes, metadata.backupChecksum],
+    );
+    if (result.rowCount !== 1) throw new Error('The restored system backup record could not be finalized.');
+  } finally {
+    await client.end();
+  }
 }
 
 function runRestoreTool(command: string, args: string[], environment: NodeJS.ProcessEnv): Promise<string> {

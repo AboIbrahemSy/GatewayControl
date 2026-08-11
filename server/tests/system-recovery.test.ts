@@ -1,7 +1,8 @@
 import { randomUUID } from 'node:crypto';
-import { lstat, mkdir, mkdtemp, readFile, readdir, rename, rm, writeFile } from 'node:fs/promises';
+import { lstat, mkdir, mkdtemp, readFile, readdir, rename, rm, symlink, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
+import { Readable } from 'node:stream';
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import { applyStagedSystemRestore } from '../src/restore-system.js';
 import { FileSystemRecoveryService, SystemRecoveryFailure, type ToolRunner } from '../src/system-recovery.js';
@@ -68,6 +69,12 @@ async function fixture() {
   return { root, localRoot, nasRoot, stageRoot, store, runner, service };
 }
 
+async function readStream(stream: Readable): Promise<Buffer> {
+  const chunks: Buffer[] = [];
+  for await (const chunk of stream) chunks.push(Buffer.from(chunk as Buffer));
+  return Buffer.concat(chunks);
+}
+
 describe('system recovery service', () => {
   it('encrypts a backup, binds its record ID, and stages a backup-specific dump', async () => {
     const { service, store, runner, stageRoot } = await fixture();
@@ -78,8 +85,8 @@ describe('system recovery service', () => {
       manualRestoreRequired: true,
       restoreCommand: 'sh docker/recover.sh',
     });
-    const marker = JSON.parse(await readFile(join(stageRoot, 'restore.pending'), 'utf8')) as { restoreId: string; backupId: string; token: string; dump: string };
-    expect(marker).toMatchObject({ restoreId: result.restore.id, backupId: backup.id });
+    const marker = JSON.parse(await readFile(join(stageRoot, 'restore.pending'), 'utf8')) as { version: number; restoreId: string; backupId: string; backupSizeBytes: number; backupChecksum: string; token: string; dump: string };
+    expect(marker).toMatchObject({ version: 2, restoreId: result.restore.id, backupId: backup.id, backupSizeBytes: backup.sizeBytes, backupChecksum: backup.checksum });
     expect(marker.dump).toBe(`database-${backup.id}-${marker.token}.dump`);
     expect(await readFile(join(stageRoot, marker.dump), 'utf8')).toBe('portable database dump');
     expect(await readFile(join(stageRoot, 'restore.lock'), 'utf8')).toBe(`${marker.token}\n`);
@@ -196,9 +203,250 @@ describe('system recovery service', () => {
     await expect(service.createBackup({ requestedByUserId: randomUUID(), target: 'nas', passphrase: 'another correct backup passphrase' }))
       .rejects.toMatchObject({ code: 'nas_unavailable' });
   });
+
+  it('exports only a verified stored artifact and records bounded audit metadata', async () => {
+    const { service, store } = await fixture();
+    const actorId = randomUUID();
+    const backup = await service.createBackup({ requestedByUserId: actorId, target: 'local', passphrase: 'correct horse battery staple' });
+    const exported = await service.exportArtifact({ backupId: backup.id, requestedByUserId: actorId });
+
+    expect(exported.filename).toBe(`gateway-control-system-${backup.id}.gcsb`);
+    expect(await readStream(exported.stream)).toEqual(await readFile(store.systemBackups[0]!.artifactPath));
+    expect(store.systemBackupTransferEvents[0]).toMatchObject({ operation: 'export', backupId: backup.id, requestedByUserId: actorId });
+    store.systemBackups[0]!.sizeBytes! += 1;
+    await expect(service.exportArtifact({ backupId: backup.id, requestedByUserId: actorId })).rejects.toMatchObject({ code: 'invalid_backup' });
+  });
+
+  it.runIf(process.platform !== 'win32')('rejects a stored symlink artifact without following it', async () => {
+    const { service, store, root } = await fixture();
+    const actorId = randomUUID();
+    const backup = await service.createBackup({ requestedByUserId: actorId, target: 'local', passphrase: 'correct horse battery staple' });
+    const artifactPath = store.systemBackups[0]!.artifactPath;
+    const realPath = join(root, 'real-artifact.gcsb');
+    await rename(artifactPath, realPath);
+    await symlink(realPath, artifactPath, 'file');
+
+    await expect(service.exportArtifact({ backupId: backup.id, requestedByUserId: actorId })).rejects.toMatchObject({ code: 'invalid_backup' });
+  });
+
+  it('streams from the verified descriptor when the pathname is replaced', async () => {
+    const { service, store, root } = await fixture();
+    const actorId = randomUUID();
+    const backup = await service.createBackup({ requestedByUserId: actorId, target: 'local', passphrase: 'correct horse battery staple' });
+    const artifactPath = store.systemBackups[0]!.artifactPath;
+    const expected = await readFile(artifactPath);
+    const exported = await service.exportArtifact({ backupId: backup.id, requestedByUserId: actorId });
+    await rename(artifactPath, join(root, 'verified-open-artifact.gcsb'));
+    await writeFile(artifactPath, 'replacement must not be streamed');
+
+    expect(await readStream(exported.stream)).toEqual(expected);
+  });
+
+  it('closes the verified export descriptor when the stream is aborted', async () => {
+    const { service, store, root } = await fixture();
+    const actorId = randomUUID();
+    const backup = await service.createBackup({ requestedByUserId: actorId, target: 'local', passphrase: 'correct horse battery staple' });
+    const exported = await service.exportArtifact({ backupId: backup.id, requestedByUserId: actorId });
+    const closed = new Promise<void>((resolve) => exported.stream.once('close', resolve));
+    exported.stream.destroy();
+    await closed;
+    await expect(rename(store.systemBackups[0]!.artifactPath, join(root, 'closed-export.gcsb'))).resolves.toBeUndefined();
+  });
+
+  it('enforces declared and streaming import bounds and rejects truncation', async () => {
+    const { root, store, runner } = await fixture();
+    const service = new FileSystemRecoveryService({
+      store, databaseUrl: 'postgresql://gateway:password@database:5432/gateway_control', masterKey: Buffer.alloc(32, 7),
+      localRoot: join(root, 'bounded'), nasRoot: join(root, 'nas'), nasMarker: '.gateway-control-nas', stageRoot: join(root, 'bounded-stage'), toolRunner: runner, maxImportBytes: 8,
+    });
+    await expect(service.uploadImport({ requestedByUserId: randomUUID(), stream: Readable.from(Buffer.alloc(9)), contentLength: 9 })).rejects.toMatchObject({ code: 'import_too_large' });
+    await expect(service.uploadImport({ requestedByUserId: randomUUID(), stream: Readable.from(Buffer.alloc(4)), contentLength: 8 })).rejects.toMatchObject({ code: 'invalid_import' });
+    expect(store.systemBackupImports.at(-1)).toMatchObject({ status: 'rejected', error: 'invalid_import' });
+  });
+
+  it('streams an exported artifact through import and can stage the preserved backup ID', async () => {
+    const source = await fixture();
+    const passphrase = 'correct horse battery staple';
+    const created = await source.service.createBackup({ requestedByUserId: randomUUID(), target: 'local', passphrase });
+    const artifact = await readFile(source.store.systemBackups[0]!.artifactPath);
+
+    const destinationRoot = await mkdtemp(join(tmpdir(), 'gateway-import-roundtrip-'));
+    roots.push(destinationRoot);
+    const destinationStore = new FakeStore();
+    const destinationService = new FileSystemRecoveryService({
+      store: destinationStore, databaseUrl: 'postgresql://gateway:password@database:5432/gateway_control', masterKey: Buffer.alloc(32, 7),
+      localRoot: join(destinationRoot, 'local'), nasRoot: join(destinationRoot, 'nas'), nasMarker: '.gateway-control-nas', stageRoot: join(destinationRoot, 'stage'), toolRunner: new PortableToolRunner(),
+    });
+    const actorId = randomUUID();
+    const uploaded = await destinationService.uploadImport({ requestedByUserId: actorId, stream: Readable.from(artifact), contentLength: artifact.length });
+    const imported = await destinationService.validateImport({ importId: uploaded.id, requestedByUserId: actorId, passphrase });
+
+    expect(imported.backup).toMatchObject({ id: created.id, source: 'imported', status: 'succeeded' });
+    await expect(destinationService.stageRestore({ backupId: created.id, requestedByUserId: actorId, passphrase })).resolves.toMatchObject({ restore: { backupId: created.id, status: 'staged' } });
+  });
+
+  it('rejects wrong import passphrases and duplicate-ID checksum conflicts without exposing secrets', async () => {
+    const { service, store } = await fixture();
+    const passphrase = 'correct horse battery staple';
+    await service.createBackup({ requestedByUserId: randomUUID(), target: 'local', passphrase });
+    const artifact = await readFile(store.systemBackups[0]!.artifactPath);
+    const actorId = randomUUID();
+    const uploaded = await service.uploadImport({ requestedByUserId: actorId, stream: Readable.from(artifact), contentLength: artifact.length });
+    await expect(service.validateImport({ importId: uploaded.id, requestedByUserId: actorId, passphrase: 'incorrect import passphrase' })).rejects.toMatchObject({ code: 'incorrect_passphrase' });
+    expect(JSON.stringify(store.systemBackupImports)).not.toContain('incorrect import passphrase');
+
+    const second = await service.uploadImport({ requestedByUserId: actorId, stream: Readable.from(artifact), contentLength: artifact.length });
+    store.systemBackups[0]!.checksum = '0'.repeat(64);
+    await expect(service.validateImport({ importId: second.id, requestedByUserId: actorId, passphrase })).rejects.toMatchObject({ code: 'import_conflict' });
+  });
+
+  it('allows only one concurrent import validation claimant', async () => {
+    const { service, store } = await fixture();
+    const passphrase = 'correct horse battery staple';
+    await service.createBackup({ requestedByUserId: randomUUID(), target: 'local', passphrase });
+    const artifact = await readFile(store.systemBackups[0]!.artifactPath);
+    const actorId = randomUUID();
+    const uploaded = await service.uploadImport({ requestedByUserId: actorId, stream: Readable.from(artifact), contentLength: artifact.length });
+
+    const outcomes = await Promise.allSettled([
+      service.validateImport({ importId: uploaded.id, requestedByUserId: actorId, passphrase }),
+      service.validateImport({ importId: uploaded.id, requestedByUserId: actorId, passphrase }),
+    ]);
+
+    expect(outcomes.filter((outcome) => outcome.status === 'fulfilled')).toHaveLength(1);
+    const rejected = outcomes.find((outcome) => outcome.status === 'rejected') as PromiseRejectedResult;
+    expect(rejected.reason).toMatchObject({ statusCode: 409, code: 'import_active' });
+    expect(store.systemBackupImports[0]).toMatchObject({ status: 'imported', error: null, validationRevision: 1 });
+  });
+
+  it('publishes a signed fixed-schema apply request with no passphrase or path', async () => {
+    const root = await mkdtemp(join(tmpdir(), 'gateway-apply-request-'));
+    roots.push(root);
+    const store = new FakeStore();
+    const service = new FileSystemRecoveryService({
+      store, databaseUrl: 'postgresql://gateway:password@database:5432/gateway_control', masterKey: Buffer.alloc(32, 7),
+      localRoot: join(root, 'local'), nasRoot: join(root, 'nas'), nasMarker: '.gateway-control-nas', stageRoot: join(root, 'stage'),
+      toolRunner: new PortableToolRunner(), recoverySupervisorEnabled: true, recoveryRequestSecret: Buffer.alloc(32, 9),
+    });
+    const actorId = randomUUID();
+    const passphrase = 'correct horse battery staple';
+    const backup = await service.createBackup({ requestedByUserId: actorId, target: 'local', passphrase });
+    const { restore } = await service.stageRestore({ backupId: backup.id, requestedByUserId: actorId, passphrase });
+    await expect(service.requestApply({ restoreId: restore.id, requestedByUserId: actorId, confirmation: `APPLY ${restore.id}`, passphrase })).resolves.toEqual({ queued: true });
+    const request = await readFile(join(root, 'local', '.recovery-requests', 'request.pending'), 'utf8');
+    expect(JSON.parse(request)).toEqual({ version: 1, operation: 'apply-system-restore', restoreId: restore.id, signature: expect.stringMatching(/^[a-f0-9]{64}$/) });
+    expect(request).not.toContain(passphrase);
+    expect(request).not.toContain(root);
+    expect(store.systemRecoveryRequests).toEqual([expect.objectContaining({ status: 'published' })]);
+  });
+
+  it('does not publish when durable recovery-request audit creation fails', async () => {
+    const { root, localRoot, nasRoot, stageRoot, store, runner } = await fixture();
+    const service = new FileSystemRecoveryService({
+      store, databaseUrl: 'postgresql://gateway:password@database:5432/gateway_control', masterKey: Buffer.alloc(32, 7),
+      localRoot, nasRoot, nasMarker: '.gateway-control-nas', stageRoot, toolRunner: runner,
+      recoverySupervisorEnabled: true, recoveryRequestSecret: Buffer.alloc(32, 9),
+    });
+    const actorId = randomUUID();
+    const passphrase = 'correct horse battery staple';
+    const backup = await service.createBackup({ requestedByUserId: actorId, target: 'local', passphrase });
+    const { restore } = await service.stageRestore({ backupId: backup.id, requestedByUserId: actorId, passphrase });
+    vi.spyOn(store, 'createSystemRecoveryRequest').mockRejectedValue(new Error('audit unavailable'));
+
+    await expect(service.requestApply({ restoreId: restore.id, requestedByUserId: actorId, confirmation: `APPLY ${restore.id}`, passphrase })).rejects.toThrow('audit unavailable');
+    expect(await lstat(join(root, 'local', '.recovery-requests', 'request.pending')).catch(() => null)).toBeNull();
+  });
+
+  it('marks the durable request failed when pending publication fails', async () => {
+    const root = await mkdtemp(join(tmpdir(), 'gateway-apply-publication-failure-'));
+    roots.push(root);
+    const store = new FakeStore();
+    const localRoot = join(root, 'local');
+    const service = new FileSystemRecoveryService({
+      store, databaseUrl: 'postgresql://gateway:password@database:5432/gateway_control', masterKey: Buffer.alloc(32, 7), localRoot,
+      nasRoot: join(root, 'nas'), nasMarker: '.gateway-control-nas', stageRoot: join(root, 'stage'), toolRunner: new PortableToolRunner(),
+      recoverySupervisorEnabled: true, recoveryRequestSecret: Buffer.alloc(32, 9),
+    });
+    const actorId = randomUUID();
+    const passphrase = 'correct horse battery staple';
+    const backup = await service.createBackup({ requestedByUserId: actorId, target: 'local', passphrase });
+    const { restore } = await service.stageRestore({ backupId: backup.id, requestedByUserId: actorId, passphrase });
+    await mkdir(join(localRoot, '.recovery-requests'));
+    await writeFile(join(localRoot, '.recovery-requests', 'request.pending'), 'existing');
+
+    await expect(service.requestApply({ restoreId: restore.id, requestedByUserId: actorId, confirmation: `APPLY ${restore.id}`, passphrase })).rejects.toMatchObject({ code: 'recovery_request_pending' });
+    expect(store.systemRecoveryRequests).toEqual([expect.objectContaining({ status: 'failed', error: 'recovery_request_pending' })]);
+    expect(await readFile(join(localRoot, '.recovery-requests', 'request.pending'), 'utf8')).toBe('existing');
+  });
+
+  it('reports queued after publication even if later audit writes fail', async () => {
+    const root = await mkdtemp(join(tmpdir(), 'gateway-apply-post-publication-'));
+    roots.push(root);
+    const store = new FakeStore();
+    const localRoot = join(root, 'local');
+    const service = new FileSystemRecoveryService({
+      store, databaseUrl: 'postgresql://gateway:password@database:5432/gateway_control', masterKey: Buffer.alloc(32, 7), localRoot,
+      nasRoot: join(root, 'nas'), nasMarker: '.gateway-control-nas', stageRoot: join(root, 'stage'), toolRunner: new PortableToolRunner(),
+      recoverySupervisorEnabled: true, recoveryRequestSecret: Buffer.alloc(32, 9),
+    });
+    const actorId = randomUUID();
+    const passphrase = 'correct horse battery staple';
+    const backup = await service.createBackup({ requestedByUserId: actorId, target: 'local', passphrase });
+    const { restore } = await service.stageRestore({ backupId: backup.id, requestedByUserId: actorId, passphrase });
+    vi.spyOn(store, 'finishSystemRecoveryRequest').mockRejectedValue(new Error('audit unavailable'));
+    vi.spyOn(store, 'recordSystemBackupTransferEvent').mockRejectedValue(new Error('event unavailable'));
+
+    await expect(service.requestApply({ restoreId: restore.id, requestedByUserId: actorId, confirmation: `APPLY ${restore.id}`, passphrase })).resolves.toEqual({ queued: true });
+    expect(await lstat(join(localRoot, '.recovery-requests', 'request.pending'))).toMatchObject({});
+  });
+});
+
+describe('host recovery supervisor', () => {
+  it('uses only the fixed recovery wrapper without eval or request-selected arguments', async () => {
+    const script = await readFile(join(process.cwd(), '..', 'docker', 'recovery-supervisor.sh'), 'utf8');
+    expect(script).toContain('sh docker/recover.sh');
+    expect(script).not.toMatch(/\beval\b/);
+    expect(script).not.toContain('sh docker/recover.sh "$');
+    expect(script).not.toContain('/var/run/docker.sock:/var/run/docker.sock');
+    expect(script).toContain('flock -n 9');
+    expect(script).toMatch(/if \[ ! -e "\$claimed" \].*\[ -e "\$pending" \].*mv "\$pending" "\$claimed".*fi\s+if \[ -e "\$claimed" \]/s);
+    expect(script.indexOf('if [ -e "$claimed" ]')).toBeLessThan(script.indexOf('sh docker/recover.sh'));
+  });
+
+  it('resumes an interrupted claimed request independently of a pending request', async () => {
+    const script = await readFile(join(process.cwd(), '..', 'docker', 'recovery-supervisor.sh'), 'utf8');
+    const claimPending = script.indexOf('if [ ! -e "$claimed" ]');
+    const resumeClaimed = script.indexOf('if [ -e "$claimed" ]');
+
+    expect(claimPending).toBeGreaterThan(-1);
+    expect(resumeClaimed).toBeGreaterThan(claimPending);
+    expect(script.slice(resumeClaimed)).toContain('(cd "$project_root" && sh docker/recover.sh)');
+  });
 });
 
 describe('startup system restore', () => {
+  it('finalizes the self-referential backup record after restoring a version 2 marker', async () => {
+    const { stageRoot } = await fixture();
+    const restoreId = randomUUID();
+    const backupId = randomUUID();
+    const token = randomUUID();
+    const dump = `database-${backupId}-${token}.dump`;
+    const backupChecksum = 'a'.repeat(64);
+    await mkdir(stageRoot);
+    await writeFile(join(stageRoot, dump), 'dump');
+    await writeFile(join(stageRoot, 'restore.pending'), JSON.stringify({ version: 2, restoreId, backupId, backupSizeBytes: 1234, backupChecksum, token, dump }));
+    await writeFile(join(stageRoot, 'restore.lock'), `${token}\n`);
+    const finalizeBackup = vi.fn(async () => undefined);
+
+    await expect(applyStagedSystemRestore({
+      stageRoot,
+      databaseUrl: 'postgresql://user:pass@db/app',
+      toolRunner: { run: vi.fn(async () => '') },
+      finalizeBackup,
+    })).resolves.toBe(true);
+    expect(finalizeBackup).toHaveBeenCalledWith('postgresql://user:pass@db/app', expect.objectContaining({ backupId, backupSizeBytes: 1234, backupChecksum }));
+  });
+
   it('atomically transitions pending through applied and cleans marker last among active files', async () => {
     const { stageRoot } = await fixture();
     const restoreId = randomUUID();

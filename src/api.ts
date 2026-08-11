@@ -75,8 +75,23 @@ export type CloudflareDomainAccess = {
   status: DeploymentStatus | 'disabled'
   lastError: string | null
   lastReconciledAt: string | null
+  tlsStatus: 'not_observed' | 'valid' | 'expiring' | 'expired' | 'error'
+  tlsIssuer: string | null
+  tlsValidTo: string | null
+  tlsObservedAt: string | null
+  tlsError: string | null
   createdAt: string
   updatedAt: string
+}
+
+export type GuidedOperation = {
+  id: string
+  kind: 'cloudflare_bootstrap' | 'domain_publish'
+  status: 'pending' | 'waiting' | 'succeeded' | 'failed'
+  stage: string
+  routeId: string | null
+  domainAccessId: string | null
+  error: string | null
 }
 
 export type CloudflarePublicHostname = CloudflareDomainAccess
@@ -102,10 +117,34 @@ export type TelegramSettings = {
   selectedEvents: string[]
 }
 
+export type NotificationServicePreference = {
+  projectName: string
+  serviceName: string
+  status: RuntimeServiceStatus
+  discovered: boolean
+  enabled: boolean
+  inherited: boolean
+  directlyEnabled: boolean
+}
+
+export type NotificationAgentPreference = {
+  id: string
+  name: string
+  healthStatus: Agent['healthStatus']
+  lastTelemetryAt: string | null
+  enabled: boolean
+  services: NotificationServicePreference[]
+}
+
+export type NotificationTopology = TelegramSettings & {
+  agents: NotificationAgentPreference[]
+  truncated: { agents: boolean; services: boolean; scopes: boolean }
+}
+
 export type DeploymentStatus = 'pending' | 'active' | 'failed'
 export type CommandStatus = 'pending' | 'claimed' | 'succeeded' | 'failed'
 export type OperationStatus = 'pending' | 'running' | 'succeeded' | 'failed'
-export type RuntimeServiceStatus = 'healthy' | 'unhealthy' | 'starting' | 'completed' | 'stopped' | 'unknown'
+export type RuntimeServiceStatus = 'healthy' | 'unhealthy' | 'starting' | 'completed' | 'running' | 'stopped' | 'unknown'
 
 export type ManagedStack = {
   id: string
@@ -168,6 +207,24 @@ export type RuntimeOperation = {
   projectName: string; serviceName: string | null; status: OperationStatus; result: Record<string, unknown> | null
   error: string | null; createdAt: string; updatedAt: string; completedAt: string | null
 }
+
+export type DeploymentRevision = {
+  id: string; deploymentId: string; commitSha: string; composePath: string; checksum: string; policyVersion: number
+  policyResult: { services: Array<{ name: string; image: string; digestPinned: boolean; healthcheck: boolean }>; warnings: Array<{ code: string; service?: string }> }
+  createdByUserId: string; createdAt: string
+}
+export type DeploymentRun = {
+  id: string; deploymentId: string; revisionId: string; priorRevisionId: string | null; agentId: string; commandId: string
+  action: 'deploy' | 'rollback' | 'stop'; status: OperationStatus; result: Record<string, unknown> | null; error: string | null
+  startedAt: string | null; completedAt: string | null; createdAt: string; updatedAt: string
+}
+export type Deployment = {
+  id: string; agentId: string; displayName: string; projectName: string; sourceRepository: string; enabled: boolean
+  currentRevisionId: string | null; status: 'pending' | 'deploying' | 'active' | 'stopping' | 'stopped' | 'failed'
+  revisions: DeploymentRevision[]; latestRun: DeploymentRun | null; createdAt: string; updatedAt: string
+}
+export type DeploymentSourceInput = { repository: string; commitSha: string; composePath: string; projectName: string; parameters?: Record<string, string | number | boolean> }
+export type DeploymentPreview = { source: { repository: string; commitSha: string; composePath: string }; policy: { policyVersion: number; checksum: string; services: DeploymentRevision['policyResult']['services']; warnings: DeploymentRevision['policyResult']['warnings'] } }
 export type RuntimeLogRequest = {
   id: string; agentId: string; projectName: string; serviceName: string; tail: number; since: string | null
   status: OperationStatus; result: null | { logs?: string; truncated?: boolean }; error: string | null
@@ -239,6 +296,20 @@ export type SystemBackup = {
   error: string | null
   createdAt: string
   completedAt: string | null
+  source: 'created' | 'imported'
+  metadata: Record<string, unknown>
+}
+
+export type SystemBackupImport = {
+  id: string
+  status: 'uploading' | 'uploaded' | 'validating' | 'imported' | 'rejected'
+  sizeBytes: number | null
+  checksum: string | null
+  backupId: string | null
+  error: string | null
+  createdAt: string
+  updatedAt: string
+  completedAt: string | null
 }
 
 export type SystemRestore = {
@@ -256,7 +327,7 @@ export type CreateRouteInput = Pick<ManagedRoute, 'gatewayAgentId' | 'name' | 'h
 export type UpdateRouteInput = Partial<CreateRouteInput>
 export type CreateConnectorInput = Pick<Connector, 'agentId' | 'name' | 'enabled'> & { token: string }
 export type UpdateConnectorInput = Partial<Pick<Connector, 'agentId' | 'name' | 'enabled'>> & { token?: string }
-export type CreateCloudflareAccountInput = Pick<CloudflareAccount, 'name' | 'accountIdentifier' | 'enabled'> & { apiToken: string }
+export type CreateCloudflareAccountInput = Pick<CloudflareAccount, 'name' | 'accountIdentifier' | 'enabled'> & { apiToken: string; createManagedTunnel?: boolean; agentId?: string; connectorName?: string }
 export type UpdateCloudflareAccountInput = Partial<Pick<CloudflareAccount, 'name' | 'accountIdentifier' | 'enabled'>> & { apiToken?: string }
 export type CreateCloudflareDomainAccessInput = Pick<CloudflareDomainAccess, 'routeId' | 'accessMethod' | 'proxied'> & {
   accountId: string
@@ -316,7 +387,7 @@ export const api = {
     request<{ user: User }>('/auth/login', { method: 'POST', body: JSON.stringify({ email, password }) }),
   me: () => request<{ user: User }>('/auth/me'),
   logout: () => request<void>('/auth/logout', { method: 'POST' }),
-  configuration: () => request<{ agentImage: string }>('/configuration'),
+  configuration: () => request<{ agentImage: string; recoverySupervisorEnabled: boolean }>('/configuration'),
   connectors: () => request<{ connectors: Connector[] }>('/connectors'),
   createConnector: (input: CreateConnectorInput) =>
     request<{ connector: Connector }>('/connectors', {
@@ -332,7 +403,7 @@ export const api = {
     request<{ connector: Connector }>(`/connectors/${encodeURIComponent(id)}/verify`, { method: 'POST' }),
   cloudflareAccounts: () => request<{ accounts: CloudflareAccount[] }>('/cloudflare/accounts'),
   createCloudflareAccount: (input: CreateCloudflareAccountInput) =>
-    request<{ account: CloudflareAccount }>('/cloudflare/accounts', { method: 'POST', body: JSON.stringify(input) }),
+    request<{ account: CloudflareAccount; zoneCount?: number; tunnel?: { id: string; name: string }; connector?: Connector; operation?: GuidedOperation }>('/cloudflare/accounts', { method: 'POST', headers: input.createManagedTunnel ? { 'Idempotency-Key': crypto.randomUUID() } : {}, body: JSON.stringify(input) }),
   updateCloudflareAccount: (id: string, input: UpdateCloudflareAccountInput) =>
     request<{ account: CloudflareAccount }>(`/cloudflare/accounts/${encodeURIComponent(id)}`, { method: 'PATCH', body: JSON.stringify(input) }),
   testCloudflareAccount: (id: string) =>
@@ -351,6 +422,10 @@ export const api = {
     }),
   reconcileCloudflareDomainAccess: (id: string) =>
     request<{ domainAccess: CloudflareDomainAccess }>(`/cloudflare/domain-access/${encodeURIComponent(id)}/reconcile`, { method: 'POST' }),
+  guidedPublishDomain: (input: { accountId: string; zoneId: string; hostname: string; agentId: string; targetKind: 'host_port' | 'url'; target: string; accessMethod: 'tunnel' | 'public_ip'; connectorId?: string; publicIpv4?: string[]; publicIpv6?: string[] }, idempotencyKey: string) =>
+    request<{ operation: GuidedOperation; route: ManagedRoute; domainAccess?: CloudflareDomainAccess; nextAction?: string; certificateMode?: string; trafficPath?: string }>('/cloudflare/domain-publish', { method: 'POST', headers: { 'Idempotency-Key': idempotencyKey }, body: JSON.stringify(input) }),
+  reconcileGuidedPublish: (id: string) =>
+    request<{ operation: GuidedOperation; route: ManagedRoute; domainAccess?: CloudflareDomainAccess; nextAction?: string; certificateMode?: string; trafficPath?: string }>(`/cloudflare/domain-publish/${encodeURIComponent(id)}/reconcile`, { method: 'POST' }),
   agents: () => request<{ agents: Agent[] }>('/agents'),
   createAgent: (name: string, baseUrl: string, image: string) =>
     request<{
@@ -385,6 +460,14 @@ export const api = {
   requestRuntimeLogs: (input: { agentId: string; projectName: string; serviceName: string; tail: number; since?: string }) =>
     request<{ request: RuntimeLogRequest }>('/runtime-log-requests', { method: 'POST', body: JSON.stringify(input) }),
   runtimeLogRequest: (id: string) => request<{ request: RuntimeLogRequest }>(`/runtime-log-requests/${encodeURIComponent(id)}`),
+  deployments: () => request<{ deployments: Deployment[] }>('/deployments'),
+  previewDeployment: (input: DeploymentSourceInput) => request<DeploymentPreview>('/deployments/preview', { method: 'POST', body: JSON.stringify(input) }),
+  createDeployment: (input: DeploymentSourceInput & { agentId: string; displayName: string }) => request<{ deployment: Deployment }>('/deployments', { method: 'POST', body: JSON.stringify(input) }),
+  createDeploymentRevision: (id: string, input: Omit<DeploymentSourceInput, 'projectName'>) => request<{ revision: DeploymentRevision }>(`/deployments/${encodeURIComponent(id)}/revisions`, { method: 'POST', body: JSON.stringify(input) }),
+  deployRevision: (id: string, revisionId: string) => request<{ run: DeploymentRun }>(`/deployments/${encodeURIComponent(id)}/deploy`, { method: 'POST', body: JSON.stringify({ revisionId }) }),
+  rollbackDeployment: (id: string, revisionId: string) => request<{ run: DeploymentRun }>(`/deployments/${encodeURIComponent(id)}/rollback`, { method: 'POST', body: JSON.stringify({ revisionId }) }),
+  stopDeployment: (id: string) => request<{ run: DeploymentRun }>(`/deployments/${encodeURIComponent(id)}/stop`, { method: 'POST', body: JSON.stringify({}) }),
+  deploymentRun: (id: string) => request<{ run: DeploymentRun }>(`/deployment-runs/${encodeURIComponent(id)}`),
   monitoringSummary: () => request<{ agents: TelemetrySnapshot[] }>('/monitoring/summary'),
   monitoringAgent: (id: string) =>
     request<{ agent: Agent; latest: TelemetrySnapshot | null; history: TelemetrySnapshot[] }>(`/monitoring/agents/${encodeURIComponent(id)}`),
@@ -397,17 +480,43 @@ export const api = {
     }),
   restoreBackup: (id: string) =>
     request<{ restore: StackRestore }>(`/backups/${encodeURIComponent(id)}/restore`, { method: 'POST' }),
-  systemBackups: () => request<{ backups: SystemBackup[]; restores: SystemRestore[] }>('/system-backups'),
+  systemBackups: () => request<{ backups: SystemBackup[]; restores: SystemRestore[]; imports: SystemBackupImport[]; recoverySupervisorEnabled: boolean }>('/system-backups'),
   createSystemBackup: (target: SystemBackup['target'], passphrase: string) =>
     request<{ backup: SystemBackup }>('/system-backups', { method: 'POST', body: JSON.stringify({ target, passphrase }) }),
   stageSystemRestore: (id: string, passphrase: string) =>
     request<{ restore: SystemRestore; manualRestoreRequired: true; restoreCommand: string }>(`/system-backups/${encodeURIComponent(id)}/stage-restore`, { method: 'POST', body: JSON.stringify({ passphrase }) }),
+  exportSystemBackupUrl: (id: string) => `/api/system-backups/${encodeURIComponent(id)}/export`,
+  uploadSystemBackup: (file: File, onProgress: (percent: number) => void) => new Promise<{ import: SystemBackupImport }>((resolve, reject) => {
+    const upload = new XMLHttpRequest()
+    upload.open('POST', '/api/system-backup-imports')
+    upload.withCredentials = true
+    upload.setRequestHeader('Accept', 'application/json')
+    upload.setRequestHeader('Content-Type', 'application/octet-stream')
+    upload.upload.onprogress = (event) => { if (event.lengthComputable) onProgress(Math.round(event.loaded / event.total * 100)) }
+    upload.onerror = () => reject(new ApiError(0, 'The upload could not be completed.'))
+    upload.onload = () => {
+      let body: { import?: SystemBackupImport; error?: string; code?: string } = {}
+      try { body = JSON.parse(upload.responseText) as typeof body } catch { /* Ignore untrusted non-JSON responses. */ }
+      if (upload.status >= 200 && upload.status < 300 && body.import) resolve({ import: body.import })
+      else reject(new ApiError(upload.status, body.error || 'The upload could not be completed.', body.code))
+    }
+    upload.send(file)
+  }),
+  validateSystemBackupImport: (id: string, passphrase: string) =>
+    request<{ import: SystemBackupImport; backup: SystemBackup; idempotent: boolean }>(`/system-backup-imports/${encodeURIComponent(id)}/validate`, { method: 'POST', body: JSON.stringify({ passphrase }) }),
+  requestSystemRestoreApply: (id: string, confirmation: string, passphrase: string) =>
+    request<{ queued: true; browserMayDisconnect: true }>(`/system-restores/${encodeURIComponent(id)}/request-apply`, { method: 'POST', body: JSON.stringify({ confirmation, passphrase }) }),
   routes: () => request<{ routes: ManagedRoute[] }>('/routes'),
   createRoute: (input: CreateRouteInput) =>
     request<{ route: ManagedRoute }>('/routes', { method: 'POST', body: JSON.stringify(input) }),
   updateRoute: (id: string, input: UpdateRouteInput) =>
     request<{ route: ManagedRoute }>(`/routes/${encodeURIComponent(id)}`, { method: 'PATCH', body: JSON.stringify(input) }),
   telegram: () => request<TelegramSettings>('/notifications/telegram'),
+  notificationTopology: () => request<NotificationTopology>('/notifications/topology'),
+  setAgentNotifications: (agentId: string, enabled: boolean) =>
+    request<{ agent: NotificationAgentPreference }>(`/notifications/agents/${encodeURIComponent(agentId)}`, { method: 'PATCH', body: JSON.stringify({ enabled }) }),
+  setServiceNotifications: (agentId: string, projectName: string, serviceName: string, enabled: boolean) =>
+    request<{ service: NotificationServicePreference }>('/notifications/services', { method: 'PATCH', body: JSON.stringify({ agentId, projectName, serviceName, enabled }) }),
   saveTelegram: (botToken: string | undefined, groupId: string | undefined, selectedEvents: string[]) =>
     request<TelegramSettings>('/notifications/telegram', {
       method: 'PUT',

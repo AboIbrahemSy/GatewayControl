@@ -2,14 +2,17 @@ package executor
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"net"
+	"net/http"
 	"net/url"
 	"path/filepath"
 	"regexp"
 	"strings"
+	"time"
 	"unicode/utf8"
 
 	"gatewaycontrol/agent/internal/types"
@@ -72,7 +75,7 @@ type traefikRedirectScheme struct {
 	Permanent bool   `json:"permanent"`
 }
 
-func (e *Executor) executeRouteSync(result types.CommandResult, raw json.RawMessage) types.CommandResult {
+func (e *Executor) executeRouteSync(ctx context.Context, result types.CommandResult, raw json.RawMessage) types.CommandResult {
 	payload, err := decodeRouteSyncPayload(raw)
 	if err != nil {
 		return safeSyncFailure(result, "route payload validation failed")
@@ -88,6 +91,11 @@ func (e *Executor) executeRouteSync(result types.CommandResult, raw json.RawMess
 		}
 		return safeSyncSuccess(result, "Traefik route disabled")
 	}
+	if !e.probeRouteBackends(ctx, payload.Backends) {
+		result = safeSyncFailure(result, "backend probe failed")
+		result.Code = "backend_probe_failed"
+		return result
+	}
 	configuration := buildTraefikConfiguration(payload)
 	contents, err := json.Marshal(configuration)
 	if err != nil {
@@ -97,6 +105,40 @@ func (e *Executor) executeRouteSync(result types.CommandResult, raw json.RawMess
 		return safeSyncFailure(result, "route configuration storage failed")
 	}
 	return safeSyncSuccess(result, "Traefik route synchronized")
+}
+
+func (e *Executor) probeRouteBackends(parent context.Context, backends []string) bool {
+	ctx, cancel := context.WithTimeout(parent, 5*time.Second)
+	defer cancel()
+	results := make(chan bool, len(backends))
+	for _, backend := range backends {
+		go func(target string) {
+			request, err := http.NewRequestWithContext(ctx, http.MethodGet, target, nil)
+			if err != nil {
+				results <- false
+				return
+			}
+			request.Header.Set("Range", "bytes=0-0")
+			response, err := e.httpClient.Do(request)
+			if err != nil {
+				results <- false
+				return
+			}
+			_ = response.Body.Close()
+			results <- response.StatusCode >= 200 && response.StatusCode < 400
+		}(backend)
+	}
+	for range backends {
+		select {
+		case reachable := <-results:
+			if !reachable {
+				return false
+			}
+		case <-ctx.Done():
+			return false
+		}
+	}
+	return true
 }
 
 func decodeRouteSyncPayload(raw json.RawMessage) (routeSyncPayload, error) {

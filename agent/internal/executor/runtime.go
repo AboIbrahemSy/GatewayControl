@@ -106,7 +106,7 @@ func (e *Executor) discoverRuntimeContainers(ctx context.Context, project, servi
 	for _, id := range ids {
 		if _, exists := seen[id]; exists { continue }; seen[id] = struct{}{}
 		if !validContainerID(id) { return nil, errors.New("runtime discovery returned an invalid container identity") }
-		inspect, inspectErr := e.runner.Run(ctx, "docker", []string{"inspect", "--format", `{{.Id}}\t{{.Name}}\t{{index .Config.Labels "com.docker.compose.project"}}\t{{index .Config.Labels "com.docker.compose.service"}}`, id}, e.maxOutput)
+		inspect, inspectErr := e.runner.Run(ctx, "docker", []string{"inspect", "--format", "{{.Id}}\t{{.Name}}\t{{index .Config.Labels \"com.docker.compose.project\"}}\t{{index .Config.Labels \"com.docker.compose.service\"}}", id}, e.maxOutput)
 		if inspectErr != nil { return nil, errors.New("runtime container revalidation failed") }
 		fields := strings.Split(strings.TrimSpace(inspect.stdout), "\t"); if len(fields) != 4 || fields[0] != id || fields[2] != project || !composeServicePattern.MatchString(fields[3]) || service != "" && fields[3] != service { return nil, errors.New("runtime container labels changed during revalidation") }
 		containers = append(containers, runtimeContainer{id: id, name: strings.TrimPrefix(fields[1], "/"), project: fields[2], service: fields[3]})

@@ -37,10 +37,12 @@ interface MigrationClient {
 export async function discoverMigrations(directory: string): Promise<Migration[]> {
   const names = (await readdir(directory)).filter((name) => /\.sql$/i.test(name)).sort();
   const sequenceNumbers = new Set<string>();
-  for (const name of names) {
+  for (const [index, name] of names.entries()) {
     const match = MIGRATION_NAME_PATTERN.exec(name);
     if (!match) throw new Error(`Invalid migration filename: ${name}. Expected NNN_description.sql.`);
     if (sequenceNumbers.has(match[1]!)) throw new Error(`Duplicate migration sequence: ${match[1]}.`);
+    const expected = String(index + 1).padStart(3, '0');
+    if (match[1] !== expected) throw new Error(`Migration sequences must be contiguous from 001; expected ${expected}, found ${match[1]}.`);
     sequenceNumbers.add(match[1]!);
   }
   return Promise.all(names.map(async (name) => {
@@ -73,7 +75,7 @@ export async function runMigrations(client: MigrationClient, migrations: Migrati
     checksum text
   )`);
   await client.query('ALTER TABLE schema_migrations ADD COLUMN IF NOT EXISTS checksum text');
-  const appliedResult = await client.query('SELECT name, checksum FROM schema_migrations ORDER BY name');
+  const appliedResult = await client.query('SELECT name, checksum FROM schema_migrations ORDER BY applied_at, name');
   const applied = appliedResult.rows as AppliedMigration[];
   validateAppliedMigrations(migrations, applied);
 

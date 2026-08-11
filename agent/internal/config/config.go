@@ -24,6 +24,8 @@ type Config struct {
 	StateVolume          string
 	StacksRoot           string
 	HostStacksRoot       string
+	DeploymentsRoot      string
+	HostDeploymentsRoot  string
 	HostProcRoot         string
 	LocalBackupRoot      string
 	HostLocalBackupRoot  string
@@ -68,6 +70,14 @@ func Load() (Config, error) {
 		return Config{}, err
 	}
 	hostStacksRoot, err := requiredValue("GATEWAY_HOST_STACKS_ROOT")
+	if err != nil {
+		return Config{}, err
+	}
+	deploymentsRoot, err := valueOrDefault("GATEWAY_DEPLOYMENTS_ROOT", "/opt/gateway-control/deployments")
+	if err != nil {
+		return Config{}, err
+	}
+	hostDeploymentsRoot, err := requiredValue("GATEWAY_HOST_DEPLOYMENTS_ROOT")
 	if err != nil {
 		return Config{}, err
 	}
@@ -135,8 +145,18 @@ func Load() (Config, error) {
 	if err != nil {
 		return Config{}, fmt.Errorf("resolve GATEWAY_STACKS_ROOT: %w", err)
 	}
+	deploymentsRoot, err = filepath.Abs(deploymentsRoot)
+	if err != nil {
+		return Config{}, fmt.Errorf("resolve GATEWAY_DEPLOYMENTS_ROOT: %w", err)
+	}
 	if !filepath.IsAbs(hostStacksRoot) {
 		return Config{}, errors.New("GATEWAY_HOST_STACKS_ROOT must be an absolute host path")
+	}
+	if !filepath.IsAbs(hostDeploymentsRoot) || filepath.Clean(hostDeploymentsRoot) != hostDeploymentsRoot {
+		return Config{}, errors.New("GATEWAY_HOST_DEPLOYMENTS_ROOT must be an absolute, clean host path")
+	}
+	if strings.ContainsAny(deploymentsRoot, ",\r\n\x00") || strings.ContainsAny(hostDeploymentsRoot, ",\r\n\x00") {
+		return Config{}, errors.New("deployment roots contain characters unsafe for a Docker mount")
 	}
 	for key, value := range map[string]string{
 		"GATEWAY_HOST_PROC_ROOT":         hostProcRoot,
@@ -163,6 +183,9 @@ func Load() (Config, error) {
 	}
 	if pathsOverlap(localBackupRoot, stacksRoot) || pathsOverlap(nasBackupRoot, stacksRoot) || pathsOverlap(localBackupRoot, stateDir) || pathsOverlap(nasBackupRoot, stateDir) || pathsOverlap(hostLocalBackupRoot, hostStacksRoot) || pathsOverlap(hostNASBackupRoot, hostStacksRoot) {
 		return Config{}, errors.New("backup roots must not overlap stack or state roots")
+	}
+	if pathsOverlap(deploymentsRoot, stacksRoot) || pathsOverlap(deploymentsRoot, stateDir) || pathsOverlap(hostDeploymentsRoot, hostStacksRoot) {
+		return Config{}, errors.New("deployment roots must be dedicated and must not overlap stack or state roots")
 	}
 	hostStacksRoot = filepath.Clean(hostStacksRoot)
 	if !dockerVolumeNamePattern.MatchString(stateVolume) {
@@ -250,6 +273,7 @@ func Load() (Config, error) {
 	return Config{
 		ControlURL: controlURL, EnrollmentToken: enrollmentToken, AgentName: agentName,
 		StateDir: stateDir, StateVolume: stateVolume, StacksRoot: stacksRoot, HostStacksRoot: hostStacksRoot,
+		DeploymentsRoot: deploymentsRoot, HostDeploymentsRoot: hostDeploymentsRoot,
 		HostProcRoot: hostProcRoot, LocalBackupRoot: localBackupRoot, HostLocalBackupRoot: hostLocalBackupRoot,
 		NASBackupRoot: nasBackupRoot, HostNASBackupRoot: hostNASBackupRoot, NASMarker: nasMarker, AgentImage: agentImage,
 		CloudflaredImage: cloudflaredImage, EdgeNetwork: edgeNetwork, AllowInsecureHTTP: allowHTTP,

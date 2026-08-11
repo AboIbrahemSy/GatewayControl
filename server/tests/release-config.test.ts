@@ -14,6 +14,12 @@ describe('production release configuration', () => {
     expect(String(compose.services['control-plane']?.image)).toContain('GATEWAY_CONTROL_IMAGE');
     expect(compose.services['control-plane']?.healthcheck).toMatchObject({ test: expect.arrayContaining(['http://127.0.0.1:3000/ready']) });
     expect(compose.services['control-plane']).toHaveProperty('stop_grace_period');
+    expect(compose.services['control-plane']?.environment).toMatchObject({
+      GATEWAY_PROTECTED_PROJECTS: '${GATEWAY_PROTECTED_PROJECTS:-gateway-control}',
+      GATEWAY_NOTIFICATION_TOPOLOGY_MAX_AGENTS: '${GATEWAY_NOTIFICATION_TOPOLOGY_MAX_AGENTS:-100}',
+      GATEWAY_NOTIFICATION_TOPOLOGY_MAX_SERVICES: '${GATEWAY_NOTIFICATION_TOPOLOGY_MAX_SERVICES:-5000}',
+      GATEWAY_NOTIFICATION_TOPOLOGY_MAX_SCOPES: '${GATEWAY_NOTIFICATION_TOPOLOGY_MAX_SCOPES:-5000}',
+    });
     expect(compose.services['control-plane-restore']).toMatchObject({ profiles: ['recovery'], restart: 'no' });
     expect(development.services['control-plane']).toHaveProperty('build');
     expect(development.services.bootstrap?.volumes).toContain('./data/backups/system:/system-backups');
@@ -105,5 +111,17 @@ describe('production release configuration', () => {
     expect(store).toContain('query_timeout: 2_500');
     expect(store).toContain('statement_timeout: 2_000');
     expect(app.slice(app.indexOf("app.get('/ready'"), app.indexOf("app.get('/api/setup/status'"))).not.toContain('Promise.race');
+  });
+
+  it('bounds notification topology work in SQL and reports truncation', async () => {
+    const store = await readFile(join(root, 'server', 'src', 'postgres-store.ts'), 'utf8');
+    const topology = store.slice(store.indexOf('public async getNotificationTopology'), store.indexOf('public async setAgentNotificationPreference'));
+    expect(topology.match(/LIMIT \$2/g)).toHaveLength(3);
+    expect(topology).toContain('maxAgents + 1');
+    expect(topology).toContain('maxServices + 1');
+    expect(topology).toContain('maxScopes + 1');
+    expect(topology).toContain('truncated:');
+    expect(topology).not.toContain('.find((scope)');
+    expect(topology).not.toContain('.filter((candidate)');
   });
 });

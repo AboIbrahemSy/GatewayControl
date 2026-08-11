@@ -18,7 +18,7 @@ import (
 
 const MaximumServices = 250
 
-var dockerServiceFormat = `{{.Label "com.docker.compose.project"}}\t{{.Label "com.docker.compose.service"}}\t{{.State}}\t{{.Status}}`
+var dockerServiceFormat = "{{.Label \"com.docker.compose.project\"}}\t{{.Label \"com.docker.compose.service\"}}\t{{.State}}\t{{.Status}}"
 
 type Runner interface {
 	Run(context.Context, string, ...string) ([]byte, error)
@@ -153,9 +153,9 @@ func (c *Collector) collectServices(ctx context.Context) ([]types.TelemetryServi
 		case "healthy": service.Running++; service.Healthy++
 		case "unhealthy": service.Running++; service.Unhealthy++
 		case "starting": service.Running++; service.Starting++
+		case "running": service.Running++
 		case "completed": service.Completed++
 		case "stopped": service.Stopped++
-		default: service.Running++
 		}
 		service.Status = aggregateStatus(*service)
 		if len(services) == MaximumServices {
@@ -166,11 +166,14 @@ func (c *Collector) collectServices(ctx context.Context) ([]types.TelemetryServi
 }
 
 func aggregateStatus(service types.TelemetryService) string {
+	if service.Total == 0 { return "unknown" }
+	if service.Running+service.Stopped+service.Completed != service.Total { return "unknown" }
 	if service.Unhealthy > 0 { return "unhealthy" }
 	if service.Starting > 0 { return "starting" }
-	if service.Completed == service.Total { return "completed" }
 	if service.Stopped > 0 { return "stopped" }
-	if service.Healthy == service.Total { return "healthy" }
+	if service.Completed == service.Total { return "completed" }
+	if service.Running > service.Healthy+service.Unhealthy+service.Starting { return "running" }
+	if service.Healthy+service.Completed == service.Total { return "healthy" }
 	return "unknown"
 }
 
@@ -190,7 +193,7 @@ func normalizeStatus(state, detail string) string {
 	case strings.Contains(detail, "health: starting") || strings.Contains(detail, "(starting)"):
 		return "starting"
 	default:
-		return "unknown"
+		return "running"
 	}
 }
 

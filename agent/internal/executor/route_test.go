@@ -4,6 +4,8 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"net/http"
+	"net/http/httptest"
 	"os"
 	"path/filepath"
 	"testing"
@@ -15,7 +17,9 @@ const testRouteID = "423e4567-e89b-12d3-a456-426614174003"
 
 func TestRouteSyncGeneratesTunnelConfiguration(t *testing.T) {
 	executor := newTestExecutor(t)
-	result := executor.Execute(context.Background(), routeCommand("tunnel", true, testRouteID, nil))
+	backend := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) { w.WriteHeader(http.StatusNoContent) }))
+	defer backend.Close()
+	result := executor.Execute(context.Background(), routeCommand("tunnel", true, testRouteID, map[string]any{"backends": []string{backend.URL}}))
 	if !result.Success {
 		t.Fatalf("result = %#v", result)
 	}
@@ -36,7 +40,7 @@ func TestRouteSyncGeneratesTunnelConfiguration(t *testing.T) {
 		}
 	}
 	for _, service := range configuration.HTTP.Services {
-		if len(service.LoadBalancer.Servers) != 1 || service.LoadBalancer.Servers[0].URL != "http://app:8080" {
+		if len(service.LoadBalancer.Servers) != 1 || service.LoadBalancer.Servers[0].URL != backend.URL {
 			t.Fatalf("service = %#v", service)
 		}
 	}
@@ -44,7 +48,9 @@ func TestRouteSyncGeneratesTunnelConfiguration(t *testing.T) {
 
 func TestRouteSyncGeneratesPublicRedirectAndTLSConfiguration(t *testing.T) {
 	executor := newTestExecutor(t)
-	result := executor.Execute(context.Background(), routeCommand("public", true, testRouteID, nil))
+	backend := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) { w.Header().Set("Location", "/login"); w.WriteHeader(http.StatusTemporaryRedirect) }))
+	defer backend.Close()
+	result := executor.Execute(context.Background(), routeCommand("public", true, testRouteID, map[string]any{"backends": []string{backend.URL}}))
 	if !result.Success {
 		t.Fatalf("result = %#v", result)
 	}
@@ -72,9 +78,24 @@ func TestRouteSyncGeneratesPublicRedirectAndTLSConfiguration(t *testing.T) {
 	}
 }
 
+func TestRouteSyncDoesNotPublishWhenBackendProbeFails(t *testing.T) {
+	executor := newTestExecutor(t)
+	backend := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) { http.Error(w, "unavailable", http.StatusServiceUnavailable) }))
+	backend.Close()
+	result := executor.Execute(context.Background(), routeCommand("tunnel", true, testRouteID, map[string]any{"backends": []string{backend.URL}}))
+	if result.Success || result.Code != "backend_probe_failed" {
+		t.Fatalf("result = %#v", result)
+	}
+	if _, err := os.Stat(filepath.Join(executor.traefikDynamicRoot, testRouteID+".yaml")); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("route configuration should not exist: %v", err)
+	}
+}
+
 func TestRouteSyncDisableRemovesFileIdempotently(t *testing.T) {
 	executor := newTestExecutor(t)
-	if result := executor.Execute(context.Background(), routeCommand("tunnel", true, testRouteID, nil)); !result.Success {
+	backend := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) { w.WriteHeader(http.StatusOK) }))
+	defer backend.Close()
+	if result := executor.Execute(context.Background(), routeCommand("tunnel", true, testRouteID, map[string]any{"backends": []string{backend.URL}})); !result.Success {
 		t.Fatalf("enable result = %#v", result)
 	}
 	for attempt := 0; attempt < 2; attempt++ {

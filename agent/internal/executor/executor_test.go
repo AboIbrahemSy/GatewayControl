@@ -145,6 +145,7 @@ func testOptions(t *testing.T, stacksRoot string) Options {
 	return Options{
 		StacksRoot: stacksRoot, StateDir: t.TempDir(), StateVolume: "gateway-agent-state",
 		HostStacksRoot: t.TempDir(), CloudflaredImage: "cloudflare/cloudflared:2026.7.3",
+		DeploymentsRoot: t.TempDir(), HostDeploymentsRoot: t.TempDir(),
 		LocalBackupRoot: t.TempDir(), HostLocalBackupRoot: t.TempDir(), NASBackupRoot: t.TempDir(), HostNASBackupRoot: t.TempDir(),
 		NASMarker: ".gateway-control-nas", AgentImage: "example/gateway-agent:test", BackupTimeout: time.Second,
 		EdgeNetwork: "gateway-control-edge", TraefikDynamicRoot: t.TempDir(), HostProcRoot: "/proc",

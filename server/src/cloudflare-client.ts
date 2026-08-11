@@ -31,6 +31,11 @@ export interface CloudflareTunnelMetadata {
   deleted: boolean;
 }
 
+export interface CloudflareManagedTunnel {
+  id: string;
+  name: string;
+}
+
 export class CloudflareClientError extends Error {
   public constructor(message: string, public readonly status: number, public readonly code?: number) {
     super(message.slice(0, 500));
@@ -118,6 +123,41 @@ export class CloudflareClient {
       throw new CloudflareClientError('Cloudflare returned an invalid tunnel token.', 502);
     }
     return envelope.result;
+  }
+
+  public async findActiveTunnelByName(accountIdentifier: string, name: string): Promise<{ id: string; name: string } | null> {
+    const query = new URLSearchParams({ name, is_deleted: 'false', per_page: '10' });
+    const envelope = await this.request('GET', `/accounts/${encodeURIComponent(accountIdentifier)}/cfd_tunnel?${query.toString()}`);
+    if (!Array.isArray(envelope.result)) throw new CloudflareClientError('Cloudflare returned an invalid tunnels response.', 502);
+    const exact = envelope.result.flatMap((value) => {
+      if (!value || typeof value !== 'object') return [];
+      const tunnel = value as Record<string, unknown>;
+      return typeof tunnel.id === 'string' && /^[a-f0-9-]{36}$/i.test(tunnel.id) && tunnel.name === name && !tunnel.deleted_at
+        ? [{ id: tunnel.id.toLowerCase(), name }] : [];
+    });
+    if (exact.length > 1) throw new CloudflareClientError('Cloudflare returned duplicate managed tunnels.', 502);
+    return exact[0] ?? null;
+  }
+
+  public async createRemotelyManagedTunnel(accountIdentifier: string, desiredName: string): Promise<CloudflareManagedTunnel> {
+    const name = desiredName.toLowerCase().replace(/[^a-z0-9-]+/g, '-').replace(/^-+|-+$/g, '').slice(0, 100);
+    if (name.length < 3) throw new CloudflareClientError('The generated Cloudflare tunnel name is invalid.', 400);
+    const secret = randomBytes(32);
+    try {
+      const envelope = await this.request('POST', `/accounts/${encodeURIComponent(accountIdentifier)}/cfd_tunnel`, {
+        name,
+        tunnel_secret: secret.toString('base64'),
+      });
+      if (!envelope.result || typeof envelope.result !== 'object') throw new CloudflareClientError('Cloudflare returned invalid tunnel metadata.', 502);
+      const result = envelope.result as Record<string, unknown>;
+      if (typeof result.id !== 'string' || !/^[a-f0-9-]{36}$/i.test(result.id) || result.name !== name) {
+        throw new CloudflareClientError('Cloudflare returned invalid tunnel metadata.', 502);
+      }
+      const id = result.id.toLowerCase();
+      return { id, name };
+    } finally {
+      secret.fill(0);
+    }
   }
 
   public async putTunnelConfig(accountIdentifier: string, tunnelId: string, ingress: CloudflareIngressRule[]): Promise<void> {
@@ -228,3 +268,4 @@ export class CloudflareClient {
     }
   }
 }
+import { randomBytes } from 'node:crypto';

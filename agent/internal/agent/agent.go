@@ -69,6 +69,7 @@ func (a *Agent) Run(ctx context.Context) error {
 	a.executor, err = executor.New(executor.Options{
 		StacksRoot: a.config.StacksRoot, StateDir: a.config.StateDir, StateVolume: a.config.StateVolume,
 		HostStacksRoot: a.config.HostStacksRoot, CloudflaredImage: a.config.CloudflaredImage,
+		DeploymentsRoot: a.config.DeploymentsRoot, HostDeploymentsRoot: a.config.HostDeploymentsRoot,
 		LocalBackupRoot: a.config.LocalBackupRoot, HostLocalBackupRoot: a.config.HostLocalBackupRoot,
 		NASBackupRoot: a.config.NASBackupRoot, HostNASBackupRoot: a.config.HostNASBackupRoot,
 		NASMarker: a.config.NASMarker, AgentImage: a.config.AgentImage, BackupTimeout: a.config.BackupTimeout,

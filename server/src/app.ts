@@ -2,14 +2,18 @@ import cookie from '@fastify/cookie';
 import rateLimit from '@fastify/rate-limit';
 import fastifyStatic from '@fastify/static';
 import Fastify, { type FastifyReply, type FastifyRequest } from 'fastify';
-import { timingSafeEqual } from 'node:crypto';
+import { createHash, timingSafeEqual } from 'node:crypto';
+import type { Readable } from 'node:stream';
 import { isIP } from 'node:net';
 import { SecretBox, hashPassword, hashToken, randomToken, verifyPassword } from './crypto.js';
 import { CloudflareClient, CloudflareClientError, type CloudflareDnsRecord, type CloudflareIngressRule } from './cloudflare-client.js';
 import { CloudflareTunnelTokenError, parseCloudflareTunnelToken, type ParsedCloudflareTunnelToken } from './cloudflare-tunnel-token.js';
 import { NotificationDispatcher } from './notification-dispatcher.js';
 import { SystemRecoveryFailure, type SystemRecoveryService } from './system-recovery.js';
-import { OPERATIONAL_EVENT_TYPES, type Agent, type AgentCommand, type Connector, type Role, type StackBackup, type StackRestore, type Store, type SystemBackup, type SystemRestore, type User } from './types.js';
+import { observeTlsCertificate, type TlsObserver } from './tls-observer.js';
+import { ComposePolicyError, evaluateComposePolicy } from './compose-policy.js';
+import { DeploymentSourceError, fetchGitComposeSource, normalizeGitComposeSource } from './deployment-source.js';
+import { OPERATIONAL_EVENT_TYPES, type Agent, type AgentCommand, type Connector, type DeploymentRevision, type GuidedOperation, type Role, type RuntimeServiceStatus, type StackBackup, type StackRestore, type Store, type SystemBackup, type SystemBackupImport, type SystemRestore, type User } from './types.js';
 
 const SESSION_COOKIE = 'gateway_control_session';
 const EMAIL_PATTERN = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
@@ -57,7 +61,12 @@ export interface BuildAppOptions {
   offlineAfterMs?: number;
   commandStaleAfterMs?: number;
   connectorIdentityIntervalMs?: number;
+  tlsObservationIntervalMs?: number;
+  tlsObserver?: TlsObserver;
+  guidedVerificationIntervalMs?: number;
+  guidedVerificationTimeoutMs?: number;
   systemRecoveryService?: SystemRecoveryService;
+  recoverySupervisorEnabled?: boolean;
   readinessCheck?: () => Promise<void>;
   release?: string;
   protectedProjects?: string[];
@@ -163,11 +172,12 @@ function enrollmentCommand(baseUrl: string, image: string, enrollmentToken: stri
     '--entrypoint /bin/sh',
     '--user root',
     '-v /opt/gateway-control/stacks:/opt/gateway-control/stacks',
+    '-v /opt/gateway-control/deployments:/opt/gateway-control/deployments',
     '-v /opt/gateway-control/backups/local:/opt/gateway-control/backups/local',
     `-v ${shellQuote(traefikDynamicVolume)}:/srv/traefik-dynamic`,
     shellQuote(image),
     '-c',
-    shellQuote('chown 10001:10001 /opt/gateway-control/stacks /opt/gateway-control/backups/local /srv/traefik-dynamic && chmod 0755 /opt/gateway-control/stacks /opt/gateway-control/backups/local /srv/traefik-dynamic'),
+    shellQuote('chown 10001:10001 /opt/gateway-control/stacks /opt/gateway-control/backups/local /srv/traefik-dynamic /opt/gateway-control/deployments && chmod 0755 /opt/gateway-control/stacks /opt/gateway-control/backups/local /srv/traefik-dynamic /opt/gateway-control/deployments'),
   ].join(' ');
   const startAgent = [
     'docker run -d',
@@ -185,6 +195,8 @@ function enrollmentCommand(baseUrl: string, image: string, enrollmentToken: stri
     `-e GATEWAY_STATE_VOLUME=${shellQuote(stateVolume)}`,
     '-e GATEWAY_STACKS_ROOT=/opt/gateway-control/stacks',
     '-e GATEWAY_HOST_STACKS_ROOT=/opt/gateway-control/stacks',
+    '-e GATEWAY_DEPLOYMENTS_ROOT=/opt/gateway-control/deployments',
+    '-e GATEWAY_HOST_DEPLOYMENTS_ROOT=/opt/gateway-control/deployments',
     '-e GATEWAY_HOST_PROC_ROOT=/host/proc',
     '-e GATEWAY_LOCAL_BACKUP_ROOT=/opt/gateway-control/backups/local',
     '-e GATEWAY_HOST_LOCAL_BACKUP_ROOT=/opt/gateway-control/backups/local',
@@ -198,6 +210,7 @@ function enrollmentCommand(baseUrl: string, image: string, enrollmentToken: stri
     '-v /proc:/host/proc:ro',
     `-v ${shellQuote(stateVolume)}:/var/lib/gateway-agent`,
     '-v /opt/gateway-control/stacks:/opt/gateway-control/stacks',
+    '-v /opt/gateway-control/deployments:/opt/gateway-control/deployments',
     '-v /opt/gateway-control/backups/local:/opt/gateway-control/backups/local',
     `-v ${shellQuote(`${nasRoot}:${nasRoot}`)}`,
     `-v ${shellQuote(traefikDynamicVolume)}:/srv/traefik-dynamic`,
@@ -297,11 +310,39 @@ function validateBackends(value: unknown): string[] {
     } catch {
       throw new ApiError(400, 'Each backend must be a valid HTTP or HTTPS URL.');
     }
-    if (!['http:', 'https:'].includes(url.protocol) || url.username || url.password || url.hash || !url.hostname) {
-      throw new ApiError(400, 'Each backend must be an absolute HTTP or HTTPS URL without credentials or fragments.');
+    if (!['http:', 'https:'].includes(url.protocol) || url.username || url.password || url.hash || url.search || !url.hostname) {
+      throw new ApiError(400, 'Each backend must be an absolute HTTP or HTTPS URL without credentials, query, or fragments.');
+    }
+    const hostname = url.hostname.toLowerCase().replace(/^\[|\]$/g, '');
+    if (['localhost', 'localhost.localdomain', 'metadata.google.internal', 'instance-data'].includes(hostname)
+      || hostname.endsWith('.localhost') || hostname === '0.0.0.0' || hostname === '::'
+      || hostname.startsWith('127.') || hostname.startsWith('169.254.') || hostname === '::1'
+      || hostname.toLowerCase().startsWith('fe80:')) {
+      throw new ApiError(400, 'Backend loopback, metadata, unspecified, and link-local targets are not allowed.', 'unsafe_backend_target');
     }
     return url.toString();
   });
+}
+
+export function normalizePublishTarget(targetKind: 'host_port' | 'url', value: string): string {
+  if (value.length < 1 || value.length > 2048 || value.trim() !== value || /[\u0000-\u001f\u007f]/.test(value)) {
+    throw new ApiError(400, 'The publish target is invalid.', 'invalid_publish_target');
+  }
+  let candidate = value;
+  if (targetKind === 'host_port') {
+    candidate = /^\d{1,5}$/.test(value) ? `localhost:${value}` : value;
+    if (!/^(?:localhost|host\.docker\.internal):\d{1,5}$/i.test(candidate)) {
+      throw new ApiError(400, 'Host port targets must use a port, localhost:port, or host.docker.internal:port.', 'invalid_publish_target');
+    }
+    const [host, portValue] = candidate.split(':');
+    const port = Number(portValue);
+    if (!Number.isInteger(port) || port < 1 || port > 65535) throw new ApiError(400, 'The host port is out of range.', 'invalid_publish_target');
+    candidate = `http://${host!.toLowerCase() === 'localhost' ? 'host.docker.internal' : host!.toLowerCase()}:${port}`;
+  }
+  const normalized = validateBackends([candidate])[0]!;
+  const parsed = new URL(normalized);
+  if (parsed.pathname !== '/') throw new ApiError(400, 'Guided publish targets cannot include a path.', 'invalid_publish_target');
+  return normalized.replace(/\/$/, '');
 }
 
 function optionalPostgresBackupConfig(body: Record<string, unknown>): { service: string; database: string; user: string } | null | undefined {
@@ -330,7 +371,7 @@ function validateTelemetryObject(value: unknown, field: string, maxKeys: number)
   return value as Record<string, unknown>;
 }
 
-function validateTelemetry(body: Record<string, unknown>): { observedAt: string; node: Record<string, unknown>; services: Array<Record<string, unknown>> } {
+function validateTelemetry(body: Record<string, unknown>): { observedAt: string; node: Record<string, unknown>; services: Array<Record<string, unknown> & { status: RuntimeServiceStatus }> } {
   if (Buffer.byteLength(JSON.stringify(body), 'utf8') > MAX_TELEMETRY_BYTES) throw new ApiError(400, 'Telemetry must not exceed 512 KiB.');
   const observedAt = stringField(body, 'observedAt', 20, 40);
   const observedTime = Date.parse(observedAt);
@@ -342,12 +383,12 @@ function validateTelemetry(body: Record<string, unknown>): { observedAt: string;
     if (typeof validated.projectName !== 'string' || !PROJECT_NAME_PATTERN.test(validated.projectName)) throw new ApiError(400, `services[${index}].projectName is invalid.`);
     if (typeof validated.serviceName !== 'string' || !SERVICE_NAME_PATTERN.test(validated.serviceName)) throw new ApiError(400, `services[${index}].serviceName is invalid.`);
     if (typeof validated.name !== 'string' || validated.name !== `${validated.projectName}/${validated.serviceName}`) throw new ApiError(400, `services[${index}].name is invalid.`);
-    if (typeof validated.status !== 'string' || !['healthy', 'unhealthy', 'starting', 'completed', 'stopped', 'unknown'].includes(validated.status)) throw new ApiError(400, `services[${index}].status is invalid.`);
+    if (typeof validated.status !== 'string' || !['healthy', 'unhealthy', 'starting', 'completed', 'running', 'stopped', 'unknown'].includes(validated.status)) throw new ApiError(400, `services[${index}].status is invalid.`);
     for (const count of ['total', 'running', 'healthy', 'unhealthy', 'starting', 'stopped', 'completed']) {
       if (!Number.isInteger(validated[count]) || Number(validated[count]) < 0 || Number(validated[count]) > 250) throw new ApiError(400, `services[${index}].${count} is invalid.`);
     }
     if (Number(validated.total) < 1 || Number(validated.running) + Number(validated.stopped) + Number(validated.completed) !== Number(validated.total)) throw new ApiError(400, `services[${index}] counts are inconsistent.`);
-    return validated;
+    return validated as Record<string, unknown> & { status: RuntimeServiceStatus };
   });
   if (new Set(services.map((service) => `${service.projectName}\u0000${service.serviceName}`)).size !== services.length) throw new ApiError(400, 'services must have unique project and service identities.');
   return { observedAt: new Date(observedTime).toISOString(), node, services };
@@ -387,14 +428,28 @@ function publicRestore(item: StackRestore): Record<string, unknown> {
 function publicSystemBackup(item: SystemBackup): Record<string, unknown> {
   return {
     id: item.id, target: item.target, status: item.status, sizeBytes: item.sizeBytes, checksum: item.checksum,
-    error: item.error, createdAt: item.createdAt, completedAt: item.completedAt,
+    error: item.error, source: item.source, createdAt: item.createdAt, completedAt: item.completedAt,
   };
+}
+
+function publicSystemBackupImport(item: SystemBackupImport): Record<string, unknown> {
+  return { id: item.id, status: item.status, sizeBytes: item.sizeBytes, checksum: item.checksum, backupId: item.backupId, error: item.error, createdAt: item.createdAt, updatedAt: item.updatedAt, completedAt: item.completedAt };
 }
 
 function publicSystemRestore(item: SystemRestore): Record<string, unknown> {
   return {
     id: item.id, backupId: item.backupId, status: item.status, error: item.error,
     createdAt: item.createdAt, completedAt: item.completedAt,
+  };
+}
+
+function publicGuidedOperation(item: GuidedOperation): Record<string, unknown> {
+  return {
+    id: item.id, kind: item.kind, status: item.status, stage: item.stage, cloudflareAccountId: item.cloudflareAccountId,
+    connectorId: item.connectorId, routeId: item.routeId, domainAccessId: item.domainAccessId,
+    remoteTunnelId: item.remoteTunnelId, remoteTunnelName: item.remoteTunnelName, result: item.result,
+    error: item.error, verificationDeadlineAt: item.verificationDeadlineAt, verificationAttempts: item.verificationAttempts,
+    createdAt: item.createdAt, updatedAt: item.updatedAt, completedAt: item.completedAt,
   };
 }
 
@@ -426,8 +481,9 @@ function runtimeProjects(inventory: Awaited<ReturnType<Store['getLatestRuntimeIn
       const actionable = agent.enabled && agent.healthStatus === 'connected' && !stale && !protectedProject;
       const statuses = services.map((service) => String(service.status));
       const status = statuses.includes('unhealthy') ? 'unhealthy' : statuses.includes('starting') ? 'starting'
-        : statuses.every((value) => value === 'completed') ? 'completed' : statuses.includes('stopped') ? 'stopped'
-          : statuses.every((value) => value === 'healthy') ? 'healthy' : 'unknown';
+        : statuses.includes('stopped') ? 'stopped' : statuses.every((value) => value === 'completed') ? 'completed'
+          : statuses.includes('running') ? 'running'
+            : statuses.every((value) => value === 'healthy' || value === 'completed') ? 'healthy' : 'unknown';
       return { agentId: agent.id, agentName: agent.name, projectName, observedAt: latest.observedAt, receivedAt: latest.receivedAt, stale, protected: protectedProject, actionable, status, services };
     });
   });
@@ -435,6 +491,19 @@ function runtimeProjects(inventory: Awaited<ReturnType<Store['getLatestRuntimeIn
 
 function exactKeys(body: Record<string, unknown>, allowed: string[]): void {
   if (Object.keys(body).some((key) => !allowed.includes(key))) throw new ApiError(400, 'The request contains unsupported fields.', 'invalid_payload');
+}
+
+function idempotencyKey(request: FastifyRequest): string {
+  const value = request.headers['idempotency-key'];
+  if (typeof value !== 'string' || !/^[A-Za-z0-9._:-]{8,128}$/.test(value)) {
+    throw new ApiError(400, 'A valid Idempotency-Key header is required.', 'idempotency_key_required');
+  }
+  return value;
+}
+
+function requestHash(value: Record<string, unknown>): string {
+  const canonical = JSON.stringify(value, Object.keys(value).sort());
+  return createHash('sha256').update(canonical).digest('hex');
 }
 
 function safeCloudflareError(error: unknown): string {
@@ -496,6 +565,7 @@ export async function buildApp(options: BuildAppOptions) {
     },
     bodyLimit: 1_048_576,
   });
+  app.addContentTypeParser('application/octet-stream', (request, payload, done) => done(null, payload));
   const secretBox = new SecretBox(options.masterKey);
   const httpFetch = options.fetch ?? globalThis.fetch;
   const secureCookie = options.secureCookie ?? true;
@@ -510,6 +580,13 @@ export async function buildApp(options: BuildAppOptions) {
   let connectorIdentityTimer: NodeJS.Timeout | undefined;
   let connectorIdentityStartupTimer: NodeJS.Timeout | undefined;
   let connectorIdentityRunning = false;
+  let tlsObservationTimer: NodeJS.Timeout | undefined;
+  let tlsObservationStartupTimer: NodeJS.Timeout | undefined;
+  let tlsObservationRunning = false;
+  let guidedVerificationTimer: NodeJS.Timeout | undefined;
+  let guidedVerificationStartupTimer: NodeJS.Timeout | undefined;
+  let guidedVerificationRunning = false;
+  let activeSystemBackupExports = 0;
 
   async function verifyParsedConnectorIdentity(parsed: ParsedCloudflareTunnelToken): Promise<{ accountId: string; accountIdentifier: string; tunnelId: string }> {
     const account = await options.store.getCloudflareAccountSecretByIdentifier(parsed.accountIdentifier);
@@ -659,6 +736,76 @@ export async function buildApp(options: BuildAppOptions) {
     }
   }
 
+  async function observePublicCertificates(): Promise<void> {
+    if (tlsObservationRunning) return;
+    tlsObservationRunning = true;
+    try {
+      for (const target of await options.store.listTlsObservationTargets(20)) {
+        const observation = await (options.tlsObserver ?? observeTlsCertificate)(target.hostname);
+        await options.store.saveTlsObservation(target.domainAccessId, observation);
+      }
+    } catch {
+      app.log.error('TLS certificate observation iteration failed.');
+    } finally {
+      tlsObservationRunning = false;
+    }
+  }
+
+  async function boundedTlsObservation(hostname: string): Promise<Awaited<ReturnType<TlsObserver>>> {
+    const observer = options.tlsObserver ?? observeTlsCertificate;
+    let timeout: NodeJS.Timeout | undefined;
+    try {
+      return await Promise.race([
+        observer(hostname),
+        new Promise<Awaited<ReturnType<TlsObserver>>>((resolve) => {
+          timeout = setTimeout(() => resolve({ status: 'error', error: 'tls_timeout' }), 6_000);
+          timeout.unref();
+        }),
+      ]);
+    } finally {
+      if (timeout) clearTimeout(timeout);
+    }
+  }
+
+  async function reconcileGuidedVerifications(): Promise<void> {
+    if (guidedVerificationRunning) return;
+    guidedVerificationRunning = true;
+    try {
+      for (const operation of await options.store.listGuidedOperationsPendingVerification(5)) {
+        if (!operation.domainAccessId || !operation.routeId) continue;
+        const domainAccess = (await options.store.listCloudflareDomainAccess()).find((item) => item.id === operation.domainAccessId);
+        const route = await options.store.getRouteDeployment(operation.routeId);
+        if (!domainAccess || !route || domainAccess.revision < 1) continue;
+        const observation = await boundedTlsObservation(domainAccess.hostname);
+        await options.store.saveTlsObservation(domainAccess.id, observation);
+        if (observation.status === 'valid' || observation.status === 'expiring') {
+          const active = await options.store.markDomainAccessOutcome(domainAccess.id, domainAccess.revision, { status: 'active', lastError: null });
+          if (!active) continue;
+          const result = {
+            route, domainAccess: active,
+            certificateMode: active.accessMethod === 'tunnel' ? 'cloudflare_edge' : 'traefik_letsencrypt_tls_alpn',
+            trafficPath: active.accessMethod === 'tunnel'
+              ? 'Browser HTTPS -> Cloudflare edge TLS -> Cloudflare Tunnel -> Traefik HTTP -> backend'
+              : 'Browser HTTPS -> DNS-only public IP:443 -> Traefik TLS -> backend',
+          };
+          await options.store.updateGuidedOperation(operation.id, { status: 'succeeded', stage: 'complete', result, error: null, clearEncryptedRequest: true, incrementVerificationAttempts: true });
+          continue;
+        }
+        const error = observation.error ?? (observation.status === 'expired' ? 'certificate_expired' : 'https_unreachable');
+        if (operation.verificationDeadlineAt && Date.parse(operation.verificationDeadlineAt) <= Date.now()) {
+          await options.store.markDomainAccessOutcome(domainAccess.id, domainAccess.revision, { status: 'failed', lastError: error });
+          await options.store.updateGuidedOperation(operation.id, { status: 'failed', stage: 'https_verification_failed', error, incrementVerificationAttempts: true });
+        } else {
+          await options.store.updateGuidedOperation(operation.id, { error, incrementVerificationAttempts: true });
+        }
+      }
+    } catch {
+      app.log.error('Guided HTTPS verification iteration failed.');
+    } finally {
+      guidedVerificationRunning = false;
+    }
+  }
+
   async function cloudflareClientForAccount(id: string): Promise<{ client: CloudflareClient; accountIdentifier: string }> {
     const account = await options.store.getCloudflareAccountSecret(id);
     if (!account) throw new ApiError(404, 'Cloudflare account not found.');
@@ -671,14 +818,14 @@ export async function buildApp(options: BuildAppOptions) {
     return { client: new CloudflareClient(apiToken, httpFetch), accountIdentifier: account.accountIdentifier };
   }
 
-  async function reconcileDomainAccess(id: string): Promise<unknown> {
+  async function reconcileDomainAccess(id: string, requireHttpsObservation = false): Promise<unknown> {
     return options.store.withDomainAccessLock(id, async () => {
       const deployment = await options.store.getCloudflareDomainAccessDeployment(id);
       if (!deployment) throw new ApiError(404, 'Cloudflare domain access was not found.', 'domain_access_not_found');
       const revision = deployment.revision;
       const ownershipMarker = `gateway-control:domain-access:${deployment.id}`;
       const superseded = (): ApiError => new ApiError(409, 'A newer domain access change superseded this operation.', 'domain_access_superseded');
-      const outcome = async (status: 'active' | 'failed' | 'disabled', lastError: string | null = null): Promise<unknown> => {
+      const outcome = async (status: 'pending' | 'active' | 'failed' | 'disabled', lastError: string | null = null): Promise<unknown> => {
         const saved = await options.store.markDomainAccessOutcome(id, revision, { status, lastError });
         if (!saved) throw superseded();
         return saved;
@@ -804,7 +951,7 @@ export async function buildApp(options: BuildAppOptions) {
             throw new CloudflareClientError('Cloudflare DNS record read-back did not match the requested ownership metadata.', 502);
           }
         }
-        return await outcome('active');
+        return await outcome(requireHttpsObservation ? 'pending' : 'active');
       } catch (error) {
         for (const recordId of createdThisAttempt) {
           try {
@@ -846,6 +993,15 @@ export async function buildApp(options: BuildAppOptions) {
     connectorIdentityStartupTimer.unref();
     connectorIdentityTimer = setInterval(() => void reconcileConnectorIdentities(), options.connectorIdentityIntervalMs ?? 5 * 60_000);
     connectorIdentityTimer.unref();
+    tlsObservationStartupTimer = setTimeout(() => void observePublicCertificates(), 5_000);
+    tlsObservationStartupTimer.unref();
+    tlsObservationTimer = setInterval(() => void observePublicCertificates(), options.tlsObservationIntervalMs ?? 60 * 60_000);
+    tlsObservationTimer.unref();
+    guidedVerificationStartupTimer = setTimeout(() => void reconcileGuidedVerifications(), 0);
+    guidedVerificationStartupTimer.unref();
+    guidedVerificationTimer = setInterval(() => void reconcileGuidedVerifications(), options.guidedVerificationIntervalMs ?? 30_000);
+    guidedVerificationTimer.unref();
+    await options.systemRecoveryService?.cleanupStaleImports?.();
   });
 
   app.addHook('onSend', async (request, reply) => {
@@ -934,6 +1090,7 @@ export async function buildApp(options: BuildAppOptions) {
   app.get('/api/auth/me', { preHandler: (request, reply) => requireUser(request, reply) }, async (request) => ({ user: publicUser((request as AuthenticatedRequest).authenticatedUser) }));
   app.get('/api/configuration', { preHandler: (request, reply) => requireUser(request, reply) }, async () => ({
     agentImage: options.defaultAgentImage ?? 'ghcr.io/gatewaycontrol/gateway-agent:latest',
+    recoverySupervisorEnabled: options.recoverySupervisorEnabled === true,
   }));
 
   app.get('/api/users', { preHandler: (request, reply) => requireUser(request, reply, 'owner') }, async () => ({ users: await options.store.listUsers() }));
@@ -1005,6 +1162,76 @@ export async function buildApp(options: BuildAppOptions) {
   app.get('/api/cloudflare/accounts', { preHandler: (request, reply) => requireUser(request, reply) }, async () => ({ accounts: await options.store.listCloudflareAccounts() }));
   app.post('/api/cloudflare/accounts', { preHandler: (request, reply) => requireUser(request, reply, 'operator') }, async (request, reply) => {
     const body = objectBody(request.body);
+    exactKeys(body, ['name', 'accountIdentifier', 'apiToken', 'enabled', 'createManagedTunnel', 'agentId', 'connectorName']);
+    const createManagedTunnel = optionalBoolean(body, 'createManagedTunnel') ?? false;
+    if (createManagedTunnel) {
+      const name = stringField(body, 'name', 1, 120);
+      const accountIdentifier = cloudflareIdentifier(body, 'accountIdentifier').toLowerCase();
+      const apiToken = opaqueStringField(body, 'apiToken', 20, 4096);
+      const agentId = optionalUuid(body, 'agentId');
+      const connectorName = stringField(body, 'connectorName', 1, 120);
+      if (!agentId) throw new ApiError(400, 'agentId is required when creating a managed tunnel.', 'invalid_payload');
+      const agent = (await options.store.listAgents()).find((item) => item.id === agentId && item.enabled && item.enrolledAt);
+      if (!agent) throw new ApiError(409, 'An enabled, enrolled agent is required.', 'connector_target_unavailable');
+      const user = (request as AuthenticatedRequest).authenticatedUser;
+      const hash = requestHash(body);
+      const operationKey = idempotencyKey(request);
+      return options.store.withGuidedOperationLock('cloudflare_bootstrap', user.id, operationKey, async () => {
+      const persisted = await options.store.createOrGetGuidedOperation({
+        kind: 'cloudflare_bootstrap', idempotencyKey: operationKey, requestedByUserId: user.id,
+        requestHash: hash, encryptedRequest: secretBox.encrypt(JSON.stringify(body)),
+      });
+      let operation = persisted.operation;
+      if (operation.requestHash !== hash) throw new ApiError(409, 'The idempotency key was already used for a different request.', 'idempotency_conflict');
+      if (operation.status === 'succeeded') return reply.code(200).send({ operation: publicGuidedOperation(operation), ...operation.result });
+      try {
+        const client = new CloudflareClient(apiToken, httpFetch);
+        await client.verifyToken();
+        const zones = await client.listZones(accountIdentifier);
+        let account = operation.cloudflareAccountId ? (await options.store.listCloudflareAccounts()).find((item) => item.id === operation.cloudflareAccountId) : undefined;
+        if (!account) {
+          account = await options.store.createCloudflareAccount({ name, accountIdentifier, encryptedApiToken: secretBox.encrypt(apiToken), enabled: optionalBoolean(body, 'enabled') ?? true });
+          operation = (await options.store.updateGuidedOperation(operation.id, { accountId: account.id, stage: 'account_created', error: null }))!;
+        }
+        const storedZones = await options.store.syncCloudflareZones(account.id, zones.map((zone) => ({ zoneIdentifier: zone.id, name: zone.name, status: zone.status })));
+        if (!storedZones) throw new ApiError(409, 'The Cloudflare account could not be synchronized.', 'cloudflare_account_unavailable');
+        const tunnelName = operation.remoteTunnelName ?? `${connectorName}-${operation.id.slice(0, 8)}`;
+        if (!operation.remoteTunnelName) operation = (await options.store.updateGuidedOperation(operation.id, { remoteTunnelName: tunnelName, stage: 'zones_synced' }))!;
+        const existingTunnel = operation.remoteTunnelId
+          ? { id: operation.remoteTunnelId, name: tunnelName }
+          : await client.findActiveTunnelByName(accountIdentifier, tunnelName.toLowerCase().replace(/[^a-z0-9-]+/g, '-').replace(/^-+|-+$/g, '').slice(0, 100));
+        let tunnelId: string;
+        let connectorToken: string;
+        if (existingTunnel) {
+          tunnelId = existingTunnel.id;
+          connectorToken = await client.getTunnelToken(accountIdentifier, tunnelId);
+        } else {
+          const tunnel = await client.createRemotelyManagedTunnel(accountIdentifier, tunnelName);
+          tunnelId = tunnel.id;
+          operation = (await options.store.updateGuidedOperation(operation.id, { remoteTunnelId: tunnelId, stage: 'tunnel_created' }))!;
+          connectorToken = await client.getTunnelToken(accountIdentifier, tunnelId);
+        }
+        operation = (await options.store.updateGuidedOperation(operation.id, { remoteTunnelId: tunnelId, stage: 'tunnel_created' }))!;
+        let connector = operation.connectorId ? (await options.store.listConnectors()).find((item) => item.id === operation.connectorId) : undefined;
+        if (!connector) {
+          const identity = await connectorIdentityForCreation(connectorToken, account.id, tunnelId);
+          if (identity.identityStatus !== 'verified') throw new ApiError(409, 'The created tunnel token could not be verified.', 'connector_identity_unverified');
+          connector = await options.store.createConnector({ name: connectorName, encryptedToken: secretBox.encrypt(connectorToken), enabled: true, agentId, ...identity }) ?? undefined;
+          if (!connector) throw new ApiError(409, 'The selected Agent became unavailable.', 'connector_target_unavailable');
+          operation = (await options.store.updateGuidedOperation(operation.id, { connectorId: connector.id, stage: 'connector_queued' }))!;
+        }
+        const result = { account, zoneCount: storedZones.length, tunnel: { id: tunnelId, name: tunnelName }, connector };
+        operation = (await options.store.updateGuidedOperation(operation.id, { status: 'succeeded', stage: 'complete', result, error: null, clearEncryptedRequest: true }))!;
+        return reply.code(persisted.created ? 201 : 200).send({ operation: publicGuidedOperation(operation), ...result });
+      } catch (error) {
+        const safeError = error instanceof ApiError ? error.message : safeCloudflareError(error);
+        await options.store.updateGuidedOperation(operation.id, { status: 'failed', stage: operation.stage, error: safeError });
+        if (error instanceof ApiError) throw error;
+        if (error instanceof CloudflareClientError) throw new ApiError(error.status === 403 ? 403 : 502, error.message, 'cloudflare_bootstrap_failed');
+        throw error;
+      }
+      });
+    }
     const account = await options.store.createCloudflareAccount({
       name: stringField(body, 'name', 1, 120),
       accountIdentifier: cloudflareIdentifier(body, 'accountIdentifier'),
@@ -1067,6 +1294,103 @@ export async function buildApp(options: BuildAppOptions) {
     if (!zones) throw new ApiError(404, 'Cloudflare account not found.');
     return { zones };
   });
+  async function continueGuidedPublish(operationId: string, requestedByUserId: string): Promise<{ statusCode: number; body: Record<string, unknown> }> {
+    let operation = await options.store.getGuidedOperation(operationId);
+    if (!operation || operation.kind !== 'domain_publish' || operation.requestedByUserId !== requestedByUserId) throw new ApiError(404, 'Guided publish operation not found.', 'publish_operation_not_found');
+    if (operation.status === 'succeeded') return { statusCode: 200, body: { operation: publicGuidedOperation(operation), ...operation.result } };
+    if (operation.stage === 'pending_https_verification') {
+      const domainAccessId = operation.domainAccessId;
+      const domainAccess = domainAccessId ? (await options.store.listCloudflareDomainAccess()).find((item) => item.id === domainAccessId) : undefined;
+      return { statusCode: 202, body: { operation: publicGuidedOperation(operation), ...(domainAccess ? { domainAccess } : {}), nextAction: 'https_verification_pending' } };
+    }
+    if (!operation.encryptedRequest) throw new ApiError(409, 'Guided publish operation cannot be resumed.', 'publish_operation_unavailable');
+    const body = JSON.parse(secretBox.decrypt(operation.encryptedRequest)) as Record<string, unknown>;
+    const route = operation.routeId ? await options.store.getRouteDeployment(operation.routeId) : null;
+    if (!route) throw new ApiError(409, 'The guided route is unavailable.', 'domain_access_route_invalid');
+    if (route.status === 'pending') {
+      operation = (await options.store.updateGuidedOperation(operation.id, { status: 'waiting', stage: 'waiting_for_route', error: null }))!;
+      return { statusCode: 202, body: { operation: publicGuidedOperation(operation), route, nextAction: 'reconcile_after_route_active' } };
+    }
+    if (route.status !== 'active' || !route.enabled) {
+      operation = (await options.store.updateGuidedOperation(operation.id, { status: 'failed', stage: 'route_failed', error: 'The Agent route probe or deployment failed.' }))!;
+      throw new ApiError(409, operation.error!, 'domain_access_route_invalid');
+    }
+    try {
+      const accountId = optionalUuid(body, 'accountId')!;
+      const zoneId = optionalUuid(body, 'zoneId')!;
+      const accessMethod = stringField(body, 'accessMethod') as 'tunnel' | 'public_ip';
+      const connectorId = optionalUuid(body, 'connectorId');
+      const publicIpv4 = publicIpArray(body, 'publicIpv4', 4);
+      const publicIpv6 = publicIpArray(body, 'publicIpv6', 6);
+      const account = (await options.store.listCloudflareAccounts()).find((item) => item.id === accountId && item.enabled);
+      const zone = (await options.store.listCloudflareZones(accountId))?.find((item) => item.id === zoneId && item.status === 'active');
+      if (!account || !zone || !hostnameWithinZone(route.hostname, zone.name)) throw new ApiError(409, 'The selected account or zone is no longer valid.', 'cloudflare_zone_invalid');
+      const connector = connectorId ? (await options.store.listConnectors()).find((item) => item.id === connectorId) : undefined;
+      if (accessMethod === 'tunnel' && (!connector?.enabled || connector.identityStatus !== 'verified' || connector.agentId !== route.gatewayAgentId
+        || connector.cloudflareAccountId !== accountId || connector.tokenAccountIdentifier?.toLowerCase() !== account.accountIdentifier.toLowerCase()
+        || connector.tunnelId?.toLowerCase() !== connector.tokenTunnelId?.toLowerCase())) {
+        throw new ApiError(409, 'The tunnel topology is no longer valid.', 'tunnel_topology_mismatch');
+      }
+      if (accessMethod === 'public_ip' && publicIpv4.length + publicIpv6.length === 0) throw new ApiError(400, 'At least one public IP is required.', 'invalid_access_configuration');
+      const existingDomainAccessId = operation.domainAccessId;
+      let domainAccess = existingDomainAccessId ? (await options.store.listCloudflareDomainAccess()).find((item) => item.id === existingDomainAccessId) : undefined;
+      if (!domainAccess) {
+        domainAccess = await options.store.createPendingDomainAccess({ accountId, zoneId, routeId: route.id, accessMethod, ...(connectorId ? { connectorId } : {}), publicIpv4, publicIpv6, proxied: accessMethod === 'tunnel' }) ?? undefined;
+        if (!domainAccess) throw new ApiError(409, 'Domain access relationships changed or are already managed.', 'domain_access_invalid');
+        operation = (await options.store.updateGuidedOperation(operation.id, { domainAccessId: domainAccess.id, status: 'pending', stage: 'domain_access_created' }))!;
+      }
+      domainAccess = await reconcileDomainAccess(domainAccess.id, true) as typeof domainAccess;
+      operation = (await options.store.updateGuidedOperation(operation.id, {
+        status: 'waiting', stage: 'pending_https_verification', error: null,
+        verificationDeadlineAt: new Date(Date.now() + (options.guidedVerificationTimeoutMs ?? 15 * 60_000)).toISOString(),
+      }))!;
+      return { statusCode: 202, body: { operation: publicGuidedOperation(operation), route, domainAccess, nextAction: 'https_verification_pending' } };
+    } catch (error) {
+      const message = error instanceof Error ? error.message.slice(0, 500) : 'Guided publish failed.';
+      await options.store.updateGuidedOperation(operation.id, { status: 'failed', error: message });
+      throw error;
+    }
+  }
+
+  app.post('/api/cloudflare/domain-publish', { preHandler: (request, reply) => requireUser(request, reply, 'operator') }, async (request, reply) => {
+    const body = objectBody(request.body);
+    exactKeys(body, ['accountId', 'zoneId', 'hostname', 'agentId', 'targetKind', 'target', 'accessMethod', 'connectorId', 'publicIpv4', 'publicIpv6']);
+    const accountId = optionalUuid(body, 'accountId'); const zoneId = optionalUuid(body, 'zoneId'); const agentId = optionalUuid(body, 'agentId');
+    if (!accountId || !zoneId || !agentId) throw new ApiError(400, 'accountId, zoneId, and agentId are required.', 'invalid_payload');
+    const hostname = validateHostname(stringField(body, 'hostname', 1, 253));
+    const targetKind = stringField(body, 'targetKind') as 'host_port' | 'url';
+    if (!['host_port', 'url'].includes(targetKind)) throw new ApiError(400, 'targetKind must be host_port or url.', 'invalid_publish_target');
+    const backend = normalizePublishTarget(targetKind, stringField(body, 'target', 1, 2048));
+    const accessMethod = stringField(body, 'accessMethod') as 'tunnel' | 'public_ip';
+    if (!['tunnel', 'public_ip'].includes(accessMethod)) throw new ApiError(400, 'accessMethod must be tunnel or public_ip.', 'invalid_access_method');
+    const agent = (await options.store.listAgents()).find((item) => item.id === agentId && item.enabled && item.enrolledAt);
+    const zone = (await options.store.listCloudflareZones(accountId))?.find((item) => item.id === zoneId && item.status === 'active');
+    if (!agent) throw new ApiError(409, 'An enabled, enrolled Agent is required.', 'agent_unavailable');
+    if (!zone || !hostnameWithinZone(hostname, zone.name)) throw new ApiError(409, 'The hostname must belong to the selected active zone.', 'cloudflare_zone_invalid');
+    const connectorId = optionalUuid(body, 'connectorId');
+    const publicIpv4 = publicIpArray(body, 'publicIpv4', 4); const publicIpv6 = publicIpArray(body, 'publicIpv6', 6);
+    if (accessMethod === 'tunnel' && !connectorId) throw new ApiError(400, 'Tunnel publishing requires connectorId.', 'invalid_access_configuration');
+    if (accessMethod === 'public_ip' && (connectorId || publicIpv4.length + publicIpv6.length === 0)) throw new ApiError(400, 'Public publishing requires public IP addresses and no connector.', 'invalid_access_configuration');
+    const normalizedRequest = { accountId, zoneId, hostname, agentId, targetKind, target: backend, accessMethod, ...(connectorId ? { connectorId } : {}), publicIpv4, publicIpv6 };
+    const user = (request as AuthenticatedRequest).authenticatedUser;
+    const hash = requestHash(normalizedRequest);
+    const persisted = await options.store.createOrGetGuidedOperation({ kind: 'domain_publish', idempotencyKey: idempotencyKey(request), requestedByUserId: user.id, requestHash: hash, encryptedRequest: secretBox.encrypt(JSON.stringify(normalizedRequest)) });
+    let operation = persisted.operation;
+    if (operation.requestHash !== hash) throw new ApiError(409, 'The idempotency key was already used for a different request.', 'idempotency_conflict');
+    if (!operation.routeId) {
+      const routeName = `publish-${operation.id.slice(0, 8)}`;
+      let route = (await options.store.listRoutes()).find((item) => item.name === routeName && item.gatewayAgentId === agentId && item.hostname === hostname);
+      route ??= await options.store.createRoute({ gatewayAgentId: agentId, name: routeName, hostname, exposure: accessMethod === 'tunnel' ? 'tunnel' : 'public', backends: [backend], enabled: true }) ?? undefined;
+      if (!route) throw new ApiError(409, 'The Agent became unavailable or hostname already exists.', 'domain_access_route_invalid');
+      operation = (await options.store.updateGuidedOperation(operation.id, { routeId: route.id, status: 'waiting', stage: 'waiting_for_route', error: null }))!;
+    }
+    const continued = await continueGuidedPublish(operation.id, user.id);
+    return reply.code(continued.statusCode).send(continued.body);
+  });
+  app.post('/api/cloudflare/domain-publish/:id/reconcile', { preHandler: (request, reply) => requireUser(request, reply, 'operator') }, async (request, reply) => {
+    const continued = await continueGuidedPublish(idParameter(request), (request as AuthenticatedRequest).authenticatedUser.id);
+    return reply.code(continued.statusCode).send(continued.body);
+  });
   const createDomainAccess = async (request: FastifyRequest, reply: FastifyReply, legacy = false): Promise<unknown> => {
     const body = objectBody(request.body);
     exactKeys(body, legacy ? ['zoneId', 'connectorId', 'routeId', 'proxied'] : ['accountId', 'zoneId', 'routeId', 'accessMethod', 'connectorId', 'publicIpv4', 'publicIpv6', 'proxied']);
@@ -1083,6 +1407,8 @@ export async function buildApp(options: BuildAppOptions) {
     const publicIpv6 = legacy ? [] : publicIpArray(body, 'publicIpv6', 6);
     if (accessMethod === 'tunnel' && (!connectorId || body.publicIpv4 !== undefined || body.publicIpv6 !== undefined)) throw new ApiError(400, 'Tunnel access requires connectorId and does not accept public IP addresses.', 'invalid_access_configuration');
     if (accessMethod === 'public_ip' && (connectorId || publicIpv4.length + publicIpv6.length === 0)) throw new ApiError(400, 'Public IP access requires at least one IP address and does not accept connectorId.', 'invalid_access_configuration');
+    const proxied = optionalBoolean(body, 'proxied') ?? accessMethod === 'tunnel';
+    if (accessMethod === 'public_ip' && proxied) throw new ApiError(400, 'Public IP access requires DNS-only records until a trusted origin-certificate mode is configured.', 'public_ip_proxied_unsupported');
     const account = (await options.store.listCloudflareAccounts()).find((item) => item.id === accountId);
     if (!account?.enabled) throw new ApiError(409, 'The Cloudflare account is missing or disabled.', 'cloudflare_account_unavailable');
     const zone = (await options.store.listCloudflareZones(accountId))?.find((item) => item.id === zoneId);
@@ -1097,7 +1423,7 @@ export async function buildApp(options: BuildAppOptions) {
       throw new ApiError(409, 'The tunnel connector must have a verified identity, use the same account, and be assigned to the route agent.', 'tunnel_topology_mismatch');
     }
     if ((await options.store.listCloudflareDomainAccess()).some((item) => item.routeId === routeId || item.hostname.toLowerCase() === route.hostname.toLowerCase())) throw new ApiError(409, 'This route or hostname is already managed.', 'domain_access_duplicate');
-    const created = await options.store.createPendingDomainAccess({ accountId, zoneId, routeId, accessMethod, ...(connectorId ? { connectorId } : {}), publicIpv4, publicIpv6, proxied: optionalBoolean(body, 'proxied') ?? true });
+    const created = await options.store.createPendingDomainAccess({ accountId, zoneId, routeId, accessMethod, ...(connectorId ? { connectorId } : {}), publicIpv4, publicIpv6, proxied });
     if (!created) throw new ApiError(409, 'Domain access relationships changed or are already managed.', 'domain_access_invalid');
     const reconciled = await reconcileDomainAccess(created.id);
     return reply.code(201).send(legacy ? { publicHostname: reconciled } : { domainAccess: reconciled });
@@ -1167,6 +1493,69 @@ export async function buildApp(options: BuildAppOptions) {
     return { request: publicRuntimeLogRequest(item) };
   });
 
+  async function deploymentCandidate(body: Record<string, unknown>, projectName?: string): Promise<{ source: ReturnType<typeof normalizeGitComposeSource>; sourceCompose: string; policy: ReturnType<typeof evaluateComposePolicy> }> {
+    exactKeys(body, ['repository', 'commitSha', 'composePath', 'projectName', 'parameters', 'agentId', 'displayName']);
+    try {
+      const source = normalizeGitComposeSource(stringField(body, 'repository', 20, 255), stringField(body, 'commitSha', 40, 40), stringField(body, 'composePath', 5, 255));
+      const sourceCompose = await fetchGitComposeSource(source, httpFetch);
+      const rawParameters = body.parameters ?? {};
+      if (!rawParameters || typeof rawParameters !== 'object' || Array.isArray(rawParameters)) throw new ApiError(400, 'parameters must be an object.', 'invalid_parameter');
+      const parameters: Record<string, string | number | boolean> = {};
+      for (const [key, value] of Object.entries(rawParameters)) {
+        if (!['string', 'number', 'boolean'].includes(typeof value)) throw new ApiError(400, 'parameters must contain typed scalar values.', 'invalid_parameter');
+        parameters[key] = value as string | number | boolean;
+      }
+      const policy = evaluateComposePolicy(sourceCompose, projectName ?? stringField(body, 'projectName', 1, 63), parameters);
+      return { source, sourceCompose, policy };
+    } catch (error) {
+      if (error instanceof DeploymentSourceError || error instanceof ComposePolicyError) throw new ApiError(400, error.message, error.code);
+      throw error;
+    }
+  }
+
+  app.get('/api/deployments', { preHandler: (request, reply) => requireUser(request, reply) }, async () => ({ deployments: await options.store.listDeployments() }));
+  app.post('/api/deployments/preview', { preHandler: (request, reply) => requireUser(request, reply, 'owner'), config: { rateLimit: { max: 20, timeWindow: '1 minute' } } }, async (request) => {
+    const candidate = await deploymentCandidate(objectBody(request.body));
+    return { source: { repository: candidate.source.repository, commitSha: candidate.source.commitSha, composePath: candidate.source.composePath }, policy: { policyVersion: candidate.policy.policyVersion, checksum: candidate.policy.checksum, services: candidate.policy.services, warnings: candidate.policy.warnings } };
+  });
+  app.post('/api/deployments', { preHandler: (request, reply) => requireUser(request, reply, 'owner'), config: { rateLimit: { max: 10, timeWindow: '1 minute' } } }, async (request, reply) => {
+    const body = objectBody(request.body); const candidate = await deploymentCandidate(body);
+    const agentId = stringField(body, 'agentId', 36, 36); const displayName = stringField(body, 'displayName', 1, 120); const projectName = stringField(body, 'projectName', 1, 63);
+    if (!UUID_PATTERN.test(agentId) || !PROJECT_NAME_PATTERN.test(projectName)) throw new ApiError(400, 'Deployment target is invalid.', 'invalid_target');
+    if (protectedProjects.has(projectName)) throw new ApiError(403, 'This project is protected from deployment.', 'project_protected');
+    const policyResult: DeploymentRevision['policyResult'] = { services: candidate.policy.services, warnings: candidate.policy.warnings };
+    const created = await options.store.createDeployment({ agentId, displayName, projectName, sourceRepository: candidate.source.repository, commitSha: candidate.source.commitSha, composePath: candidate.source.composePath, encryptedSourceCompose: secretBox.encrypt(candidate.sourceCompose), encryptedNormalizedCompose: secretBox.encrypt(candidate.policy.normalizedCompose), checksum: candidate.policy.checksum, policyVersion: candidate.policy.policyVersion, policyResult, requestedByUserId: (request as AuthenticatedRequest).authenticatedUser.id });
+    if (!created) throw new ApiError(409, 'The target agent is unavailable or the project is already active.', 'deployment_conflict');
+    return reply.code(201).send({ deployment: created });
+  });
+  app.post('/api/deployments/:id/revisions', { preHandler: (request, reply) => requireUser(request, reply, 'owner'), config: { rateLimit: { max: 10, timeWindow: '1 minute' } } }, async (request, reply) => {
+    const body = objectBody(request.body); const target = (await options.store.listDeployments()).find((item) => item.id === idParameter(request));
+    if (!target) throw new ApiError(404, 'Deployment not found.', 'deployment_not_found');
+    const candidate = await deploymentCandidate(body, target.projectName);
+    if (candidate.source.repository !== target.sourceRepository) throw new ApiError(400, 'A deployment source repository cannot be changed.', 'repository_immutable');
+    const policyResult: DeploymentRevision['policyResult'] = { services: candidate.policy.services, warnings: candidate.policy.warnings };
+    const revision = await options.store.createDeploymentRevision(target.id, { sourceRepository: candidate.source.repository, commitSha: candidate.source.commitSha, composePath: candidate.source.composePath, encryptedSourceCompose: secretBox.encrypt(candidate.sourceCompose), encryptedNormalizedCompose: secretBox.encrypt(candidate.policy.normalizedCompose), checksum: candidate.policy.checksum, policyVersion: candidate.policy.policyVersion, policyResult, requestedByUserId: (request as AuthenticatedRequest).authenticatedUser.id });
+    if (!revision) throw new ApiError(409, 'This immutable revision already exists or the deployment is unavailable.', 'revision_conflict');
+    return reply.code(201).send({ revision });
+  });
+  const queueDeploymentRun = async (request: FastifyRequest, reply: FastifyReply, action: 'deploy' | 'rollback' | 'stop') => {
+    const deploymentId = idParameter(request); const target = (await options.store.listDeployments()).find((item) => item.id === deploymentId);
+    if (!target) throw new ApiError(404, 'Deployment not found.', 'deployment_not_found');
+    if (protectedProjects.has(target.projectName)) throw new ApiError(403, 'This project is protected from deployment.', 'project_protected');
+    const body = request.body === undefined ? {} : objectBody(request.body); exactKeys(body, ['revisionId']);
+    const revisionId = action === 'stop' ? target.currentRevisionId : stringField(body, 'revisionId', 36, 36);
+    if (!revisionId || !UUID_PATTERN.test(revisionId) || !target.revisions.some((item) => item.id === revisionId)) throw new ApiError(400, 'A revision belonging to this deployment is required.', 'invalid_revision');
+    if (action === 'rollback' && revisionId === target.currentRevisionId) throw new ApiError(409, 'Rollback requires an older revision.', 'invalid_revision');
+    const run = await options.store.createDeploymentRun(deploymentId, revisionId, action, (request as AuthenticatedRequest).authenticatedUser.id);
+    if (run === 'active') throw new ApiError(409, 'A deployment run is already active.', 'deployment_active');
+    if (!run) throw new ApiError(409, 'The deployment or assigned agent is unavailable.', 'deployment_unavailable');
+    return reply.code(202).send({ run });
+  };
+  app.post('/api/deployments/:id/deploy', { preHandler: (request, reply) => requireUser(request, reply, 'owner') }, async (request, reply) => queueDeploymentRun(request, reply, 'deploy'));
+  app.post('/api/deployments/:id/rollback', { preHandler: (request, reply) => requireUser(request, reply, 'owner') }, async (request, reply) => queueDeploymentRun(request, reply, 'rollback'));
+  app.post('/api/deployments/:id/stop', { preHandler: (request, reply) => requireUser(request, reply, 'owner') }, async (request, reply) => queueDeploymentRun(request, reply, 'stop'));
+  app.get('/api/deployment-runs/:id', { preHandler: (request, reply) => requireUser(request, reply) }, async (request) => { const run = await options.store.getDeploymentRun(idParameter(request)); if (!run) throw new ApiError(404, 'Deployment run not found.', 'deployment_run_not_found'); return { run }; });
+
   app.get('/api/stacks', { preHandler: (request, reply) => requireUser(request, reply) }, async () => ({ stacks: await options.store.listStacks() }));
   const legacyStackMutation = async (): Promise<never> => { throw new ApiError(410, 'Managed stack deployment is no longer available.', 'legacy_stack_mutation_disabled'); };
   app.post('/api/stacks', { preHandler: (request, reply) => requireUser(request, reply, 'operator') }, legacyStackMutation);
@@ -1231,7 +1620,27 @@ export async function buildApp(options: BuildAppOptions) {
   });
 
   app.get('/api/notifications/telegram', { preHandler: (request, reply) => requireUser(request, reply) }, async () => await options.store.getNotificationSettings());
-  app.put('/api/notifications/telegram', { preHandler: (request, reply) => requireUser(request, reply, 'operator') }, async (request) => {
+  app.get('/api/notifications/topology', { preHandler: (request, reply) => requireUser(request, reply) }, async () => await options.store.getNotificationTopology());
+  app.patch('/api/notifications/agents/:id', { preHandler: (request, reply) => requireUser(request, reply, 'operator') }, async (request) => {
+    const body = objectBody(request.body);
+    const enabled = optionalBoolean(body, 'enabled');
+    if (enabled === undefined || Object.keys(body).some((key) => key !== 'enabled')) throw new ApiError(400, 'enabled must be the only field.');
+    const preference = await options.store.setAgentNotificationPreference(idParameter(request), enabled, (request as AuthenticatedRequest).authenticatedUser.id);
+    if (!preference) throw new ApiError(404, 'Agent not found.');
+    return { agent: preference };
+  });
+  app.patch('/api/notifications/services', { preHandler: (request, reply) => requireUser(request, reply, 'operator') }, async (request) => {
+    const body = objectBody(request.body);
+    const agentId = stringField(body, 'agentId', 36, 36);
+    const projectName = stringField(body, 'projectName', 1, 63);
+    const serviceName = stringField(body, 'serviceName', 1, 128);
+    const enabled = optionalBoolean(body, 'enabled');
+    if (!UUID_PATTERN.test(agentId) || !PROJECT_NAME_PATTERN.test(projectName) || !SERVICE_NAME_PATTERN.test(serviceName) || enabled === undefined || Object.keys(body).some((key) => !['agentId', 'projectName', 'serviceName', 'enabled'].includes(key))) throw new ApiError(400, 'Notification service identity is invalid.');
+    const preference = await options.store.setServiceNotificationPreference(agentId, projectName, serviceName, enabled, (request as AuthenticatedRequest).authenticatedUser.id);
+    if (!preference) throw new ApiError(404, 'Discovered or retained service not found.');
+    return { service: preference };
+  });
+  app.put('/api/notifications/telegram', { preHandler: (request, reply) => requireUser(request, reply, 'owner') }, async (request) => {
     const body = objectBody(request.body);
     if (!Array.isArray(body.selectedEvents) || body.selectedEvents.length > OPERATIONAL_EVENT_TYPES.length || body.selectedEvents.some((event) => typeof event !== 'string' || !EVENT_TYPES.has(event))) {
       throw new ApiError(400, 'selectedEvents contains an unsupported operational event.');
@@ -1251,7 +1660,7 @@ export async function buildApp(options: BuildAppOptions) {
     await options.store.saveNotificationSettings(secrets.botTokenEncrypted, secrets.groupIdEncrypted, selectedEvents);
     return { configured: true, selectedEvents };
   });
-  app.post('/api/notifications/telegram/test', { preHandler: (request, reply) => requireUser(request, reply, 'operator'), config: { rateLimit: { max: 5, timeWindow: '1 minute' } } }, async () => {
+  app.post('/api/notifications/telegram/test', { preHandler: (request, reply) => requireUser(request, reply, 'owner'), config: { rateLimit: { max: 5, timeWindow: '1 minute' } } }, async () => {
     const secrets = await options.store.getNotificationSecrets();
     if (!secrets) throw new ApiError(409, 'Telegram notifications are not configured.');
     const botToken = secretBox.decrypt(secrets.botTokenEncrypted);
@@ -1346,6 +1755,26 @@ export async function buildApp(options: BuildAppOptions) {
     for (const command of claimedCommands) {
       if (command.type === 'compose.stack.sync') {
         await options.store.completeCommand(agent.id, command.id, 'failed', { error: 'Legacy managed stack deployment is disabled.' });
+        continue;
+      }
+      if (command.type === 'deployment.compose.apply') {
+        const runId = command.payload.runId;
+        const source = typeof runId === 'string' && UUID_PATTERN.test(runId) ? await options.store.getDeploymentCommandSource(runId) : null;
+        if (!source || source.agentId !== agent.id || source.commandId !== command.id || protectedProjects.has(source.projectName)) {
+          await options.store.completeCommand(agent.id, command.id, 'failed', { error: 'Deployment is unavailable for this agent.' });
+          continue;
+        }
+        try {
+          const sourceCompose = secretBox.decrypt(source.encryptedNormalizedCompose);
+          if (createHash('sha256').update(sourceCompose).digest('hex') !== source.checksum) throw new Error('checksum mismatch');
+          const priorCompose = source.encryptedPriorNormalizedCompose ? secretBox.decrypt(source.encryptedPriorNormalizedCompose) : undefined;
+          commands.push({ ...command, payload: {
+            runId: source.runId, revisionId: source.id, projectName: source.projectName, sourceCompose, checksum: source.checksum, action: source.action,
+            ...(source.priorRevisionId && priorCompose ? { priorRevisionId: source.priorRevisionId, priorCompose, priorChecksum: createHash('sha256').update(priorCompose).digest('hex') } : {}),
+          } });
+        } catch {
+          await options.store.completeCommand(agent.id, command.id, 'failed', { error: 'Deployment source could not be authenticated.' });
+        }
         continue;
       }
       if (command.type === 'compose.runtime.action') {
@@ -1494,7 +1923,7 @@ export async function buildApp(options: BuildAppOptions) {
     const commands = await options.store.listCommands(agentId as string | undefined);
     return {
       commands: commands.map((command) => {
-        if (!['cloudflare.connector.sync', 'compose.stack.sync', 'compose.runtime.logs', 'traefik.route.sync'].includes(command.type)) return command;
+        if (!['cloudflare.connector.sync', 'compose.stack.sync', 'compose.runtime.logs', 'traefik.route.sync', 'deployment.compose.apply'].includes(command.type)) return command;
         const { result: _sensitiveResult, ...publicCommand } = command;
         return publicCommand;
       }),
@@ -1534,7 +1963,52 @@ export async function buildApp(options: BuildAppOptions) {
   app.get('/api/system-backups', { preHandler: (request, reply) => requireUser(request, reply, 'owner') }, async () => ({
     backups: (await options.store.listSystemBackups()).map(publicSystemBackup),
     restores: (await options.store.listSystemRestores()).map(publicSystemRestore),
+    imports: options.systemRecoveryService?.listImports ? (await options.systemRecoveryService.listImports()).map(publicSystemBackupImport) : [],
+    recoverySupervisorEnabled: options.recoverySupervisorEnabled === true,
   }));
+  app.get('/api/system-backups/:id/export', { preHandler: (request, reply) => requireUser(request, reply, 'owner'), config: { rateLimit: { max: 10, timeWindow: '1 minute' } } }, async (request, reply) => {
+    if (!options.systemRecoveryService?.exportArtifact) throw new ApiError(503, 'System backup export is not configured.');
+    if (activeSystemBackupExports >= 2) throw new ApiError(429, 'Too many system backup exports are active.');
+    let stream: Readable | undefined;
+    try {
+      const artifact = await options.systemRecoveryService.exportArtifact({ backupId: idParameter(request), requestedByUserId: (request as AuthenticatedRequest).authenticatedUser.id });
+      activeSystemBackupExports += 1;
+      stream = artifact.stream;
+      let released = false;
+      const releaseExport = (): void => { if (!released) { released = true; activeSystemBackupExports -= 1; } };
+      stream.once('close', releaseExport); stream.once('error', releaseExport);
+      reply.raw.once('close', () => { if (!stream?.destroyed) stream?.destroy(); });
+      return reply.type('application/octet-stream').header('content-length', artifact.size).header('content-disposition', `attachment; filename="${artifact.filename}"`).send(stream);
+    } catch (error) {
+      stream?.destroy();
+      if (error instanceof SystemRecoveryFailure) throw new ApiError(error.statusCode, error.message, error.code);
+      throw error;
+    }
+  });
+  app.post('/api/system-backup-imports', { preHandler: (request, reply) => requireUser(request, reply, 'owner'), config: { rateLimit: { max: 3, timeWindow: '1 hour' } } }, async (request, reply) => {
+    if (!options.systemRecoveryService?.uploadImport) throw new ApiError(503, 'System backup import is not configured.');
+    if (request.headers['content-type']?.split(';', 1)[0]?.trim().toLowerCase() !== 'application/octet-stream') throw new ApiError(415, 'Content-Type must be application/octet-stream.');
+    const contentLength = Number(request.headers['content-length']);
+    try {
+      const imported = await options.systemRecoveryService.uploadImport({ requestedByUserId: (request as AuthenticatedRequest).authenticatedUser.id, stream: request.body as Readable, contentLength });
+      return reply.code(201).send({ import: publicSystemBackupImport(imported) });
+    } catch (error) {
+      if (error instanceof SystemRecoveryFailure) throw new ApiError(error.statusCode, error.message, error.code);
+      throw error;
+    }
+  });
+  app.get('/api/system-backup-imports', { preHandler: (request, reply) => requireUser(request, reply, 'owner') }, async () => ({ imports: options.systemRecoveryService?.listImports ? (await options.systemRecoveryService.listImports()).map(publicSystemBackupImport) : [] }));
+  app.post('/api/system-backup-imports/:id/validate', { preHandler: (request, reply) => requireUser(request, reply, 'owner'), config: { rateLimit: { max: 5, timeWindow: '15 minutes' } } }, async (request, reply) => {
+    if (!options.systemRecoveryService?.validateImport) throw new ApiError(503, 'System backup import is not configured.');
+    const passphrase = opaqueStringField(objectBody(request.body), 'passphrase', 16, 1024);
+    try {
+      const result = await options.systemRecoveryService.validateImport({ importId: idParameter(request), requestedByUserId: (request as AuthenticatedRequest).authenticatedUser.id, passphrase });
+      return reply.send({ import: publicSystemBackupImport(result.importRecord), backup: publicSystemBackup(result.backup), idempotent: result.idempotent });
+    } catch (error) {
+      if (error instanceof SystemRecoveryFailure) throw new ApiError(error.statusCode, error.message, error.code);
+      throw error;
+    }
+  });
   app.post('/api/system-backups', { preHandler: (request, reply) => requireUser(request, reply, 'owner') }, async (request, reply) => {
     if (!options.systemRecoveryService) throw new ApiError(503, 'System recovery is not configured.');
     const body = objectBody(request.body);
@@ -1559,6 +2033,18 @@ export async function buildApp(options: BuildAppOptions) {
         manualRestoreRequired: result.manualRestoreRequired,
         restoreCommand: result.restoreCommand,
       });
+    } catch (error) {
+      if (error instanceof SystemRecoveryFailure) throw new ApiError(error.statusCode, error.message, error.code);
+      throw error;
+    }
+  });
+  app.post('/api/system-restores/:id/request-apply', { preHandler: (request, reply) => requireUser(request, reply, 'owner'), config: { rateLimit: { max: 3, timeWindow: '15 minutes' } } }, async (request, reply) => {
+    if (!options.systemRecoveryService?.requestApply) throw new ApiError(503, 'Platform-assisted recovery is not configured.');
+    const body = objectBody(request.body);
+    exactKeys(body, ['confirmation', 'passphrase']);
+    try {
+      const result = await options.systemRecoveryService.requestApply({ restoreId: idParameter(request), requestedByUserId: (request as AuthenticatedRequest).authenticatedUser.id, confirmation: opaqueStringField(body, 'confirmation', 42, 42), passphrase: opaqueStringField(body, 'passphrase', 16, 1024) });
+      return reply.code(202).send({ ...result, browserMayDisconnect: true });
     } catch (error) {
       if (error instanceof SystemRecoveryFailure) throw new ApiError(error.statusCode, error.message, error.code);
       throw error;
@@ -1590,6 +2076,10 @@ export async function buildApp(options: BuildAppOptions) {
     notificationDispatcher.stop();
     if (connectorIdentityStartupTimer) clearTimeout(connectorIdentityStartupTimer);
     if (connectorIdentityTimer) clearInterval(connectorIdentityTimer);
+    if (tlsObservationStartupTimer) clearTimeout(tlsObservationStartupTimer);
+    if (tlsObservationTimer) clearInterval(tlsObservationTimer);
+    if (guidedVerificationStartupTimer) clearTimeout(guidedVerificationStartupTimer);
+    if (guidedVerificationTimer) clearInterval(guidedVerificationTimer);
     await options.store.close();
   });
   return app;

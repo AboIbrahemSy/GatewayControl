@@ -16,8 +16,14 @@ export interface Config {
   systemBackupNasRoot: string;
   systemBackupNasMarker: string;
   systemRestoreStageRoot: string;
+  systemBackupMaxBytes: number;
+  recoverySupervisorEnabled: boolean;
+  recoveryRequestSecret?: Buffer;
   release: string;
   protectedProjects: string[];
+  notificationTopologyMaxAgents: number;
+  notificationTopologyMaxServices: number;
+  notificationTopologyMaxScopes: number;
 }
 
 const COMPOSE_PROJECT_PATTERN = /^[a-z0-9][a-z0-9_-]{0,62}$/;
@@ -37,6 +43,12 @@ function required(name: string): string {
     throw new Error(`${name} is required.`);
   }
   return value;
+}
+
+export function boundedInteger(value: string | undefined, name: string, fallback: number, maximum: number): number {
+  const parsed = Number(value ?? fallback);
+  if (!Number.isSafeInteger(parsed) || parsed < 1 || parsed > maximum) throw new Error(`${name} must be an integer between 1 and ${maximum}.`);
+  return parsed;
 }
 
 export function decodeMasterKey(value: string): Buffer {
@@ -68,6 +80,12 @@ export function loadConfig(): Config {
   const webRoot = process.env.WEB_ROOT?.trim();
   const systemBackupLocalRoot = process.env.GATEWAY_SYSTEM_BACKUP_LOCAL_ROOT?.trim() || '/opt/gateway-control/backups/system';
   const systemRestoreStageRoot = process.env.GATEWAY_SYSTEM_RESTORE_STAGE_ROOT?.trim() || '/opt/gateway-control/backups/system/.restore-stage';
+  const systemBackupMaxBytes = Number(process.env.GATEWAY_SYSTEM_BACKUP_MAX_BYTES || 10 * 1024 ** 3);
+  if (!Number.isSafeInteger(systemBackupMaxBytes) || systemBackupMaxBytes < 1024 * 1024) throw new Error('GATEWAY_SYSTEM_BACKUP_MAX_BYTES must be a safe integer of at least 1 MiB.');
+  const recoverySupervisorEnabled = process.env.GATEWAY_RECOVERY_SUPERVISOR_ENABLED === 'true';
+  const recoverySecretFile = process.env.GATEWAY_RECOVERY_REQUEST_SECRET_FILE?.trim();
+  const recoveryRequestSecret = recoverySecretFile ? Buffer.from(readFileSync(recoverySecretFile, 'utf8').trim(), 'utf8') : undefined;
+  if (recoverySupervisorEnabled && (!recoveryRequestSecret || recoveryRequestSecret.length < 32)) throw new Error('GATEWAY_RECOVERY_REQUEST_SECRET_FILE must contain at least 32 bytes when the recovery supervisor is enabled.');
   return {
     host: process.env.HOST?.trim() || '0.0.0.0',
     port: Number(process.env.PORT || 3000),
@@ -82,8 +100,14 @@ export function loadConfig(): Config {
     systemBackupNasRoot: process.env.GATEWAY_SYSTEM_BACKUP_NAS_ROOT?.trim() || '/mnt/gateway-control-backups',
     systemBackupNasMarker: process.env.GATEWAY_SYSTEM_BACKUP_NAS_MARKER?.trim() || '.gateway-control-nas',
     systemRestoreStageRoot: validateRestoreStageRoot(systemBackupLocalRoot, systemRestoreStageRoot),
+    systemBackupMaxBytes,
+    recoverySupervisorEnabled,
+    ...(recoveryRequestSecret ? { recoveryRequestSecret } : {}),
     release: process.env.GATEWAY_CONTROL_RELEASE?.trim() || 'unknown',
     protectedProjects: parseProtectedProjects(process.env.GATEWAY_PROTECTED_PROJECTS),
+    notificationTopologyMaxAgents: boundedInteger(process.env.GATEWAY_NOTIFICATION_TOPOLOGY_MAX_AGENTS, 'GATEWAY_NOTIFICATION_TOPOLOGY_MAX_AGENTS', 100, 1_000),
+    notificationTopologyMaxServices: boundedInteger(process.env.GATEWAY_NOTIFICATION_TOPOLOGY_MAX_SERVICES, 'GATEWAY_NOTIFICATION_TOPOLOGY_MAX_SERVICES', 5_000, 25_000),
+    notificationTopologyMaxScopes: boundedInteger(process.env.GATEWAY_NOTIFICATION_TOPOLOGY_MAX_SCOPES, 'GATEWAY_NOTIFICATION_TOPOLOGY_MAX_SCOPES', 5_000, 25_000),
     ...(webRoot ? { webRoot } : {}),
   };
 }

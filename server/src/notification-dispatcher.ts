@@ -56,6 +56,10 @@ export class NotificationDispatcher {
 
   private async dispatch(delivery: NotificationDelivery): Promise<void> {
     try {
+      if (!await this.options.store.isNotificationDeliveryEnabled(delivery)) {
+        await this.options.store.skipNotificationDelivery(delivery.id);
+        return;
+      }
       const secrets = await this.options.store.getNotificationSecrets();
       if (!secrets) throw new Error('Telegram notifications are not configured.');
       const response = await this.options.fetch(

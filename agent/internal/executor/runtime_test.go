@@ -33,6 +33,10 @@ func TestRuntimeActionRevalidatesLabelsAndUsesOnlyFixedContainerArguments(t *tes
 	if !reflect.DeepEqual(runner.commands[0].args, []string{"ps", "--all", "--no-trunc", "--filter", "label=com.docker.compose.project=project", "--filter", "label=com.docker.compose.service=web", "--format", "{{.ID}}"}) {
 		t.Fatalf("discovery args = %#v", runner.commands[0].args)
 	}
+	expectedInspectArgs := []string{"inspect", "--format", "{{.Id}}\t{{.Name}}\t{{index .Config.Labels \"com.docker.compose.project\"}}\t{{index .Config.Labels \"com.docker.compose.service\"}}", runtimeContainerID}
+	if !reflect.DeepEqual(runner.commands[1].args, expectedInspectArgs) || strings.Contains(runner.commands[1].args[2], `\t`) {
+		t.Fatalf("inspect args = %#v", runner.commands[1].args)
+	}
 }
 
 func TestRuntimeLogsAcceptDelayedTwentyFourHourSinceAndClampForDocker(t *testing.T) {

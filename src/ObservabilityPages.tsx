@@ -1,5 +1,7 @@
 import {
   Activity,
+  Bell,
+  BellOff,
   CheckCircle2,
   Clipboard,
   Container,
@@ -11,7 +13,7 @@ import {
   WrapText,
 } from 'lucide-react'
 import { useEffect, useRef, useState } from 'react'
-import { api, ApiError, type Agent, type Role, type RuntimeProject, type RuntimeServiceStatus, type TelemetrySnapshot } from './api'
+import { api, ApiError, type Agent, type NotificationAgentPreference, type Role, type RuntimeProject, type RuntimeServiceStatus, type TelemetrySnapshot } from './api'
 import type { Locale, Translate } from './App'
 import { copyText } from './clipboard'
 
@@ -23,26 +25,45 @@ const servicePattern = /^[a-zA-Z0-9][a-zA-Z0-9_.-]*$/
 const maxLogCharacters = 500_000
 const maxLogErrorCharacters = 500
 
-export function MonitoringPage({ t, locale }: { t: Translate; locale: Locale }) {
+export function MonitoringPage({ t, locale, role }: { t: Translate; locale: Locale; role: Role }) {
   const [snapshots, setSnapshots] = useState<TelemetrySnapshot[]>([])
   const [agents, setAgents] = useState<Agent[]>([])
   const [loading, setLoading] = useState(true)
   const [refreshing, setRefreshing] = useState(false)
   const [error, setError] = useState('')
+  const [notificationAgents, setNotificationAgents] = useState<NotificationAgentPreference[]>([])
+  const [notificationBusy, setNotificationBusy] = useState<string[]>([])
 
   async function load(background = false) {
     background ? setRefreshing(true) : setLoading(true)
     setError('')
     try {
-      const [summary, agentResult] = await Promise.all([api.monitoringSummary(), api.agents()])
+      const [summary, agentResult, notifications] = await Promise.all([api.monitoringSummary(), api.agents(), api.notificationTopology()])
       setSnapshots(summary.agents)
       setAgents(agentResult.agents)
+      setNotificationAgents(notifications.agents)
     } catch (caught) {
       setError(friendlyError(caught, t))
     } finally {
       setLoading(false)
       setRefreshing(false)
     }
+  }
+
+  async function toggleAgentNotifications(agentId: string) {
+    if (role === 'viewer') return
+    const previous = notificationAgents
+    const current = notificationAgents.find((item) => item.id === agentId)
+    if (!current) return
+    const enabled = !current.enabled
+    setNotificationBusy((items) => [...items, agentId])
+    setNotificationAgents((items) => items.map((item) => item.id === agentId ? { ...item, enabled } : item))
+    setError('')
+    try {
+      const result = await api.setAgentNotifications(agentId, enabled)
+      setNotificationAgents((items) => items.map((item) => item.id === agentId ? result.agent : item))
+    } catch (caught) { setNotificationAgents(previous); setError(friendlyError(caught, t)) }
+    finally { setNotificationBusy((items) => items.filter((item) => item !== agentId)) }
   }
 
   useEffect(() => {
@@ -55,25 +76,27 @@ export function MonitoringPage({ t, locale }: { t: Translate; locale: Locale }) 
   const staleCount = snapshots.filter((snapshot) => isStale(snapshot, now)).length
   const services = snapshots.filter((snapshot) => !isStale(snapshot, now)).flatMap((snapshot) => snapshot.services)
   const healthyCount = services.filter((service) => service.status === 'healthy').length
+  const runningCount = services.filter((service) => service.status === 'running').length
   const unhealthyCount = services.filter((service) => service.status === 'unhealthy').length
 
   return <PageShell icon={Activity} title={t('monitoringTitle')} description={t('monitoringDescription')} action={<button type="button" className={secondaryButton} disabled={refreshing} onClick={() => void load(true)}><RefreshCw className={refreshing ? 'animate-spin' : ''} size={15} />{t('refresh')}</button>}>
     {error && <Alert>{error}</Alert>}
     {loading ? <Loading t={t} /> : <>
-      <section className="grid grid-cols-2 gap-3 lg:grid-cols-4">
+      <section className="grid grid-cols-2 gap-3 lg:grid-cols-5">
         <Metric icon={Server} label={t('reportingAgents')} value={formatNumber(snapshots.length, locale)} />
         <Metric icon={CheckCircle2} label={t('healthyServices')} value={formatNumber(healthyCount, locale)} tone="good" />
+        <Metric icon={Container} label={t('runningServices')} value={formatNumber(runningCount, locale)} tone="active" />
         <Metric icon={TriangleAlert} label={t('unhealthyServices')} value={formatNumber(unhealthyCount, locale)} tone={unhealthyCount ? 'bad' : 'neutral'} />
         <Metric icon={Gauge} label={t('staleAgents')} value={formatNumber(staleCount, locale)} tone={staleCount ? 'warn' : 'neutral'} />
       </section>
       {snapshots.length === 0 ? <Empty icon={Activity} text={t('noMonitoringData')} /> : <section className="grid grid-cols-1 gap-5 2xl:grid-cols-2">
-        {snapshots.map((snapshot) => <AgentTelemetryCard key={snapshot.agentId} snapshot={snapshot} agent={agents.find((item) => item.id === snapshot.agentId)} locale={locale} t={t} now={now} />)}
+        {snapshots.map((snapshot) => <AgentTelemetryCard key={snapshot.agentId} snapshot={snapshot} agent={agents.find((item) => item.id === snapshot.agentId)} notifications={notificationAgents.find((item) => item.id === snapshot.agentId)} notificationsBusy={notificationBusy.includes(snapshot.agentId)} role={role} toggleNotifications={() => void toggleAgentNotifications(snapshot.agentId)} locale={locale} t={t} now={now} />)}
       </section>}
     </>}
   </PageShell>
 }
 
-function AgentTelemetryCard({ snapshot, agent, locale, t, now }: { snapshot: TelemetrySnapshot; agent?: Agent; locale: Locale; t: Translate; now: number }) {
+function AgentTelemetryCard({ snapshot, agent, notifications, notificationsBusy, role, toggleNotifications, locale, t, now }: { snapshot: TelemetrySnapshot; agent?: Agent; notifications?: NotificationAgentPreference; notificationsBusy: boolean; role: Role; toggleNotifications: () => void; locale: Locale; t: Translate; now: number }) {
   const stale = isStale(snapshot, now)
   const total = snapshot.node.memoryTotalBytes
   const used = Math.max(0, total - snapshot.node.memoryAvailableBytes)
@@ -81,7 +104,7 @@ function AgentTelemetryCard({ snapshot, agent, locale, t, now }: { snapshot: Tel
   return <article className={`${panelClass} min-w-0 overflow-hidden`}>
     <div className="flex flex-wrap items-start justify-between gap-3 border-b border-stone-200/70 p-5 dark:border-white/[0.06] sm:p-6">
       <div className="min-w-0"><p className="text-[0.65rem] font-extrabold uppercase tracking-wider text-stone-400">{t('runtimeHealth')}</p><h2 className="truncate pt-1 text-lg font-black text-ink-900 dark:text-white">{agent?.name || snapshot.agentId}</h2></div>
-      <Freshness stale={stale} t={t} />
+      <div className="flex items-center gap-2"><Freshness stale={stale} t={t} /><NotificationBell enabled={notifications?.enabled ?? true} readOnly={role === 'viewer'} busy={notificationsBusy} t={t} onClick={toggleNotifications} /></div>
     </div>
     <div className="flex flex-col gap-5 p-5 sm:p-6">
       <div className="grid grid-cols-1 gap-3 sm:grid-cols-3">
@@ -221,9 +244,10 @@ export function LogsPage({ t, locale, role }: { t: Translate; locale: Locale; ro
 }
 
 function PageShell({ icon: Icon, title, description, action, children }: { icon: typeof Activity; title: string; description: string; action?: React.ReactNode; children: React.ReactNode }) { return <div className="mx-auto flex w-full max-w-[100rem] flex-col gap-6"><section className="flex flex-col justify-between gap-4 lg:flex-row lg:items-end"><div className="max-w-3xl"><span className="flex items-center gap-2 text-xs font-extrabold uppercase tracking-[0.14em] text-mint-500 dark:text-mint-300"><Icon size={15} />GatewayControl</span><h1 className="pt-2 text-3xl font-black tracking-[-0.045em] text-ink-900 dark:text-white sm:text-4xl">{title}</h1><p className="max-w-2xl pt-2 text-sm font-medium leading-6 text-stone-500 dark:text-stone-400 sm:text-base">{description}</p></div>{action}</section>{children}</div> }
-function Metric({ icon: Icon, label, value, tone = 'neutral' }: { icon: typeof Activity; label: string; value: string; tone?: 'neutral' | 'good' | 'warn' | 'bad' }) { const color = tone === 'good' ? 'text-emerald-600 dark:text-emerald-300' : tone === 'warn' ? 'text-amber-600 dark:text-amber-300' : tone === 'bad' ? 'text-rose-600 dark:text-rose-300' : 'text-mint-500 dark:text-mint-300'; return <article className={`${panelClass} min-w-0 p-4 sm:p-5`}><div className="flex items-start justify-between gap-2"><div className="min-w-0"><p className="text-[0.68rem] font-bold text-stone-400">{label}</p><bdi dir="ltr" className="block pt-2 text-2xl font-black text-ink-900 dark:text-white sm:text-3xl">{value}</bdi></div><Icon className={`shrink-0 ${color}`} size={20} /></div></article> }
+function Metric({ icon: Icon, label, value, tone = 'neutral' }: { icon: typeof Activity; label: string; value: string; tone?: 'neutral' | 'good' | 'active' | 'warn' | 'bad' }) { const color = tone === 'good' ? 'text-emerald-600 dark:text-emerald-300' : tone === 'active' ? 'text-sky-600 dark:text-sky-300' : tone === 'warn' ? 'text-amber-600 dark:text-amber-300' : tone === 'bad' ? 'text-rose-600 dark:text-rose-300' : 'text-mint-500 dark:text-mint-300'; return <article className={`${panelClass} min-w-0 p-4 sm:p-5`}><div className="flex items-start justify-between gap-2"><div className="min-w-0"><p className="text-[0.68rem] font-bold text-stone-400">{label}</p><bdi dir="ltr" className="block pt-2 text-2xl font-black text-ink-900 dark:text-white sm:text-3xl">{value}</bdi></div><Icon className={`shrink-0 ${color}`} size={20} /></div></article> }
 function Freshness({ stale, t }: { stale: boolean; t: Translate }) { return <span className={`inline-flex items-center gap-1.5 rounded-full px-2.5 py-1 text-[0.65rem] font-extrabold ${stale ? 'bg-amber-500/10 text-amber-700 dark:text-amber-300' : 'bg-emerald-500/10 text-emerald-700 dark:text-emerald-300'}`}><span className="h-1.5 w-1.5 rounded-full bg-current" />{t(stale ? 'stale' : 'fresh')}</span> }
-function RuntimeStatus({ status, t }: { status: RuntimeServiceStatus; t: Translate }) { const color = status === 'healthy' || status === 'completed' ? 'text-emerald-700 bg-emerald-500/10 dark:text-emerald-300' : status === 'unhealthy' ? 'text-rose-700 bg-rose-500/10 dark:text-rose-300' : status === 'starting' ? 'text-amber-700 bg-amber-500/10 dark:text-amber-300' : 'text-stone-500 bg-stone-500/10 dark:text-stone-300'; return <span className={`shrink-0 rounded-full px-2 py-1 text-[0.6rem] font-extrabold ${color}`}>{t(status === 'healthy' ? 'runtimeHealthy' : status)}</span> }
+function NotificationBell({ enabled, readOnly, busy, t, onClick }: { enabled: boolean; readOnly: boolean; busy: boolean; t: Translate; onClick: () => void }) { const Icon = enabled ? Bell : BellOff; const label = t(enabled ? 'muteServerNotifications' : 'enableServerNotifications'); return <button type="button" disabled={readOnly || busy} title={label} aria-label={label} aria-pressed={!enabled} onClick={onClick} className={`flex h-9 w-9 items-center justify-center rounded-xl border transition disabled:cursor-default disabled:opacity-70 ${enabled ? 'border-emerald-500/20 bg-emerald-500/10 text-emerald-700 dark:text-emerald-300' : 'border-rose-500/20 bg-rose-500/10 text-rose-700 dark:text-rose-300'}`}><Icon size={15} /></button> }
+function RuntimeStatus({ status, t }: { status: RuntimeServiceStatus; t: Translate }) { const color = status === 'healthy' || status === 'completed' ? 'text-emerald-700 bg-emerald-500/10 dark:text-emerald-300' : status === 'running' ? 'text-sky-700 bg-sky-500/10 dark:text-sky-300' : status === 'unhealthy' ? 'text-rose-700 bg-rose-500/10 dark:text-rose-300' : status === 'starting' ? 'text-amber-700 bg-amber-500/10 dark:text-amber-300' : 'text-stone-500 bg-stone-500/10 dark:text-stone-300'; return <span className={`shrink-0 rounded-full px-2 py-1 text-[0.6rem] font-extrabold ${color}`}>{t(status === 'healthy' ? 'runtimeHealthy' : status)}</span> }
 function Meta({ label, value, ltr = false }: { label: string; value: string; ltr?: boolean }) { return <div className="min-w-0 rounded-xl bg-stone-100/70 p-4 dark:bg-white/[0.03]"><span className="block text-[0.62rem] font-bold text-stone-400">{label}</span><bdi dir={ltr ? 'ltr' : undefined} title={value} className="block break-words pt-1 text-xs font-bold leading-5 text-ink-800 dark:text-stone-200">{value}</bdi></div> }
 function Field({ label, hint, className = '', children }: { label: string; hint?: string; className?: string; children: React.ReactNode }) { return <label className={`flex min-w-0 flex-col gap-2 ${className}`}><span className="text-xs font-extrabold text-ink-800 dark:text-stone-100">{label}</span>{children}{hint && <span className="text-[0.66rem] font-medium leading-5 text-stone-400">{hint}</span>}</label> }
 function Alert({ children }: { children: React.ReactNode }) { return <div role="alert" className="flex items-start gap-2 rounded-xl bg-rose-500/10 px-3.5 py-3 text-xs font-bold leading-5 text-rose-700 dark:text-rose-300"><TriangleAlert className="mt-0.5 shrink-0" size={15} />{children}</div> }

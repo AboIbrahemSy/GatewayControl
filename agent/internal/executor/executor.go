@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"net/http"
 	"os"
 	"path/filepath"
 	"regexp"
@@ -31,6 +32,8 @@ type Executor struct {
 	stateDir             string
 	stateVolume          string
 	hostStacksRoot       string
+	deploymentsRoot      string
+	hostDeploymentsRoot  string
 	localBackupRoot      string
 	hostLocalBackupRoot  string
 	nasBackupRoot        string
@@ -49,6 +52,7 @@ type Executor struct {
 	secrets              []string
 	protectedProjects    map[string]struct{}
 	runner               commandRunner
+	httpClient           *http.Client
 }
 
 type Options struct {
@@ -56,6 +60,8 @@ type Options struct {
 	StateDir             string
 	StateVolume          string
 	HostStacksRoot       string
+	DeploymentsRoot      string
+	HostDeploymentsRoot  string
 	LocalBackupRoot      string
 	HostLocalBackupRoot  string
 	NASBackupRoot        string
@@ -85,6 +91,19 @@ func New(options Options, secrets ...string) (*Executor, error) {
 	}
 	if !filepath.IsAbs(options.HostStacksRoot) {
 		return nil, errors.New("host stacks root must be absolute")
+	}
+	deploymentsRoot, err := filepath.Abs(options.DeploymentsRoot)
+	if err != nil {
+		return nil, fmt.Errorf("resolve deployments root: %w", err)
+	}
+	if !filepath.IsAbs(options.HostDeploymentsRoot) || filepath.Clean(options.HostDeploymentsRoot) != options.HostDeploymentsRoot {
+		return nil, errors.New("host deployments root must be an absolute, clean path")
+	}
+	if strings.ContainsAny(deploymentsRoot, ",\r\n\x00") || strings.ContainsAny(options.HostDeploymentsRoot, ",\r\n\x00") {
+		return nil, errors.New("deployment roots contain unsafe Docker mount characters")
+	}
+	if backupPathsOverlap(deploymentsRoot, root) || backupPathsOverlap(deploymentsRoot, stateDir) || backupPathsOverlap(options.HostDeploymentsRoot, options.HostStacksRoot) {
+		return nil, errors.New("deployment roots must be dedicated and must not overlap stack or state roots")
 	}
 	for name, value := range map[string]string{
 		"local backup root": options.LocalBackupRoot, "host local backup root": options.HostLocalBackupRoot,
@@ -136,7 +155,8 @@ func New(options Options, secrets ...string) (*Executor, error) {
 	}
 	return &Executor{
 		stacksRoot: root, stateDir: stateDir, stateVolume: options.StateVolume,
-		hostStacksRoot: filepath.Clean(options.HostStacksRoot), cloudflaredImage: options.CloudflaredImage,
+		hostStacksRoot: filepath.Clean(options.HostStacksRoot), deploymentsRoot: deploymentsRoot,
+		hostDeploymentsRoot: filepath.Clean(options.HostDeploymentsRoot), cloudflaredImage: options.CloudflaredImage,
 		localBackupRoot: options.LocalBackupRoot, hostLocalBackupRoot: options.HostLocalBackupRoot,
 		nasBackupRoot: options.NASBackupRoot, hostNASBackupRoot: options.HostNASBackupRoot,
 		nasMarker: options.NASMarker, agentImage: options.AgentImage, backupTimeout: options.BackupTimeout,
@@ -144,6 +164,7 @@ func New(options Options, secrets ...string) (*Executor, error) {
 		traefikDynamicRoot: traefikDynamicRoot, traefikDynamicVolume: options.TraefikDynamicVolume,
 		hostProcRoot: options.HostProcRoot,
 		maxOutput: options.MaxOutput, secrets: secrets, protectedProjects: protectedProjects, runner: osCommandRunner{},
+		httpClient: &http.Client{Timeout: 5 * time.Second, CheckRedirect: func(_ *http.Request, _ []*http.Request) error { return http.ErrUseLastResponse }},
 	}, nil
 }
 
@@ -220,12 +241,14 @@ func (e *Executor) Execute(ctx context.Context, command types.Command) types.Com
 		return e.executeConnectorRemove(ctx, result, command.Payload)
 	case "compose.stack.sync":
 		return e.failure(result, errors.New("command type \"compose.stack.sync\" is permanently unsupported"))
+	case "deployment.compose.apply":
+		return e.executeDeploymentComposeApply(ctx, result, command.Payload)
 	case "compose.runtime.action":
 		return e.executeRuntimeAction(ctx, result, command.Payload)
 	case "compose.runtime.logs":
 		return e.executeRuntimeLogs(ctx, result, command.Payload)
 	case "traefik.route.sync":
-		return e.executeRouteSync(result, command.Payload)
+		return e.executeRouteSync(ctx, result, command.Payload)
 	case "service.logs.read":
 		return e.executeServiceLogs(ctx, result, command.Payload)
 	case "stack.backup.create":
@@ -287,6 +310,7 @@ func (e *Executor) Diagnostics(ctx context.Context) types.Diagnostics {
 		"hostProc":        pathReadableCheck(filepath.Join(e.hostProcRoot, "uptime")),
 		"stateStorage":    pathWritableCheck(e.stateDir),
 		"stacksStorage":   pathWritableCheck(e.stacksRoot),
+		"deploymentStorage": pathWritableCheck(e.deploymentsRoot),
 		"localBackups":    pathWritableCheck(e.localBackupRoot),
 		"traefikStorage":  pathWritableCheck(e.traefikDynamicRoot),
 		"nasBackups":      e.nasDiagnostic(),

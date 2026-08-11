@@ -1,0 +1,24 @@
+[Unit]
+Description=GatewayControl host recovery request supervisor
+After=docker.service
+Requires=docker.service
+
+[Service]
+Type=simple
+User=root
+Group=root
+WorkingDirectory=/opt/gateway-control
+Environment=GATEWAY_RECOVERY_PROJECT_ROOT=/opt/gateway-control
+Environment=GATEWAY_SYSTEM_BACKUP_LOCAL_HOST_ROOT=/opt/gateway-control/backups/system
+Environment=GATEWAY_RECOVERY_REQUEST_SECRET_FILE=/etc/gateway-control/recovery-request.secret
+ExecStart=/bin/sh /opt/gateway-control/docker/recovery-supervisor.sh
+Restart=on-failure
+RestartSec=5
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectHome=true
+ProtectSystem=strict
+ReadWritePaths=/opt/gateway-control/backups/system /var/run/docker.sock
+
+[Install]
+WantedBy=multi-user.target
