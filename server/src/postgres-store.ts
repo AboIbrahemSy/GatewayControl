@@ -1,6 +1,6 @@
 import { randomUUID } from 'node:crypto';
 import { Pool, type PoolClient, type QueryResultRow } from 'pg';
-import { OPERATIONAL_EVENT_TYPES, sanitizeOperationalEventTypes, type Agent, type AgentCommand, type BackupTarget, type CloudflareAccount, type CloudflareAccountSecret, type CloudflareDomainAccess, type CloudflareDomainAccessDeployment, type CloudflareZone, type Connector, type ConnectorDeployment, type ConnectorIdentityDeployment, type ConnectorIdentityExpectation, type Deployment, type DeploymentCommandSource, type DeploymentRevision, type DeploymentRun, type DomainAccessDnsRecord, type GuidedOperation, type ManagedRoute, type ManagedStack, type NotificationAgentPreference, type NotificationDelivery, type NotificationServicePreference, type NotificationSettings, type NotificationTopology, type OperationalEventType, type RuntimeInventory, type RuntimeLogRequest, type RuntimeOperation, type RuntimeAction, type RuntimeScope, type StackBackup, type StackDeployment, type StackRestore, type Store, type StoredSystemBackup, type SystemBackup, type SystemBackupImport, type SystemRestore, type TelemetrySnapshot, type TlsObservation, type TlsObservationTarget, type User } from './types.js';
+import { OPERATIONAL_EVENT_TYPES, sanitizeOperationalEventTypes, type Agent, type AgentCommand, type BackupTarget, type CloudflareAccount, type CloudflareAccountDeletionDependencies, type CloudflareAccountSecret, type CloudflareDomainAccess, type CloudflareDomainAccessDeployment, type CloudflareZone, type Connector, type ConnectorDeployment, type ConnectorIdentityDeployment, type ConnectorIdentityExpectation, type Deployment, type DeploymentCommandSource, type DeploymentRevision, type DeploymentRun, type DomainAccessDnsRecord, type GuidedOperation, type ManagedRoute, type ManagedStack, type NotificationAgentPreference, type NotificationDelivery, type NotificationServicePreference, type NotificationSettings, type NotificationTopology, type OperationalEventType, type RuntimeInventory, type RuntimeLogRequest, type RuntimeOperation, type RuntimeAction, type RuntimeScope, type StackBackup, type StackDeployment, type StackRestore, type Store, type StoredSystemBackup, type SystemBackup, type SystemBackupImport, type SystemRestore, type TelemetrySnapshot, type TlsObservation, type TlsObservationTarget, type User } from './types.js';
 
 function user(row: QueryResultRow): User {
   return { id: row.id, email: row.email, role: row.role, passwordHash: row.password_hash } as User;
@@ -394,6 +394,18 @@ export class PgStore implements Store {
       [id, values.name ?? null, values.accountIdentifier ?? null, values.encryptedApiToken ?? null, values.enabled ?? null],
     );
     return result.rows[0] ? cloudflareAccount(result.rows[0]) : null;
+  }
+
+  public async deleteCloudflareAccount(id: string): Promise<{ deleted: true; dependencies: CloudflareAccountDeletionDependencies } | { deleted: false; dependencies: CloudflareAccountDeletionDependencies } | null> {
+    return this.transaction(async (client) => {
+      const account = await client.query('SELECT id FROM cloudflare_accounts WHERE id = $1 FOR UPDATE', [id]);
+      if (!account.rows[0]) return null;
+      const dependencies = await this.cloudflareAccountDeletionDependencies(client, id);
+      if (dependencies.connectors + dependencies.domainAccess + dependencies.guidedOperations > 0) return { deleted: false, dependencies };
+      await client.query('DELETE FROM cloudflare_zones WHERE cloudflare_account_id = $1', [id]);
+      await client.query('DELETE FROM cloudflare_accounts WHERE id = $1', [id]);
+      return { deleted: true, dependencies };
+    });
   }
 
   public async getCloudflareAccountSecret(id: string): Promise<CloudflareAccountSecret | null> {
@@ -1095,7 +1107,9 @@ export class PgStore implements Store {
 
   public async heartbeatAgent(id: string, metadata: Record<string, unknown>): Promise<void> {
     await this.transaction(async (client) => {
+      const current = await client.query('SELECT name, offline_detected_at FROM agents WHERE id = $1 FOR UPDATE', [id]);
       await client.query('UPDATE agents SET last_heartbeat_at = now(), last_metadata = $2, offline_detected_at = NULL, updated_at = now() WHERE id = $1', [id, metadata]);
+      if (current.rows[0]?.offline_detected_at) await this.enqueueEvent(client, 'agent.recovered', { agentId: id, payload: { agentName: current.rows[0].name } });
       const connectors = metadata.diagnostics && typeof metadata.diagnostics === 'object' && !Array.isArray(metadata.diagnostics)
         ? (metadata.diagnostics as { connectors?: unknown }).connectors : null;
       if (connectors && typeof connectors === 'object' && !Array.isArray(connectors)) {
@@ -1125,9 +1139,16 @@ export class PgStore implements Store {
       const previousServices = new Map<string, Record<string, unknown>>((previous.rows[0]?.services ?? []).map((service: Record<string, unknown>) => [String(service.name), service]));
       for (const service of snapshot.services) {
         const name = String(service.name);
+        const previousStatus = String(previousServices.get(name)?.status ?? 'unknown');
         const wasUnhealthy = previousServices.get(name)?.status === 'unhealthy';
         if (service.status === 'unhealthy' && !wasUnhealthy) {
           await this.enqueueEvent(client, 'service.unhealthy', { agentId, projectName: String(service.projectName), serviceName: String(service.serviceName), payload: { service: name } });
+        }
+        if (service.status === 'stopped' && previousStatus !== 'stopped') {
+          await this.enqueueEvent(client, 'service.stopped', { agentId, projectName: String(service.projectName), serviceName: String(service.serviceName), payload: { service: name } });
+        }
+        if (['healthy', 'running'].includes(String(service.status)) && ['unhealthy', 'stopped'].includes(previousStatus)) {
+          await this.enqueueEvent(client, 'service.recovered', { agentId, projectName: String(service.projectName), serviceName: String(service.serviceName), payload: { service: name, previousStatus } });
         }
         const expiresAt = typeof service.certificateExpiresAt === 'string' ? Date.parse(service.certificateExpiresAt) : Number.NaN;
         const previousExpiry = previousServices.get(name)?.certificateExpiresAt;
@@ -1885,6 +1906,21 @@ export class PgStore implements Store {
          AND ($5::text IS NULL OR NOT EXISTS (SELECT 1 FROM notification_scopes WHERE agent_id = $3 AND project_name = $4 AND service_name = $5 AND NOT enabled))`,
       [event.rows[0].id, type, values.agentId ?? null, values.projectName ?? null, values.serviceName ?? null],
     );
+  }
+
+  private async cloudflareAccountDeletionDependencies(client: PoolClient, id: string): Promise<CloudflareAccountDeletionDependencies> {
+    const result = await client.query(
+      `SELECT
+        (SELECT count(*)::integer FROM cloudflare_connectors WHERE cloudflare_account_id = $1) AS connectors,
+        (SELECT count(*)::integer FROM cloudflare_public_hostnames WHERE cloudflare_account_id = $1) AS domain_access,
+        (SELECT count(*)::integer FROM guided_operations WHERE cloudflare_account_id = $1) AS guided_operations`,
+      [id],
+    );
+    return {
+      connectors: Number(result.rows[0].connectors),
+      domainAccess: Number(result.rows[0].domain_access),
+      guidedOperations: Number(result.rows[0].guided_operations),
+    };
   }
 
   private safeRuntimeResult(result: Record<string, unknown>): Record<string, unknown> {

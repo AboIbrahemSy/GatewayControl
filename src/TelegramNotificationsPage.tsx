@@ -11,7 +11,7 @@ const buttonClass = 'flex min-h-11 items-center justify-center gap-2 rounded-xl 
 const primaryButton = 'flex min-h-11 items-center justify-center gap-2 rounded-xl bg-ink-900 px-5 text-xs font-extrabold text-white disabled:cursor-not-allowed disabled:opacity-50 dark:bg-mint-400 dark:text-ink-950'
 
 const notificationEvents = [
-  ['agent.offline', 'agentOffline'], ['service.unhealthy', 'serviceUnhealthy'], ['deployment.failed', 'deploymentFailed'], ['deployment.succeeded', 'deploymentSucceeded'],
+  ['agent.offline', 'agentOffline'], ['agent.recovered', 'agentRecovered'], ['service.unhealthy', 'serviceUnhealthy'], ['service.stopped', 'serviceStopped'], ['service.recovered', 'serviceRecovered'], ['deployment.failed', 'deploymentFailed'], ['deployment.succeeded', 'deploymentSucceeded'],
   ['certificate.expiring', 'certificateExpiring'], ['backup.failed', 'backupFailed'], ['backup.succeeded', 'backupSucceeded'],
   ['runtime.action.succeeded', 'runtimeActionSucceeded'], ['runtime.action.failed', 'runtimeActionFailed'],
 ] as const

@@ -42,10 +42,10 @@ describe('migration integrity', () => {
       .rejects.toThrow('expected 001, found 002');
   });
 
-  it('ships contiguous deployment and domain hardening as migration 024', async () => {
+  it('ships contiguous service recovery notifications as migration 025', async () => {
     const migrations = await discoverMigrations(fileURLToPath(new URL('../migrations', import.meta.url)));
-    expect(migrations.at(-1)?.name).toBe('024_deploy_domain_hardening.sql');
-    expect(migrations).toHaveLength(24);
+    expect(migrations.at(-1)?.name).toBe('025_service_recovery_notifications.sql');
+    expect(migrations).toHaveLength(25);
   });
 
   it('adds recovery request ownership and import validation revisions additively', async () => {

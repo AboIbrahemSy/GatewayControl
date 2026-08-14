@@ -65,6 +65,12 @@ export interface CloudflareAccount {
   updatedAt: string;
 }
 
+export interface CloudflareAccountDeletionDependencies {
+  connectors: number;
+  domainAccess: number;
+  guidedOperations: number;
+}
+
 export interface CloudflareZone {
   id: string;
   cloudflareAccountId: string;
@@ -292,7 +298,7 @@ export interface DeploymentCommandSource extends DeploymentRevision {
   encryptedPriorNormalizedCompose: string | null; action: DeploymentRun['action']; runId: string; commandId: string;
 }
 
-export const OPERATIONAL_EVENT_TYPES = ['agent.offline', 'service.unhealthy', 'deployment.failed', 'deployment.succeeded', 'certificate.expiring', 'backup.failed', 'backup.succeeded', 'runtime.action.succeeded', 'runtime.action.failed'] as const;
+export const OPERATIONAL_EVENT_TYPES = ['agent.offline', 'agent.recovered', 'service.unhealthy', 'service.stopped', 'service.recovered', 'deployment.failed', 'deployment.succeeded', 'certificate.expiring', 'backup.failed', 'backup.succeeded', 'runtime.action.succeeded', 'runtime.action.failed'] as const;
 export type OperationalEventType = typeof OPERATIONAL_EVENT_TYPES[number];
 const OPERATIONAL_EVENT_TYPE_SET = new Set<string>(OPERATIONAL_EVENT_TYPES);
 
@@ -435,6 +441,7 @@ export interface Store {
   listCloudflareAccounts(): Promise<CloudflareAccount[]>;
   createCloudflareAccount(values: { name: string; accountIdentifier: string; encryptedApiToken: string; enabled: boolean }): Promise<CloudflareAccount>;
   updateCloudflareAccount(id: string, values: { name?: string; accountIdentifier?: string; encryptedApiToken?: string; enabled?: boolean }): Promise<CloudflareAccount | null>;
+  deleteCloudflareAccount(id: string): Promise<{ deleted: true; dependencies: CloudflareAccountDeletionDependencies } | { deleted: false; dependencies: CloudflareAccountDeletionDependencies } | null>;
   getCloudflareAccountSecret(id: string): Promise<CloudflareAccountSecret | null>;
   syncCloudflareZones(accountId: string, zones: Array<{ zoneIdentifier: string; name: string; status: string }>, error?: string): Promise<CloudflareZone[] | null>;
   listCloudflareZones(accountId: string): Promise<CloudflareZone[] | null>;

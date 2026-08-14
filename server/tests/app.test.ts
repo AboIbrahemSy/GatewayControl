@@ -356,16 +356,21 @@ describe('control-plane API', () => {
     await store.recordTelemetry(agent.id, { ...healthy, observedAt: new Date(Date.now() + 2_000).toISOString(), services: [{ ...healthy.services[0]!, status: 'unhealthy' }] });
     await dispatcher.tick();
     expect(fetchMock).toHaveBeenCalledTimes(1);
-    expect(store.deliveries.at(-1)?.status).toBe('succeeded');
+    expect(store.deliveries.some((delivery) => delivery.eventType === 'service.recovered' && delivery.status === 'succeeded')).toBe(true);
+
+    await store.recordTelemetry(agent.id, { ...healthy, observedAt: new Date(Date.now() + 2_500).toISOString(), services: [{ ...healthy.services[0]!, status: 'stopped' }] });
+    await store.recordTelemetry(agent.id, { ...healthy, observedAt: new Date(Date.now() + 2_750).toISOString(), services: [{ ...healthy.services[0]!, status: 'running' }] });
+    expect(store.events.at(-2)?.type).toBe('service.stopped');
+    expect(store.events.at(-1)?.type).toBe('service.recovered');
 
     await store.setAgentNotificationPreference(agent.id, false, owner!.id);
     await store.recordTelemetry(agent.id, { ...healthy, observedAt: new Date(Date.now() + 3_000).toISOString() });
     await store.recordTelemetry(agent.id, { ...healthy, observedAt: new Date(Date.now() + 4_000).toISOString(), services: [{ ...healthy.services[0]!, status: 'unhealthy' }] });
-    expect(store.deliveries).toHaveLength(2);
+    expect(store.deliveries).toHaveLength(5);
     store.agents[0]!.lastHeartbeatAt = new Date(Date.now() - 10_000).toISOString();
     await store.sweepOfflineAgents(new Date(Date.now() - 5_000));
     expect(store.events.find((event) => event.type === 'agent.offline')?.payload).toMatchObject({ agentId: agent.id });
-    expect(store.deliveries).toHaveLength(2);
+    expect(store.deliveries).toHaveLength(5);
   });
 
   it('decorates connector sync only for the assigned authenticated agent', async () => {
@@ -868,7 +873,32 @@ describe('control-plane API', () => {
     expect((await app.inject({ method: 'POST', url: `/api/cloudflare/accounts/${accountId}/sync`, headers: { cookie } })).json().zones).toHaveLength(2);
     expect(store.cloudflareZones.map((zone) => zone.name)).toEqual(['one.example', 'two.example']);
     expect(store.cloudflareAccounts[0]?.lastSyncedAt).not.toBeNull();
+    const deleted = await app.inject({ method: 'DELETE', url: `/api/cloudflare/accounts/${accountId}`, headers: { cookie } });
+    expect(deleted.statusCode).toBe(204);
+    expect(store.cloudflareAccounts).toHaveLength(0);
+    expect(store.cloudflareZones).toHaveLength(0);
     expect(fetchMock).toHaveBeenCalledTimes(9);
+  });
+
+  it('blocks Cloudflare account deletion while references exist', async () => {
+    const { app, store, cookie } = await appWithOwner();
+    const created = await app.inject({
+      method: 'POST', url: '/api/cloudflare/accounts', headers: { cookie },
+      payload: { name: 'Referenced', accountIdentifier: '2'.repeat(32), apiToken: 'cloudflare-api-token-that-is-long-enough' },
+    });
+    const accountId = created.json().account.id;
+    const pendingAgent = await store.createAgent('referenced-agent', hashToken('referenced-agent-enrollment-token'));
+    await store.enrollAgent(hashToken('referenced-agent-enrollment-token'), hashToken('referenced-agent-credential'));
+    await store.createConnector({
+      name: 'referenced-connector', encryptedToken: 'encrypted-token', enabled: false, agentId: pendingAgent.id,
+      accountId, accountIdentifier: '2'.repeat(32), tunnelId: randomUUID(), identityStatus: 'verified',
+    });
+
+    const blocked = await app.inject({ method: 'DELETE', url: `/api/cloudflare/accounts/${accountId}`, headers: { cookie } });
+
+    expect(blocked.statusCode).toBe(409);
+    expect(blocked.json()).toMatchObject({ code: 'cloudflare_account_delete_blocked' });
+    expect(store.cloudflareAccounts).toHaveLength(1);
   });
 
   it('tests zero-zone accounts and maps zone authorization failures without leaking Cloudflare responses', async () => {

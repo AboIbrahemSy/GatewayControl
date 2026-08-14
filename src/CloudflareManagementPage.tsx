@@ -8,6 +8,7 @@ import {
   RefreshCw,
   RotateCw,
   ShieldCheck,
+  Trash2,
   TriangleAlert,
   type LucideIcon,
 } from "lucide-react";
@@ -221,6 +222,28 @@ export function CloudflareManagementPage({
       );
     } catch (caught) {
       setError(friendlyError(caught, t));
+    } finally {
+      setBusy("");
+    }
+  }
+
+  async function deleteAccount(account: CloudflareAccount) {
+    if (!window.confirm(t("confirmDeleteCloudflareAccount"))) return;
+    setBusy(`delete:${account.id}`);
+    setError("");
+    setSuccess("");
+    try {
+      await api.deleteCloudflareAccount(account.id);
+      setAccounts((current) => current.filter((item) => item.id !== account.id));
+      setZonesByAccount((current) => {
+        const next = { ...current };
+        delete next[account.id];
+        return next;
+      });
+      if (selectedAccountId === account.id) setSelectedAccountId("");
+      setSuccess(t("cloudflareAccountDeleted"));
+    } catch (caught) {
+      setError(caught instanceof ApiError && caught.code === "cloudflare_account_delete_blocked" ? t("cloudflareAccountDeleteBlocked") : friendlyError(caught, t));
     } finally {
       setBusy("");
     }
@@ -462,6 +485,7 @@ export function CloudflareManagementPage({
           }}
           selectAccount={(id) => void selectAccount(id, true)}
           toggleAccount={(account) => void toggleAccount(account)}
+          deleteAccount={(account) => void deleteAccount(account)}
           action={(account, action) => void accountAction(account, action)}
         />
       ) : tab === "zones" ? (
@@ -584,6 +608,7 @@ function AccountsArea({
   form,
   selectAccount,
   toggleAccount,
+  deleteAccount,
   action,
 }: {
   t: Translate;
@@ -599,6 +624,7 @@ function AccountsArea({
   form: AccountForm;
   selectAccount: (id: string) => void;
   toggleAccount: (account: CloudflareAccount) => void;
+  deleteAccount: (account: CloudflareAccount) => void;
   action: (account: CloudflareAccount, action: "test" | "sync") => void;
 }) {
   return (
@@ -771,7 +797,7 @@ function AccountsArea({
               {t("apiTokenNeverShown")}
             </p>
             <div
-              className={`grid grid-cols-1 gap-2 pt-5 ${role === "viewer" ? "" : "sm:grid-cols-3"}`}
+              className={`grid grid-cols-1 gap-2 pt-5 ${role === "viewer" ? "" : role === "owner" ? "sm:grid-cols-2 xl:grid-cols-4" : "sm:grid-cols-3"}`}
             >
               <button
                 type="button"
@@ -806,6 +832,15 @@ function AccountsArea({
                     />
                     {t("syncZones")}
                   </button>
+                  {role === "owner" && <button
+                    type="button"
+                    disabled={busy === `delete:${account.id}`}
+                    className="flex min-h-11 items-center justify-center gap-2 rounded-xl border border-rose-300/70 bg-white px-4 text-xs font-extrabold text-rose-700 transition hover:border-rose-400 disabled:cursor-not-allowed disabled:opacity-50 dark:border-rose-400/30 dark:bg-white/5 dark:text-rose-300"
+                    onClick={() => deleteAccount(account)}
+                  >
+                    <Trash2 size={15} />
+                    {t("deleteAccount")}
+                  </button>}
                 </>
               )}
             </div>

@@ -406,6 +406,8 @@ export const api = {
     request<{ account: CloudflareAccount; zoneCount?: number; tunnel?: { id: string; name: string }; connector?: Connector; operation?: GuidedOperation }>('/cloudflare/accounts', { method: 'POST', headers: input.createManagedTunnel ? { 'Idempotency-Key': crypto.randomUUID() } : {}, body: JSON.stringify(input) }),
   updateCloudflareAccount: (id: string, input: UpdateCloudflareAccountInput) =>
     request<{ account: CloudflareAccount }>(`/cloudflare/accounts/${encodeURIComponent(id)}`, { method: 'PATCH', body: JSON.stringify(input) }),
+  deleteCloudflareAccount: (id: string) =>
+    request<void>(`/cloudflare/accounts/${encodeURIComponent(id)}`, { method: 'DELETE' }),
   testCloudflareAccount: (id: string) =>
     request<{ verified: true; zoneCount?: number }>(`/cloudflare/accounts/${encodeURIComponent(id)}/test`, { method: 'POST' }),
   syncCloudflareAccount: (id: string) =>

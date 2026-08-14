@@ -1259,6 +1259,12 @@ export async function buildApp(options: BuildAppOptions) {
     if (!account) throw new ApiError(404, 'Cloudflare account not found.');
     return { account };
   });
+  app.delete('/api/cloudflare/accounts/:id', { preHandler: (request, reply) => requireUser(request, reply, 'owner') }, async (request, reply) => {
+    const result = await options.store.deleteCloudflareAccount(idParameter(request));
+    if (!result) throw new ApiError(404, 'Cloudflare account not found.', 'cloudflare_account_not_found');
+    if (!result.deleted) throw new ApiError(409, 'Remove Cloudflare connectors, domain access, and guided operation references before deleting this account.', 'cloudflare_account_delete_blocked');
+    return reply.code(204).send();
+  });
   app.post('/api/cloudflare/accounts/:id/test', { preHandler: (request, reply) => requireUser(request, reply, 'operator') }, async (request) => {
     const { client, accountIdentifier } = await cloudflareClientForAccount(idParameter(request));
     let operation: 'token' | 'zones' = 'token';

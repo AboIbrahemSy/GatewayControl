@@ -1,5 +1,5 @@
 import { randomUUID } from 'node:crypto';
-import { OPERATIONAL_EVENT_TYPES, type Agent, type AgentCommand, type BackupTarget, type CloudflareAccount, type CloudflareAccountSecret, type CloudflareDomainAccess, type CloudflareDomainAccessDeployment, type CloudflareZone, type Connector, type ConnectorDeployment, type ConnectorIdentityDeployment, type ConnectorIdentityExpectation, type Deployment, type DeploymentCommandSource, type DeploymentRevision, type DeploymentRun, type DomainAccessDnsRecord, type GuidedOperation, type ManagedRoute, type ManagedStack, type NotificationAgentPreference, type NotificationDelivery, type NotificationServicePreference, type NotificationSettings, type NotificationTopology, type OperationalEventType, type Role, type RuntimeAction, type RuntimeInventory, type RuntimeLogRequest, type RuntimeOperation, type RuntimeScope, type StackBackup, type StackDeployment, type StackRestore, type Store, type StoredSystemBackup, type SystemBackup, type SystemBackupImport, type SystemRestore, type TelemetrySnapshot, type TlsObservation, type TlsObservationTarget, type User } from '../src/types.js';
+import { OPERATIONAL_EVENT_TYPES, type Agent, type AgentCommand, type BackupTarget, type CloudflareAccount, type CloudflareAccountDeletionDependencies, type CloudflareAccountSecret, type CloudflareDomainAccess, type CloudflareDomainAccessDeployment, type CloudflareZone, type Connector, type ConnectorDeployment, type ConnectorIdentityDeployment, type ConnectorIdentityExpectation, type Deployment, type DeploymentCommandSource, type DeploymentRevision, type DeploymentRun, type DomainAccessDnsRecord, type GuidedOperation, type ManagedRoute, type ManagedStack, type NotificationAgentPreference, type NotificationDelivery, type NotificationServicePreference, type NotificationSettings, type NotificationTopology, type OperationalEventType, type Role, type RuntimeAction, type RuntimeInventory, type RuntimeLogRequest, type RuntimeOperation, type RuntimeScope, type StackBackup, type StackDeployment, type StackRestore, type Store, type StoredSystemBackup, type SystemBackup, type SystemBackupImport, type SystemRestore, type TelemetrySnapshot, type TlsObservation, type TlsObservationTarget, type User } from '../src/types.js';
 
 export class FakeStore implements Store {
   public users: User[] = [];
@@ -112,6 +112,19 @@ export class FakeStore implements Store {
     Object.assign(item, values, { updatedAt: new Date().toISOString() });
     const { encryptedApiToken: _, ...account } = item;
     return account;
+  }
+  public async deleteCloudflareAccount(id: string): Promise<{ deleted: true; dependencies: CloudflareAccountDeletionDependencies } | { deleted: false; dependencies: CloudflareAccountDeletionDependencies } | null> {
+    const index = this.cloudflareAccounts.findIndex((account) => account.id === id);
+    if (index === -1) return null;
+    const dependencies = {
+      connectors: this.connectors.filter((item) => item.cloudflareAccountId === id).length,
+      domainAccess: this.cloudflareDomainAccess.filter((item) => item.cloudflareAccountId === id).length,
+      guidedOperations: this.guidedOperations.filter((item) => item.cloudflareAccountId === id).length,
+    };
+    if (dependencies.connectors + dependencies.domainAccess + dependencies.guidedOperations > 0) return { deleted: false, dependencies };
+    this.cloudflareAccounts.splice(index, 1);
+    this.cloudflareZones = this.cloudflareZones.filter((zone) => zone.cloudflareAccountId !== id);
+    return { deleted: true, dependencies };
   }
   public async getCloudflareAccountSecret(id: string): Promise<CloudflareAccountSecret | null> {
     return this.cloudflareAccounts.find((account) => account.id === id) ?? null;
@@ -451,10 +464,12 @@ export class FakeStore implements Store {
   public async heartbeatAgent(id: string, metadata: Record<string, unknown> = {}): Promise<void> {
     const item = this.agents.find((agent) => agent.id === id);
     if (item) {
+      const recovered = this.offlineNotifications.has(item.id);
       item.lastHeartbeatAt = new Date().toISOString();
       item.metadata = metadata;
       item.diagnostics = metadata.diagnostics && typeof metadata.diagnostics === 'object' && !Array.isArray(metadata.diagnostics) ? metadata.diagnostics as Record<string, unknown> : item.diagnostics;
       item.healthStatus = 'connected';
+      if (recovered) { this.offlineNotifications.delete(item.id); this.queueEvent('agent.recovered', { agentId: item.id, agentName: item.name }); }
       const connectors = metadata.diagnostics && typeof metadata.diagnostics === 'object' && !Array.isArray(metadata.diagnostics)
         ? (metadata.diagnostics as { connectors?: unknown }).connectors : null;
       if (connectors && typeof connectors === 'object' && !Array.isArray(connectors)) for (const [connectorId, value] of Object.entries(connectors).slice(0, 100)) {
@@ -473,6 +488,9 @@ export class FakeStore implements Store {
     const previousServices = new Map((previous?.services ?? []).map((service) => [service.name, service]));
     for (const service of snapshot.services) {
       if (service.status === 'unhealthy' && previousServices.get(service.name)?.status !== 'unhealthy') this.queueEvent('service.unhealthy', { agentId, projectName: service.projectName, serviceName: service.serviceName, service: service.name });
+      const previousStatus = String(previousServices.get(service.name)?.status ?? 'unknown');
+      if (service.status === 'stopped' && previousStatus !== 'stopped') this.queueEvent('service.stopped', { agentId, projectName: service.projectName, serviceName: service.serviceName, service: service.name });
+      if (['healthy', 'running'].includes(String(service.status)) && ['unhealthy', 'stopped'].includes(previousStatus)) this.queueEvent('service.recovered', { agentId, projectName: service.projectName, serviceName: service.serviceName, service: service.name, previousStatus });
     }
   }
   public async getMonitoringSummary(): Promise<TelemetrySnapshot[]> {
